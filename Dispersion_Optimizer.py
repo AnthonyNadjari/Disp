@@ -268,6 +268,12 @@ def _render_optimization_result(result, is_cross, debug_info=None):
             col_v2.metric("Axe book cleaned", f"{result.axe_cleaned * 100:.1f}%")
         if result.axe_recycled is not None:
             col_v3.metric("Package recycled", f"{result.axe_recycled * 100:.1f}%")
+        st.caption(
+            "Vega allocation below = the actual trade (vᵢ = wᵢ·V). The two axe "
+            "figures are a separate overlay: **book cleaned** = Σ min(vᵢ, cibleᵢ)/Σ cibles, "
+            "**package recycled** = Σ min(vᵢ, cibleᵢ)/V. 0% means none of the SELECTED "
+            "names had a matched Cible — check the Vega inventory names match the "
+            "candidates (a mismatch warning is shown above the run).")
         if result.vega_basket:
             with st.expander("⚡ Vega allocation (absolute)", expanded=False):
                 st.dataframe(pd.DataFrame(
@@ -1190,7 +1196,11 @@ with tab1:
                         _long_src, _inj_warns = _inject_axes_groups(_long_src, _is_xc)
                         for _w in _inj_warns:
                             st.warning(_w)
-                        with st.spinner("Loading data & running optimization..."):
+                        with st.spinner(
+                                f"Loading Bloomberg data + fitting the reference for "
+                                f"{len(_long_src)} names, then running the GA… "
+                                f"(the Time Limit bounds the GA search only — data load, "
+                                f"reference fitting and the final polish are extra)"):
                             _opt_error = None
                             result = None
                             def _parse_ticker_list(raw_text):

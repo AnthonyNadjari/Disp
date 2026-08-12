@@ -196,6 +196,36 @@ def test_api_cross_corridor_forced_present_but_dropped(api_offline):
     assert "Did you mean" not in msg, f"should not be a 'did you mean' case: {msg}"
 
 
+def test_api_forced_bypasses_zero_hr_filter(api_offline):
+    """Point 3: a FORCED name with 0% hit ratio must NOT be removed by the
+    filter_zero_hr toggle — it is restored (forced names bypass the filter),
+    both mono and cross-corridor."""
+    rng = np.random.default_rng(5)
+    n = 6
+    tickers = [f"E{i}" for i in range(n)]
+    means = np.linspace(0.3, 1.5, n)
+    pnl = np.column_stack([rng.normal(means[i], 0.5, N_DAYS) for i in range(n)])
+    pnl[:, 0] = -np.abs(rng.normal(1.0, 0.3, N_DAYS)) - 0.1   # E0: every payoff < 0 → 0% HR
+    col_map = {tickers[i]: i for i in range(n)}
+    long_df = pd.DataFrame({
+        "Variance Asset": tickers, "Strike Mono Var Swap (%)": [12.0] * n,
+        "Min Weight": 5.0, "Max Weight": 60.0,
+    })
+    api = api_offline(pnl, col_map, tickers)
+    cfg = DispersionConfig(missing_data_policy=MissingDataPolicy.FILL_ZERO)
+
+    # Sanity: filter ON, NOT forced → E0 (0% HR) is dropped
+    res_free = api.optimize(long_df, cfg, _cons(), score_weights={"mean_payoff": 1.0},
+                            seed=0, filter_zero_hr=True)
+    assert "E0" not in [k for k, _ in res_free.long_basket]
+
+    # Filter ON + forced → E0 restored past the filter and present in the basket
+    res_forced = api.optimize(long_df, cfg, _cons(), score_weights={"mean_payoff": 1.0},
+                              seed=0, filter_zero_hr=True, forced_tickers=["E0"])
+    assert "E0" in [k for k, _ in res_forced.long_basket], (
+        "forced 0%-HR name must be restored past the filter (mono)")
+
+
 def test_api_mono_force_bogus_message(api_offline):
     """Mono mode: the bogus-forced message reports the Variance Asset key."""
     tickers, pnl, col_map, long_df = _universe()
