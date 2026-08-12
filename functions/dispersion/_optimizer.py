@@ -2297,6 +2297,7 @@ class DispersionOptimizer:
         strikes_per_col = np.zeros(n_stocks)
         min_w_per_col = np.zeros(n_stocks)
         max_w_per_col = np.full(n_stocks, self._weight_solver._constraints.max_weight)
+        unmapped_cols: List[int] = []
         for col_idx in range(n_stocks):
             if col_idx in col_to_cand:
                 cand_idx = col_to_cand[col_idx]
@@ -2305,9 +2306,27 @@ class DispersionOptimizer:
                 min_w_per_col[col_idx] = leg.min_weight
                 max_w_per_col[col_idx] = leg.max_weight
             else:
-                # Column exists in matrix but has no candidate mapping — allow MILP to select it
-                min_w_per_col[col_idx] = self._weight_solver._constraints.min_weight
-                max_w_per_col[col_idx] = self._weight_solver._constraints.max_weight
+                # Column exists in the matrix but is NOT a selectable long
+                # candidate (excluded name, 0%-HR-filtered, or a short-leg
+                # column). The GA can never pick it, so the certificate must
+                # not either — z_i is pinned to 0 below.
+                unmapped_cols.append(col_idx)
+
+        # ── Forced names: z_i pinned to 1 (candidate universe consistency) ──
+        forced_cols: List[int] = []
+        _missing_forced: List[str] = []
+        for cand_idx in self._forced_long:
+            k = _candidate_key(self.long_candidates[cand_idx], is_xcorr)
+            col = self._col_pos.get(k)
+            if col is None:
+                _missing_forced.append(k)
+            else:
+                forced_cols.append(col)
+        if _missing_forced:
+            raise RuntimeError(
+                f"[MILP] forced name(s) {_missing_forced} have no P&L matrix "
+                f"column — cannot certify a universe the GA did not see."
+            )
 
         c = self.c
         min_w = self._weight_solver._constraints.min_weight
@@ -2330,6 +2349,13 @@ class DispersionOptimizer:
         ub[n_stocks:2*n_stocks] = 1.0     # z_i <= 1
         lb[-1] = -np.inf                  # t unbounded below
         ub[-1] = np.inf
+        # Universe consistency with the GA: unmapped columns unselectable,
+        # forced names always selected (z fixed via bounds + integrality).
+        for col_idx in unmapped_cols:
+            ub[n_stocks + col_idx] = 0.0
+            ub[col_idx] = 0.0             # w_i = 0 as well (belt and braces)
+        for col_idx in forced_cols:
+            lb[n_stocks + col_idx] = 1.0
 
         # Integrality: 0=continuous, 1=integer
         integrality = np.zeros(n_vars, dtype=int)
@@ -2370,7 +2396,9 @@ class DispersionOptimizer:
             A_strike[:n_stocks] = strikes_per_col
             constraints.append(LinearConstraint(A_strike.reshape(1, -1), -np.inf, max_net_strike))
 
-        print(f"[MILP] n_candidates={n_stocks}, n_days={n_days}, min_k={min_k}, max_k={max_k} | approx=(row-level zero drop, not per-basket)", flush=True)
+        print(f"[MILP] n_candidates={n_stocks}, n_days={n_days}, min_k={min_k}, max_k={max_k} | "
+              f"forced={len(forced_cols)}, unselectable={len(unmapped_cols)} | "
+              f"approx=(row-level zero drop, not per-basket)", flush=True)
 
         res = milp(
             c=obj,
