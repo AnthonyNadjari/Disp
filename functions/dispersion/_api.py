@@ -41,6 +41,7 @@ import pandas as pd
 from datetime import date
 from typing import Callable, Dict, List, Optional, Tuple
 
+from functions.dispersion._logging import logger as _engine_log
 from functions.dispersion.models import (
     BucketConstraint,
     DispersionConfig,
@@ -773,6 +774,7 @@ def optimize(
     bucket_constraints: List = None,
     vega=None,
     robustness_check: bool = False,
+    log_level: str = None,
 ) -> OptimizationResult:
     """
     Find optimal basket via genetic algorithm.
@@ -838,12 +840,20 @@ def optimize(
         with replacement; winner vs its 10 best refinement challengers) and
         attach it as ``result.robustness`` — {top1_freq, top3_freq,
         winner_raw_ci}.  Deterministic (derived from the run seed).
+    log_level : str, optional
+        Activate the engine's diagnostic logger ("DEBUG"/"INFO"/...).
+        Default None = silent (historical prints now live behind this).
 
     Returns
     -------
     OptimizationResult
         .long_basket, .short_basket, .net_strike, .score, .converged, .backtest
     """
+    # ── Optional engine diagnostics ──
+    if log_level:
+        from functions.dispersion._logging import configure_engine_logging
+        configure_engine_logging(log_level)
+
     # ── Forced / excluded: cheap validation before any data load ──
     def _norm_ticker_set(lst):
         return {str(t).strip().casefold() for t in (lst or []) if str(t).strip()}
@@ -1040,7 +1050,7 @@ def optimize(
         opt_result._milp_result = None
 
     # ── TEMP AUDIT: scoring mode used ──
-    print(f"[AUDIT] scoring_mode={optimizer._scoring_mode} | use_new={optimizer._use_new_scoring} | score_fn_fitted={optimizer._score_fn.is_fitted if optimizer._score_fn else 'N/A'}")
+    _engine_log.debug(f"[AUDIT] scoring_mode={optimizer._scoring_mode} | use_new={optimizer._use_new_scoring} | score_fn_fitted={optimizer._score_fn.is_fitted if optimizer._score_fn else 'N/A'}")
 
     # ── Step 6b: Capture debug info for UI ──
     
@@ -1107,18 +1117,18 @@ def optimize(
                 b_nz = b[b != 0.0] if len(b) > 0 else np.array([])
                 s_min_nz = float(s_nz.min()) if len(s_nz) > 0 else 0.0
                 b_min_nz = float(b_nz.min()) if len(b_nz) > 0 else 0.0
-                print("[NUMERIC-CHECK] solver: len=%d min=%.4f mean=%.4f min_nz=%.4f" % (len(s), s.min(), s.mean(), s_min_nz), flush=True)
-                print("[NUMERIC-CHECK] backtest: len=%d min=%.4f mean=%.4f min_nz=%.4f" % (len(b), b.min(), b.mean(), b_min_nz), flush=True)
+                _engine_log.debug("[NUMERIC-CHECK] solver: len=%d min=%.4f mean=%.4f min_nz=%.4f" % (len(s), s.min(), s.mean(), s_min_nz))
+                _engine_log.debug("[NUMERIC-CHECK] backtest: len=%d min=%.4f mean=%.4f min_nz=%.4f" % (len(b), b.min(), b.mean(), b_min_nz))
                 n = min(len(s), len(b))
                 if n > 0:
                     close = np.allclose(s[:n], b[:n], atol=1e-8)
-                    print("[NUMERIC-CHECK] same_len=%s allclose=%s" % (len(s) == len(b), close), flush=True)
+                    _engine_log.debug("[NUMERIC-CHECK] same_len=%s allclose=%s" % (len(s) == len(b), close))
                     if not close:
                         idx = np.where(~np.isclose(s[:n], b[:n], atol=1e-8))[0][:5]
                         for i in idx:
-                            print("  diff[%d]: solver=%.6f backtest=%.6f" % (i, s[i], b[i]), flush=True)
+                            _engine_log.debug("  diff[%d]: solver=%.6f backtest=%.6f" % (i, s[i], b[i]))
     except Exception as _e:
-        print("[NUMERIC-CHECK] failed: %s" % repr(_e), flush=True)
+        _engine_log.debug("[NUMERIC-CHECK] failed: %s" % repr(_e))
 
     # Return debug info in result for UI display
     opt_result._debug_info = "\n".join(debug_info) if debug_info else ""

@@ -25,16 +25,7 @@ import pandas as pd
 from datetime import date, datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-# ── File-based debug logger (always visible, even under Streamlit) ──
-_OPTIM_LOG_PATH = os.path.join(os.path.dirname(__file__), "_optim_debug.log")
-
-def _dlog(msg: str):
-    """Debug log — disabled."""
-    pass
-
-def _dlog_ticker_mismatch(tickers: List[str], col_pos_keys: List[str]):
-    """Visible debug for ticker format mismatch — disabled."""
-    pass
+from functions.dispersion._logging import logger as _engine_log
 
 def _scoring_signature(metric_weights, seed: int, n_samples: int,
                        reference_size: int) -> str:
@@ -356,11 +347,8 @@ class DispersionOptimizer:
             bc.bucket: (bc.min_names, bc.max_names) for bc in self._bucket_constraints
         }
         # Print all config at init
-        _dlog(f"🔬 [OPTIM-INIT] {len(long_candidates)} long, {len(short_candidates)} short | "
-              f"pop={self.c.population_size} gen={self.c.max_generations} time={self.c.time_limit_seconds}s")
         if long_candidates:
             s = long_candidates[0]
-            _dlog(f"🔬 [OPTIM-INIT] bounds sample: min_w={s.min_weight:.4f} max_w={s.max_weight:.4f}")
     # ══════════════════════════════════════════════════════════════════════════
     # BUCKET CONSTRAINTS (regional/sector, long leg)
     # ══════════════════════════════════════════════════════════════════════════
@@ -586,7 +574,6 @@ class DispersionOptimizer:
         if len(self.long_candidates) < self.c.min_stocks_long:
             return self._empty_result()
         if not self._long_only and len(self.short_candidates) < self.c.min_stocks_short:
-            _dlog(f"NOT ENOUGH SHORT: {len(self.short_candidates)} < {self.c.min_stocks_short}")
             return self._empty_result()
         # ── Setup new scoring system (bilevel) if metric_weights provided ──
         if self._use_new_scoring:
@@ -626,11 +613,9 @@ class DispersionOptimizer:
             n_samples = (self._n_reference_samples if self._n_reference_samples
                          else (800 if has_tail else 300))
             self._weight_solver = None  # not available during reference build
-            _dlog(f"BUILD REFERENCE SAMPLE: n_samples={n_samples}")
             self._build_reference_sample(n_samples=n_samples)
             # ── TABLE: Long candidates + PnL data quality ──
             self._print_candidate_table()
-            _dlog(f"SCORE FN IS FITTED: {self._score_fn.is_fitted}")
             if not self._score_fn.is_fitted:
                 raise RuntimeError(
                     "Scoring system failed to initialise: build_reference did not fit. "
@@ -677,17 +662,14 @@ class DispersionOptimizer:
                 population.append(ind)
             attempts += 1
         if not population:
-            _dlog("FAILED TO CREATE INITIAL POPULATION")
             return self._empty_result()
-        _dlog(f"POPULATION: {len(population)} individuals")
         # Start the evolution timer AFTER reference sample + population init
         # so the GA gets the full time budget for actual evolution
         start_time = time.time()
         setup_elapsed = start_time - setup_start
         self.log("INFO", f"⚙️ Setup took {setup_elapsed:.1f}s — GA evolution starts now (budget: {self.c.time_limit_seconds}s)")
-        print(f"[TIMING] setup={setup_elapsed:.1f}s | GA budget={self.c.time_limit_seconds}s", flush=True)
+        _engine_log.debug(f"[TIMING] setup={setup_elapsed:.1f}s | GA budget={self.c.time_limit_seconds}s")
         init_weights = np.concatenate([ind.long_weights for ind in population])
-        _dlog(f"INIT POP: {len(init_weights)} weights, mean={init_weights.mean():.4f}, std={init_weights.std():.4f}")
         best_individual = max(population, key=lambda x: x.fitness)
         best_score = best_individual.fitness
         generations_run = 0
@@ -696,7 +678,6 @@ class DispersionOptimizer:
         for generation in range(self.c.max_generations):
             if time.time() - start_time > self.c.time_limit_seconds:
                 self.log("INFO", f"⏰ Time limit at gen {generation} (elapsed={time.time()-start_time:.1f}s)")
-                _dlog(f"⏰ [TIME] gen {generation}/{self.c.max_generations} | {time.time()-start_time:.1f}s / {self.c.time_limit_seconds}s budget | {(time.time()-start_time)/max(1,generation):.2f}s/gen")
                 break
             generations_run = generation
             # Sort by fitness
@@ -757,7 +738,7 @@ class DispersionOptimizer:
                 stagnation = 0
             else:
                 stagnation += 1
-            print(f"[GEN {generation}] best_fitness={best_score:.4f} | elapsed={time.time()-start_time:.1f}s | cache={self._weight_solver._cache_hits}/{self._weight_solver._cache_misses} | avg_LPs={self._weight_solver._bisect_lp_count/max(1,self._weight_solver._cache_misses):.1f}", flush=True)
+            _engine_log.debug(f"[GEN {generation}] best_fitness={best_score:.4f} | elapsed={time.time()-start_time:.1f}s | cache={self._weight_solver._cache_hits}/{self._weight_solver._cache_misses} | avg_LPs={self._weight_solver._bisect_lp_count/max(1,self._weight_solver._cache_misses):.1f}")
             if stagnation > self.c.stagnation_limit:
                 self.log("INFO", f"✅ Converged at gen {generation} (stagnation={self.c.stagnation_limit})")
                 break
@@ -770,7 +751,6 @@ class DispersionOptimizer:
                     except Exception:
                         pass
         elapsed_ga = time.time() - start_time
-        _dlog(f"GA FINISHED: {generations_run} gens in {elapsed_ga:.1f}s | best={best_score:.4f}")
         if best_score == -np.inf:
             return self._empty_result()
         # ── Post-GA refinement ──
@@ -1180,7 +1160,6 @@ class DispersionOptimizer:
             if r_scalar > best_scalar + 1e-12:
                 best_scalar, best_step, best_w, best_ind_list = r_scalar, r_score, r_w, r_ind
 
-        _dlog(f"[LOCAL-SEARCH] evals={n_evals} improved={improved_any} scalar={best_scalar:.6f}")
         if improved_any:
             best = self._copy(best)
             best.long_indices = list(best_ind_list)
@@ -1469,7 +1448,6 @@ class DispersionOptimizer:
                 short_w = short_w / s
         use_adaptive = (self.missing_data_policy == MissingDataPolicy.ADAPTIVE_REWEIGHT)
         use_drop = (self.missing_data_policy == MissingDataPolicy.DROP_INCOMPLETE_DAYS)
-        _dlog(f"  [COMPUTE-NET] use_adaptive={use_adaptive}, use_drop={use_drop}, is_cross_corridor={self.is_cross_corridor}")
         if use_adaptive:
             L_mat = self._orig_ts_mat[:, long_pos]
             L_nan = np.isnan(L_mat)
@@ -1496,7 +1474,6 @@ class DispersionOptimizer:
             combined = self._orig_ts_mat[:, all_pos]
             valid_rows = ~np.isnan(combined).any(axis=1)
             if valid_rows.sum() < 50:
-                _dlog(f"  [COMPUTE-NET] use_drop: valid_rows.sum()={valid_rows.sum()} < 50")
                 return None
             L = self._orig_ts_mat[valid_rows][:, long_pos] @ long_w
             S = (self._orig_ts_mat[valid_rows][:, short_pos] @ short_w) if len(short_pos) else 0.0
@@ -1504,12 +1481,9 @@ class DispersionOptimizer:
             L = self._ts_mat[:, long_pos] @ long_w
             S = (self._ts_mat[:, short_pos] @ short_w) if len(short_pos) else 0.0
             valid_rows = np.ones(self._n_rows, dtype=bool)
-            _dlog(f"  [COMPUTE-NET] default: L.shape={L.shape}, S={S}, valid_rows.sum()={valid_rows.sum()}")
         if valid_rows.sum() < 50:
-            _dlog(f"  [NET-PNL] valid_rows < 50: {valid_rows.sum()}")
             return None
         net = (L + S) if self.is_cross_corridor else (L - S)
-        _dlog(f"  [COMPUTE-NET] net.shape={net.shape}, net[:5]={net[:5]}")
         if self.global_cap < 9999998 or self.global_floor > -9999998:
             net = np.clip(net, self.global_floor, self.global_cap)
         if not use_drop:
@@ -1521,13 +1495,10 @@ class DispersionOptimizer:
                 n_trailing_zeros += 1
             else:
                 break
-        _dlog(f"  [NET-PNL] len={len(net)}, nonzero={nonzero_mask.sum()}, trailing_zeros={n_trailing_zeros}")
         if nonzero_mask.sum() < 50:
-            _dlog(f"  [NET-PNL] NONZERO < 50 - returning None")
             return None
         # ── ALIGNED WITH BACKTESTER: return full series including zeros ──
         # Cross-corridor backtester keeps all rows. Zeros are valid observations.
-        _dlog(f"  [NET-PNL] FINAL: len={len(net)}, last_val={net[-1]:.8f}, last5={[f'{v:.6f}' for v in net[-5:]]}")
         return net
 
     def _build_reference_sample(self, n_samples: int = 2000) -> None:
@@ -1729,15 +1700,11 @@ class DispersionOptimizer:
             vals = vals[np.isfinite(vals)]
             if len(vals) > 10 and np.std(vals) < 1e-10:
                 # DEBUG: Print first 10 baskets for root cause analysis
-                _dlog(f"\n❌ [METRIC-REJECT] metric '{m.name}' has zero spread (std={np.std(vals):.2e})")
-                _dlog(f"   All {len(vals)} values ≈ {vals[0]:.6f}")
-                _dlog(f"   First 10 sample PnL stats:")
                 for i in range(min(10, len(sample_pnls))):
                     pnl = sample_pnls[i]
                     last_val = float(np.mean(pnl[-1:]))
                     mean_ret = float(np.mean(pnl))
                     cumsum = float(np.sum(pnl))
-                    _dlog(f"     Basket-{i}: last_carry={last_val:.6f}, mean={mean_ret:.6f}, cumsum={cumsum:.6f}, len={len(pnl)}")
                 raise RuntimeError(
                     f"Reference sample non-degenerate check failed: metric '{m.name}' "
                     f"has zero spread (all values ≈ {vals[0]:.6f}). The quantile normalizer "
@@ -1746,7 +1713,6 @@ class DispersionOptimizer:
                 )
         ref_elapsed = time.time() - ref_start
         self.log("INFO", f"✅ Reference sample fitted ({len(sample_pnls)} baskets, {attempts} attempts) → bilevel scoring active [{ref_elapsed:.1f}s]")
-        _dlog(f"🔬 [REF] {len(sample_pnls)} baskets in {ref_elapsed:.1f}s")
 
     def _ws_active(self) -> bool:
         """True when the weighted_strike objective carries a positive weight."""
@@ -1774,11 +1740,9 @@ class DispersionOptimizer:
         if n == 0:
             return weights
         w = np.clip(weights, min_weights, max_weights)
-        _dlog(f"  _project_to_simplex_bounded: initial sum={w.sum():.6f}")
         # Iterative adjustment: redistribute excess/deficit proportionally
         for iteration in range(15):
             s = w.sum()
-            _dlog(f"  iter {iteration}: sum={s:.6f}")
             if abs(s - 1.0) < 1e-10:
                 break
             if s > 1.0:
@@ -1801,11 +1765,6 @@ class DispersionOptimizer:
                 addition = room * (deficit / room_total)
                 w = w + addition
                 w = np.minimum(w, max_weights)
-        else:
-            # Did not converge in 15 iterations
-            _dlog(f"⚠️ [SIMPLEX] did NOT converge in 15 iters! sum={w.sum():.6f} n={n} "
-                  f"sum_min={min_weights.sum():.4f} sum_max={max_weights.sum():.4f}")
-        _dlog(f"  final w={w}, sum={w.sum():.6f}")
         return w
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -2053,8 +2012,6 @@ class DispersionOptimizer:
         return new
 
     def _empty_result(self) -> OptimizationResult:
-        _dlog(f"EMPTY RESULT: long_only={self._long_only}, is_cross_corridor={self.is_cross_corridor}, "
-              f"n_long={len(self.long_candidates)}, n_short={len(self.short_candidates)}")
         r = OptimizationResult(
             long_basket=[], short_basket=[],
             long_strike_weighted=0.0, short_strike_weighted=0.0,
@@ -2113,10 +2070,6 @@ class DispersionOptimizer:
                               if self._ws_active() else None)
                     ga_score = self._score_fn.score(ga_pnl, self._make_ctx(_ga_ws))
 
-                    # bisect_pnl = self._adaptive_net_pnl(long_pos_final, resolv.weights)
-                    # bisect_min = float(np.min(bisect_pnl))
-                    # bisect_score = resolv.score
-
                     resolv_w = self._project_to_simplex_bounded(
                         np.asarray(resolv.weights, dtype=np.float64),
                         np.array(
@@ -2149,13 +2102,13 @@ class DispersionOptimizer:
                     bisect_score = self._score_fn.score(bisect_pnl, self._make_ctx(_bs_ws))
 
 
-                    print(f"[BISECT-VS-GA] ga_min={ga_min:.4f} ga_score={ga_score:.4f} | bisect_min={bisect_min:.4f} bisect_score={bisect_score:.4f}", flush=True)
+                    _engine_log.debug(f"[BISECT-VS-GA] ga_min={ga_min:.4f} ga_score={ga_score:.4f} | bisect_min={bisect_min:.4f} bisect_score={bisect_score:.4f}")
 
                     # NEVER DOWNGRADE: pick the better weight set by user's blend objective
                     # TIE-BREAK: when scores are within 1e-4, prefer higher raw min_payoff
                     if abs(bisect_score - ga_score) < 1e-4:
                         winner = "bisect" if bisect_min > ga_min else "ga"
-                        print(f"[SAFETY-NET] tie on score ({ga_score:.4f} vs {bisect_score:.4f}), min decides: {winner} (ga_min={ga_min:.4f} bisect_min={bisect_min:.4f})", flush=True)
+                        _engine_log.debug(f"[SAFETY-NET] tie on score ({ga_score:.4f} vs {bisect_score:.4f}), min decides: {winner} (ga_min={ga_min:.4f} bisect_min={bisect_min:.4f})")
                         if winner == "bisect":
                             best.long_weights = resolv_w
                             best.fitness = bisect_score
@@ -2164,11 +2117,11 @@ class DispersionOptimizer:
                     elif bisect_score > ga_score:
                         best.long_weights = resolv_w
                         best.fitness = bisect_score
-                        print(f"[SAFETY-NET] UPGRADED: bisection wins (score {ga_score:.4f} -> {bisect_score:.4f}, min {ga_min:.4f} -> {bisect_min:.4f})", flush=True)
+                        _engine_log.debug(f"[SAFETY-NET] UPGRADED: bisection wins (score {ga_score:.4f} -> {bisect_score:.4f}, min {ga_min:.4f} -> {bisect_min:.4f})")
                     else:
                         # Keep GA weights — they score equal or better
                         best.fitness = ga_score
-                        print(f"[SAFETY-NET] KEPT GA: ga wins (score {ga_score:.4f} >= {bisect_score:.4f}, min {ga_min:.4f} vs {bisect_min:.4f})", flush=True)
+                        _engine_log.debug(f"[SAFETY-NET] KEPT GA: ga wins (score {ga_score:.4f} >= {bisect_score:.4f}, min {ga_min:.4f} vs {bisect_min:.4f})")
                 else:
                     # Bisection infeasible — keep GA weights, re-score them
                     ga_pnl = self._adaptive_net_pnl(long_pos_final, best.long_weights)
@@ -2176,9 +2129,9 @@ class DispersionOptimizer:
                                                 best.short_indices, best.short_weights)
                                if self._ws_active() else None)
                     best.fitness = self._score_fn.score(ga_pnl, self._make_ctx(_ga_ws2))
-                    print(f"[SAFETY-NET] bisection infeasible — kept GA weights", flush=True)
+                    _engine_log.debug(f"[SAFETY-NET] bisection infeasible — kept GA weights")
             except Exception as e:
-                print(f"[SAFETY-NET] failed: {e}", flush=True)
+                _engine_log.debug(f"[SAFETY-NET] failed: {e}")
         else:
             # ═══ NON-EXACT CONFIGS: report the STEP score ═══
             # The GA and the refinement rank on the tie-broken scale (which
@@ -2238,16 +2191,16 @@ class DispersionOptimizer:
                 smooth_mean = float(np.mean(smooth_pnl))
                 star_std = float(np.std(w_star))
                 smooth_std = float(np.std(w_smooth))
-                print(f"[SMOOTH] min: {star_min:.4f} -> {smooth_min:.4f} | mean: {star_mean:.4f} -> {smooth_mean:.4f} | dispersion(std): {star_std:.4f} -> {smooth_std:.4f} | eps={self._smooth_eps:.2f}", flush=True)
+                _engine_log.debug(f"[SMOOTH] min: {star_min:.4f} -> {smooth_min:.4f} | mean: {star_mean:.4f} -> {smooth_mean:.4f} | dispersion(std): {star_std:.4f} -> {smooth_std:.4f} | eps={self._smooth_eps:.2f}")
                 # Per-ticker weight comparison, sorted by |delta| descending
-                print("[SMOOTH-WEIGHTS] ticker | w_optimal | w_smooth | delta", flush=True)
+                _engine_log.debug("[SMOOTH-WEIGHTS] ticker | w_optimal | w_smooth | delta")
                 _rows = []
                 for i, (wo, ws) in enumerate(zip(w_star, w_smooth)):
                     tk = _candidate_key(self.long_candidates[best.long_indices[i]], is_xcorr)
                     _rows.append((tk, float(wo), float(ws), float(ws - wo)))
                 _rows.sort(key=lambda r: abs(r[3]), reverse=True)
                 for tk, wo, ws, d in _rows:
-                    print(f"[SMOOTH-WEIGHTS] {tk:20s} | {wo:.2f} | {ws:.2f} | {d:+.2f}", flush=True)
+                    _engine_log.debug(f"[SMOOTH-WEIGHTS] {tk:20s} | {wo:.2f} | {ws:.2f} | {d:+.2f}")
                 # Store unsmoothed basket on optimizer for API dual-backtest access
                 self._last_unsmoothed_basket = [
                     (_candidate_key(self.long_candidates[i], is_xcorr), float(w))
@@ -2255,7 +2208,7 @@ class DispersionOptimizer:
                 ]
                 best.long_weights = w_smooth
             except Exception as e:
-                print(f"[SMOOTH] failed: {e}, keeping original weights", flush=True)
+                _engine_log.debug(f"[SMOOTH] failed: {e}, keeping original weights")
                 self._last_unsmoothed_basket = None
         else:
             self._last_unsmoothed_basket = None
@@ -2316,21 +2269,21 @@ class DispersionOptimizer:
         # ═══ BUCKET AUDIT (delivered basket must honour the constraints) ═══
         if self._bucket_constraints:
             if not self._bucket_counts_ok(best.long_indices):
-                print(f"⚠️ [BUCKET-WARNING] Delivered basket violates bucket COUNT bounds", flush=True)
+                _engine_log.debug(f"⚠️ [BUCKET-WARNING] Delivered basket violates bucket COUNT bounds")
                 self.log("WARN", "[BUCKET] Delivered basket violates bucket count bounds")
             _g_final = self._bucket_groups_for(best.long_indices)
             if _g_final and not self._weight_solver._groups_satisfied(
                     np.asarray(best.long_weights, dtype=np.float64), _g_final, tol=1e-4):
-                print(f"⚠️ [BUCKET-WARNING] Delivered basket violates bucket WEIGHT bounds", flush=True)
+                _engine_log.debug(f"⚠️ [BUCKET-WARNING] Delivered basket violates bucket WEIGHT bounds")
                 self.log("WARN", "[BUCKET] Delivered basket violates bucket weight bounds")
 
         # ═══ STRIKE AUDIT LOG ═══
         _binding = net_strike_val >= (self.c.max_net_strike - 1e-6) if self.c.max_net_strike > 0 else False
         _violation = net_strike_val > self.c.max_net_strike + 1e-4 if self.c.max_net_strike > 0 else False
         _convention = "net_spread (stock-index)" if is_xcorr else "mono_var_swap"
-        print(f"[STRIKE] convention={_convention} | basket={net_strike_val:.4f} | limit={self.c.max_net_strike:.4f} | binding={_binding}", flush=True)
+        _engine_log.debug(f"[STRIKE] convention={_convention} | basket={net_strike_val:.4f} | limit={self.c.max_net_strike:.4f} | binding={_binding}")
         if _violation:
-            print(f"⚠️ [STRIKE-WARNING] Delivered basket VIOLATES strike limit: {net_strike_val:.4f} > {self.c.max_net_strike:.4f}", flush=True)
+            _engine_log.debug(f"⚠️ [STRIKE-WARNING] Delivered basket VIOLATES strike limit: {net_strike_val:.4f} > {self.c.max_net_strike:.4f}")
             self.log("WARN", f"[STRIKE] Violation: net_strike={net_strike_val:.4f} > limit={self.c.max_net_strike:.4f}")
         
         # ═══ FINAL-RAW (uses same best.long_weights as basket extraction) ═══
@@ -2356,7 +2309,7 @@ class DispersionOptimizer:
                                weighted_strike=_fin_ws)
             raw_final = self._score_fn.raw_metrics(final_net_pnl, ctx)
             self.log("INFO", f"[FINAL-RAW] " + " | ".join(f"{k}={v:.4f}" for k, v in raw_final.items()))
-            print(f"[FINAL-RAW] " + " | ".join(f"{k}={v:.4f}" for k, v in raw_final.items()), flush=True)
+            _engine_log.debug(f"[FINAL-RAW] " + " | ".join(f"{k}={v:.4f}" for k, v in raw_final.items()))
             self._final_raw_min = float(np.min(final_net_pnl))  # For interactive assertion
         except Exception as e:
             self.log("WARN", f"[FINAL-RAW] failed: {e}")
@@ -2534,7 +2487,7 @@ class DispersionOptimizer:
         from scipy.sparse import csr_matrix as _csr
 
         if not self._weight_solver._is_min_payoff_only():
-            print("[MILP] Not min_payoff-only config — skipping.", flush=True)
+            _engine_log.debug("[MILP] Not min_payoff-only config — skipping.")
             return None
 
         is_xcorr = self.is_cross_corridor
@@ -2544,7 +2497,7 @@ class DispersionOptimizer:
         n_stocks = P.shape[1]  # ALL columns = full candidate universe
 
         if n_stocks == 0:
-            print("[MILP] No valid candidates.", flush=True)
+            _engine_log.debug("[MILP] No valid candidates.")
             return None
 
         # Apply same cap/floor as GA evaluation in _fitness
@@ -2557,7 +2510,7 @@ class DispersionOptimizer:
         # for a specific basket selection, not at the matrix level.
         n_days = P.shape[0]
 
-        print(f"[MILP] matrix shape={P.shape} | ga_matrix shape={self._ts_mat.shape} | id(ga_mat)={id(self._ts_mat)}", flush=True)
+        _engine_log.debug(f"[MILP] matrix shape={P.shape} | ga_matrix shape={self._ts_mat.shape} | id(ga_mat)={id(self._ts_mat)}")
 
         # Build per-column strike array (for strike constraint)
         # Invert col_pos: col_index → candidate_index
@@ -2682,7 +2635,7 @@ class DispersionOptimizer:
 
         if not res.success:
             bound = -res.fun if hasattr(res, 'fun') and res.fun is not None else None
-            print(f"[MILP] Failed: {res.message} | bound={bound}", flush=True)
+            _engine_log.debug(f"[MILP] Failed: {res.message} | bound={bound}")
             return {"status": "failed", "message": res.message, "bound": bound}
 
         milp_t = res.x[-1]
@@ -2690,5 +2643,5 @@ class DispersionOptimizer:
         milp_z = res.x[n_stocks:2*n_stocks]
         selected = int(np.round(milp_z).sum())
 
-        print(f"[MILP] Exact optimum: min_payoff={milp_t:.6f} | selected={selected} stocks", flush=True)
+        _engine_log.debug(f"[MILP] Exact optimum: min_payoff={milp_t:.6f} | selected={selected} stocks")
         return {"status": "optimal", "min_payoff": milp_t, "n_selected": selected, "weights": milp_w, "z": milp_z}

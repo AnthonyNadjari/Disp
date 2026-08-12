@@ -74,6 +74,7 @@ def adaptive_pnl(pnl_matrix: np.ndarray, stock_indices: np.ndarray, w: np.ndarra
     else:
         return sub_pnl @ w
 
+from functions.dispersion._logging import logger as _engine_log
 from .metrics import ScoreContext, soft_hit_ratio
 from .score import ScoreFunction
 
@@ -1057,21 +1058,21 @@ class WeightSolver:
                 actual_blend = _raw_blend(cand_pnl, w_cand)
                 actual_disp = float(np.std(w_cand))
 
-                print(f"[SMOOTH-TRY] eps={cur_eps:.2f} success={res.success} dispersion {ref_disp:.4f}->{actual_disp:.4f} min {ref_min:.4f}->{actual_min:.4f} blend {ref_blend:.4f}->{actual_blend:.4f}", flush=True)
+                _engine_log.debug(f"[SMOOTH-TRY] eps={cur_eps:.2f} success={res.success} dispersion {ref_disp:.4f}->{actual_disp:.4f} min {ref_min:.4f}->{actual_min:.4f} blend {ref_blend:.4f}->{actual_blend:.4f}")
 
                 if not self._groups_satisfied(w_cand, group_bounds):
                     continue
                 if actual_disp < ref_disp - 1e-6 and actual_min >= floor_min - 1e-6 and actual_blend >= floor_blend - 1e-6:
-                    print(f"[SMOOTH] accepted: dispersion {ref_disp:.4f}->{actual_disp:.4f} min {ref_min:.4f}->{actual_min:.4f} blend {ref_blend:.4f}->{actual_blend:.4f}", flush=True)
+                    _engine_log.debug(f"[SMOOTH] accepted: dispersion {ref_disp:.4f}->{actual_disp:.4f} min {ref_min:.4f}->{actual_min:.4f} blend {ref_blend:.4f}->{actual_blend:.4f}")
                     return w_cand
                 else:
                     continue
             except Exception as e:
-                print(f"[SMOOTH-TRY] eps={cur_eps:.2f} success=False(exception: {e}) dispersion {ref_disp:.4f}->N/A min {ref_min:.4f}->N/A blend {ref_blend:.4f}->N/A", flush=True)
+                _engine_log.debug(f"[SMOOTH-TRY] eps={cur_eps:.2f} success=False(exception: {e}) dispersion {ref_disp:.4f}->N/A min {ref_min:.4f}->N/A blend {ref_blend:.4f}->N/A")
                 continue
 
         # All attempts failed
-        print(f"[SMOOTH] infeasible even at eps={eps_min * 4:.2f} — weights unchanged", flush=True)
+        _engine_log.debug(f"[SMOOTH] infeasible even at eps={eps_min * 4:.2f} — weights unchanged")
         return w_star
 
     def _solve_concave_blend(
@@ -1488,7 +1489,7 @@ class WeightSolver:
                 first_viol = int(violated_days[0]) if len(violated_days) > 0 else -1
                 active_cols_on_day = np.where(mask_active[first_viol])[0] if first_viol >= 0 and first_viol < n_active_days else []
                 self._log("WARN", f"[BISECT-SANITY] incumbent_f={inc_f:.4f} feasible=False first_violated_day={first_viol} active_cols={list(active_cols_on_day)}")
-                print(f"[BISECT-SANITY] incumbent_f={inc_f:.4f} feasible=False first_violated_day={first_viol} active_cols={list(active_cols_on_day)}", flush=True)
+                _engine_log.debug(f"[BISECT-SANITY] incumbent_f={inc_f:.4f} feasible=False first_violated_day={first_viol} active_cols={list(active_cols_on_day)}")
             else:
                 self._log("DEBUG", f"[BISECT-SANITY] incumbent_f={inc_f:.4f} feasible=True")
 
