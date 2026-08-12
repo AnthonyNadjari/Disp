@@ -987,9 +987,29 @@ with tab1:
                     st.session_state['_vega_inv_df'],
                     num_rows="dynamic", use_container_width=True, key="_vega_inv_editor")
                 st.session_state['_vega_inv_df'] = _vega_inv_edited
+                st.markdown("**♻️ Priorité recyclage**")
+                recycle_weight = st.number_input(
+                    "Poids priorité recyclage (package)", step=0.01, min_value=0.00,
+                    max_value=1.00, value=0.30, key="_recycle_weight",
+                    help="À quel point privilégier un panier CONCENTRÉ en axe "
+                         "(critère B = Σ min(vega_i, cible_i) / V). Entre dans le même "
+                         "mélange normalisé que les autres poids (last_carry, mean_payoff, "
+                         "hit_ratio, min_payoff). 0 = inactif.")
+                # Guard against the silent auto-deactivation the user hit: recycling
+                # asked for, but no axe target anywhere → degenerate metric → dropped.
+                _inv_now = st.session_state.get('_vega_inv_df')
+                _has_target = (_inv_now is not None and not _inv_now.empty
+                               and 'Cible' in _inv_now.columns
+                               and _inv_now['Cible'].astype(str).str.strip().replace('nan', '').any())
+                if recycle_weight > 0 and not _has_target:
+                    st.warning(
+                        "♻️ Poids recyclage > 0 mais l'inventaire Vega est vide (aucune "
+                        "Cible) — le critère serait automatiquement désactivé (métrique "
+                        "dégénérée). Remplis l'inventaire ci-dessus pour qu'il compte.")
             else:
                 vega_v_min = None
                 vega_v_max = None
+                recycle_weight = 0.0
             robustness_check = st.checkbox(
                 "🧪 Robustness check (bootstrap)", value=False,
                 help="Resample the days 300× with replacement and re-rank the winner "
@@ -1033,24 +1053,11 @@ with tab1:
                                                         max_value=1.00, value=0.00,
                                                         help="Minimize the basket's weighted net strike. "
                                                              "The Max net strike hard limit stays active independently.")
-                if st.session_state.get('_vega_toggle', False):
-                    st.markdown("**⚡ Axe recycling criteria (Vega mode)**")
-                    col19d, col19e = st.columns(2)
-                    with col19d:
-                        axe_cleaned_weight = st.number_input(
-                            "Axe book cleaned weight", step=0.01, min_value=0.00,
-                            max_value=1.00, value=0.30,
-                            help="Criterion A: fraction of the desk's axe book cleaned "
-                                 "= Σ min(v_i, target_i) / Σ targets. Default-active in Vega mode.")
-                    with col19e:
-                        axe_recycled_weight = st.number_input(
-                            "Package recycled weight", step=0.01, min_value=0.00,
-                            max_value=1.00, value=0.00,
-                            help="Criterion B: fraction of the package in recycling "
-                                 "= Σ min(v_i, target_i) / V.")
-                else:
-                    axe_cleaned_weight = 0.0
-                    axe_recycled_weight = 0.0
+                # Recycling priority is now the dedicated '♻️ Priorité recyclage'
+                # knob in the Vega block above (criterion B = axe_package_recycled).
+                # Criterion A (axe_book_cleaned) is retired per design decision.
+                axe_cleaned_weight = 0.0
+                axe_recycled_weight = recycle_weight if st.session_state.get('_vega_toggle', False) else 0.0
         # Validation
         score_weights = {
             'last_carry': last_carry_weight,
