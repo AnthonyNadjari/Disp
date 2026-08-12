@@ -1,186 +1,612 @@
-"""normalizers.py — map raw metric values to [0, 1], scale-free.
+"""
+normalizers.py
+==============
 
-═══════════════════════════════════════════════════════════════════════════════
-SCAFFOLDING REPO DE TEST — NE PAS recopier dans le vrai repo.
-Le vrai repo possède son propre normalizers.py ; ce fichier est une
-reconstruction fidèle inférée des usages observés dans score.py /
-weight_solver.py (fit(dict name→array), transform(name, value,
-higher_is_better), transform_smooth(...)).  Si le comportement du vrai
-normalizer diffère, c'est LUI la référence.
-═══════════════════════════════════════════════════════════════════════════════
+Normalizer protocol and three concrete implementations used by the scoring
+pipeline to map raw metric values onto a common [0, 1] scale where **1 is
+always best**.
 
-Contract (used by :class:`~functions.dispersion.scoring.score.ScoreFunction`):
+Public surface
+--------------
+- :class:`Normalizer`         – structural Protocol (type-checking only)
+- :class:`QuantileNormalizer` – empirical CDF / rank-based  (DEFAULT)
+- :class:`ZScoreNormalizer`   – Gaussian CDF
+- :class:`MinMaxNormalizer`   – linear rescaling
 
-- ``fit(reference)`` receives ``{metric_name: 1-D float array}`` containing
-  only finite values, each array of size >= 2 (score.py filters beforehand).
-- ``transform(name, value, higher_is_better)`` -> step-function normalisation
-  in [0, 1].  Rank-based for :class:`QuantileNormalizer`: the fraction of the
-  reference sample that the value beats.
-- ``transform_smooth(name, value, higher_is_better)`` -> continuous,
-  piecewise-linear interpolation of the same mapping (for gradient-based
-  inner solvers).
-- Both raise ``KeyError`` with an actionable message for a metric name that
-  was never fitted — no silent fallback.
+Design notes
+------------
+* ``fit`` must be called before any ``transform*`` call.
+* All ``transform*`` methods clamp output to [0, 1].
+* ``transform`` is intended for final scoring (can be step-wise / piecewise).
+* ``transform_smooth`` is intended for scipy-based weight optimisation and must
+  be continuously differentiable wherever the optimiser queries it.
 """
 
 from __future__ import annotations
 
-import math
-from typing import Dict, Protocol, runtime_checkable
+import bisect
+from typing import Protocol, runtime_checkable
 
 import numpy as np
+from scipy.stats import norm as _norm  # used only by ZScoreNormalizer
 
-__all__ = [
-    "Normalizer",
-    "QuantileNormalizer",
-    "ZScoreNormalizer",
-    "MinMaxNormalizer",
-]
+
+# ---------------------------------------------------------------------------
+# Protocol
+# ---------------------------------------------------------------------------
 
 
 @runtime_checkable
 class Normalizer(Protocol):
-    """Structural protocol for normalizers (fit once, transform many)."""
+    """Structural protocol for all normalizer implementations.
 
-    def fit(self, reference: Dict[str, np.ndarray]) -> None: ...
+    A ``Normalizer`` converts raw metric values into a *goodness* score in
+    ``[0, 1]`` where **1 = best possible** within the reference sample.
 
-    def transform(self, name: str, value: float, higher_is_better: bool) -> float: ...
+    Two transform variants are provided so that the same normalizer can serve
+    both human-readable final scores (``transform``) and differentiable
+    optimisation landscapes (``transform_smooth``).
+    """
 
-    def transform_smooth(self, name: str, value: float, higher_is_better: bool) -> float: ...
+    def fit(self, raw_by_metric: dict[str, np.ndarray]) -> None:
+        """Store reference distributions for every metric.
+
+        Parameters
+        ----------
+        raw_by_metric:
+            Mapping of *metric name* → 1-D array of raw reference values
+            (e.g. drawn from the historical universe of candidates).
+            All arrays must be finite and non-empty.
+        """
+        ...
+
+    def transform(self, name: str, raw: float, higher_is_better: bool) -> float:
+        """Map a single raw observation to a goodness score in ``[0, 1]``.
+
+        The method is guaranteed to be **monotone** with respect to
+        ``higher_is_better``:
+
+        * ``higher_is_better=True``  → score increases as *raw* increases.
+        * ``higher_is_better=False`` → score increases as *raw* decreases.
+
+        Parameters
+        ----------
+        name:
+            Metric identifier; must have been seen during :meth:`fit`.
+        raw:
+            Observed metric value to score.
+        higher_is_better:
+            Direction of the metric.
+
+        Returns
+        -------
+        float
+            Score in ``[0, 1]``.
+        """
+        ...
+
+    def transform_smooth(
+        self, name: str, raw: float, higher_is_better: bool
+    ) -> float:
+        """Differentiable variant of :meth:`transform`.
+
+        Produces the same ordinal ranking as :meth:`transform` but avoids
+        discrete jumps so that automatic-differentiation / finite-difference
+        gradient estimators used by ``scipy.optimize`` receive a smooth loss
+        surface.
+
+        Parameters
+        ----------
+        name:
+            Metric identifier; must have been seen during :meth:`fit`.
+        raw:
+            Observed metric value to score.
+        higher_is_better:
+            Direction of the metric.
+
+        Returns
+        -------
+        float
+            Smooth score in ``[0, 1]``.
+        """
+        ...
 
 
-def _require_fitted(store: dict, name: str, cls_name: str):
-    if name not in store:
-        raise KeyError(
-            f"{cls_name}: metric '{name}' has no fitted reference. "
-            f"Fitted metrics: {sorted(store.keys())}. "
-            f"Call fit() with a reference for this metric first."
-        )
+# ---------------------------------------------------------------------------
+# QuantileNormalizer (DEFAULT)
+# ---------------------------------------------------------------------------
 
 
 class QuantileNormalizer:
-    """Rank-based (empirical CDF) normalisation against a fixed reference.
+    """Empirical-CDF normalizer — the recommended default.
 
-    ``transform`` returns the fraction of reference values the candidate
-    beats (ties counted as beaten for ``higher_is_better=True``); a value of
-    0.90 reads as "better than 90 % of the reference sample".  For
-    ``higher_is_better=False`` the fraction of reference values that are
-    >= value is returned, so lower raw values map to higher scores.
+    Scoring is based on the *rank* of the observation within a reference
+    sample, which makes it robust to outliers and scale-free.
 
-    ``transform_smooth`` linearly interpolates the ECDF between reference
-    points (mid-rank plotting positions), clamped to [0, 1] outside the
-    reference range — continuous and monotone, suitable for SLSQP.
+    ``transform``
+        Uses binary search on the sorted reference array to count how many
+        reference values are beaten.  The result is therefore a *step
+        function* with resolution ``1 / n_reference``.
+
+    ``transform_smooth``
+        Linearly interpolates between consecutive order statistics to produce
+        a piecewise-linear CDF that is differentiable almost everywhere
+        (discontinuity only at the exact sample points, which have measure
+        zero).  Suitable for finite-difference gradient estimation used by
+        ``scipy.optimize``.
+
+    Both variants are strictly monotone on the support of the reference
+    sample and clamp to ``[0, 1]`` outside it.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> norm = QuantileNormalizer()
+    >>> rng = np.random.default_rng(0)
+    >>> norm.fit({"vol": rng.normal(0.15, 0.05, 1000)})
+    >>> norm.transform("vol", 0.10, higher_is_better=False)  # low vol is good
+    0.841...
     """
 
-    #: Number of quantile knots for the smooth (interpolated) transform.
-    #: Coarser than the raw reference on purpose: fewer kinks → smoother
-    #: SLSQP landscape, while the step transform keeps full rank resolution.
-    N_SMOOTH_KNOTS = 41
-
     def __init__(self) -> None:
-        self._sorted: Dict[str, np.ndarray] = {}
-        self._knots: Dict[str, np.ndarray] = {}
+        # metric_name → sorted 1-D ndarray of reference values
+        self._sorted: dict[str, np.ndarray] = {}
 
-    def fit(self, reference: Dict[str, np.ndarray]) -> None:
-        self._sorted = {}
-        self._knots = {}
-        for name, arr in reference.items():
-            a = np.asarray(arr, dtype=np.float64)
+    # ------------------------------------------------------------------
+    # fit
+    # ------------------------------------------------------------------
+
+    def fit(self, raw_by_metric: dict[str, np.ndarray]) -> None:
+        """Sort and store one reference array per metric.
+
+        Parameters
+        ----------
+        raw_by_metric:
+            Mapping of metric name → 1-D array of raw reference values.
+            NaN / inf values are silently dropped before sorting.
+        """
+        self._sorted.clear()
+        for name, arr in raw_by_metric.items():
+            a = np.asarray(arr, dtype=float).ravel()
             a = a[np.isfinite(a)]
+            if a.size == 0:
+                raise ValueError(
+                    f"QuantileNormalizer.fit: metric '{name}' produced an "
+                    "empty finite array."
+                )
             if a.size < 2:
                 raise ValueError(
-                    f"QuantileNormalizer.fit: reference for '{name}' needs >= 2 "
-                    f"finite values, got {a.size}."
+                    f"QuantileNormalizer.fit: metric '{name}' needs at least 2 "
+                    f"distinct reference values, got {a.size}."
                 )
             self._sorted[name] = np.sort(a)
-            k = min(self.N_SMOOTH_KNOTS, a.size)
-            self._knots[name] = np.quantile(self._sorted[name], np.linspace(0.0, 1.0, k))
 
-    def transform(self, name: str, value: float, higher_is_better: bool) -> float:
-        _require_fitted(self._sorted, name, "QuantileNormalizer")
-        ref = self._sorted[name]
-        n = ref.size
+    # ------------------------------------------------------------------
+    # transform  (step-function empirical CDF)
+    # ------------------------------------------------------------------
+
+    def transform(self, name: str, raw: float, higher_is_better: bool) -> float:
+        """Score via empirical CDF (binary-search rank).
+
+        The fraction of reference values *beaten* by *raw*:
+
+        * ``higher_is_better=True``  → ``fraction of ref values < raw``
+        * ``higher_is_better=False`` → ``fraction of ref values > raw``
+
+        Clamped to ``[0, 1]``.  Values above the reference maximum map to
+        ``1.0``; values below the minimum map to ``0.0``.
+
+        Parameters
+        ----------
+        name:
+            Metric name (must be present in the fitted data).
+        raw:
+            Raw observed value.
+        higher_is_better:
+            Monotonicity direction.
+
+        Returns
+        -------
+        float
+            Goodness score in ``[0, 1]``.
+        """
+        self._check_fitted(name)
+        arr = self._sorted[name]
+        n = len(arr)
+
         if higher_is_better:
-            frac = np.searchsorted(ref, value, side="right") / n
+            # Number of reference values strictly less than raw
+            rank = bisect.bisect_left(arr, raw)
         else:
-            frac = (n - np.searchsorted(ref, value, side="left")) / n
-        return float(frac)
+            # Number of reference values strictly greater than raw
+            rank = n - bisect.bisect_right(arr, raw)
 
-    def transform_smooth(self, name: str, value: float, higher_is_better: bool) -> float:
-        _require_fitted(self._sorted, name, "QuantileNormalizer")
-        knots = self._knots[name]
-        # Piecewise-linear interpolation of the ECDF over a coarse quantile
-        # grid (min → 0, max → 1): non-zero gradient across the whole
-        # reference hull, exact agreement with the step transform at the
-        # extremes, and far fewer kinks than raw-reference interpolation —
-        # a smoother landscape for the gradient-based inner solver.
-        positions = np.linspace(0.0, 1.0, knots.size)
-        cdf = float(np.interp(value, knots, positions))
-        return cdf if higher_is_better else 1.0 - cdf
+        score = rank / n
+        return float(np.clip(score, 0.0, 1.0))
+
+    # ------------------------------------------------------------------
+    # transform_smooth  (piecewise-linear interpolated CDF)
+    # ------------------------------------------------------------------
+
+    def transform_smooth(
+        self, name: str, raw: float, higher_is_better: bool
+    ) -> float:
+        """Score via linearly-interpolated empirical CDF.
+
+        Between consecutive order statistics ``x[i]`` and ``x[i+1]`` the CDF
+        is linearly interpolated, producing a piecewise-linear, differentiable
+        (almost everywhere) function.  Outside the reference support the CDF
+        is linearly extrapolated to preserve gradient signal:
+
+        * ``raw < x[0]``   → extrapolated below 0.0
+        * ``raw > x[-1]``  → extrapolated above 1.0
+        (then clipped to [0, 1] at the end)
+
+        Parameters
+        ----------
+        name:
+            Metric name (must be present in the fitted data).
+        raw:
+            Raw observed value.
+        higher_is_better:
+            Monotonicity direction.
+
+        Returns
+        -------
+        float
+            Smooth goodness score in ``[0, 1]``.
+        """
+        self._check_fitted(name)
+        arr = self._sorted[name]
+        n = len(arr)
+
+        # Use numpy's linear interpolation on the empirical CDF grid.
+        # xp: order statistics  yp: CDF values at those points [0/(n-1) … 1]
+        xp = arr
+        yp = np.linspace(0.0, 1.0, n)
+
+        # Linear extrapolation beyond reference range to preserve gradient
+        if n >= 2:
+            if raw < arr[0]:
+                # Below min: use slope from first segment
+                slope = (yp[1] - yp[0]) / (arr[1] - arr[0])
+                cdf_value = yp[0] + (raw - arr[0]) * slope
+            elif raw > arr[-1]:
+                # Above max: use slope from last segment
+                slope = (yp[-1] - yp[-2]) / (arr[-1] - arr[-2])
+                cdf_value = yp[-1] + (raw - arr[-1]) * slope
+            else:
+                # Inside range: use linear interpolation
+                cdf_value = float(np.interp(raw, xp, yp))
+        else:
+            # Edge case: single reference value
+            cdf_value = 0.0 if raw < arr[0] else 1.0
+
+        if not higher_is_better:
+            cdf_value = 1.0 - cdf_value
+
+        # No clip — linear extrapolation beyond [0,1] is the intended gradient signal
+        return float(cdf_value)
+
+    # ------------------------------------------------------------------
+    # internal helpers
+    # ------------------------------------------------------------------
+
+    def _check_fitted(self, name: str) -> None:
+        if not self._sorted:
+            raise RuntimeError(
+                "QuantileNormalizer has not been fitted yet. Call fit() first."
+            )
+        if name not in self._sorted:
+            raise KeyError(
+                f"QuantileNormalizer: metric '{name}' was not seen during fit. "
+                f"Available metrics: {sorted(self._sorted)}"
+            )
+
+    def __repr__(self) -> str:  # pragma: no cover
+        n = len(self._sorted)
+        fitted = f"fitted on {n} metric(s)" if n else "not fitted"
+        return f"QuantileNormalizer({fitted})"
+
+
+# ---------------------------------------------------------------------------
+# ZScoreNormalizer
+# ---------------------------------------------------------------------------
 
 
 class ZScoreNormalizer:
-    """Gaussian-CDF normalisation: Φ((value − mean) / std) of the reference."""
+    """Gaussian-CDF normalizer.
+
+    Assumes each metric is approximately normally distributed in the reference
+    sample.  The raw value is standardised and then passed through the normal
+    CDF ``Φ``, which maps ℝ → (0, 1).
+
+    ``transform`` and ``transform_smooth`` are identical because the Gaussian
+    CDF is already infinitely differentiable.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> norm = ZScoreNormalizer()
+    >>> rng = np.random.default_rng(42)
+    >>> norm.fit({"ret": rng.normal(0.08, 0.02, 500)})
+    >>> norm.transform("ret", 0.08, higher_is_better=True)  # exactly mean → 0.5
+    0.5
+    """
 
     def __init__(self) -> None:
-        self._stats: Dict[str, tuple] = {}
+        self._mean: dict[str, float] = {}
+        self._std: dict[str, float] = {}
 
-    def fit(self, reference: Dict[str, np.ndarray]) -> None:
-        self._stats = {}
-        for name, arr in reference.items():
-            a = np.asarray(arr, dtype=np.float64)
+    # ------------------------------------------------------------------
+    # fit
+    # ------------------------------------------------------------------
+
+    def fit(self, raw_by_metric: dict[str, np.ndarray]) -> None:
+        """Compute and store mean and standard deviation per metric.
+
+        Parameters
+        ----------
+        raw_by_metric:
+            Mapping of metric name → 1-D array of raw reference values.
+            NaN / inf values are silently dropped before statistics are
+            computed.
+
+        Raises
+        ------
+        ValueError
+            If the finite sample has fewer than 2 observations (std undefined)
+            or all values are identical (std = 0).
+        """
+        self._mean.clear()
+        self._std.clear()
+        for name, arr in raw_by_metric.items():
+            a = np.asarray(arr, dtype=float).ravel()
             a = a[np.isfinite(a)]
             if a.size < 2:
                 raise ValueError(
-                    f"ZScoreNormalizer.fit: reference for '{name}' needs >= 2 "
-                    f"finite values, got {a.size}."
+                    f"ZScoreNormalizer.fit: metric '{name}' needs at least 2 "
+                    f"finite values; got {a.size}."
                 )
-            self._stats[name] = (float(a.mean()), float(a.std(ddof=1)))
+            std = float(np.std(a, ddof=1))
+            if std == 0.0:
+                raise ValueError(
+                    f"ZScoreNormalizer.fit: metric '{name}' has zero variance; "
+                    "z-score normalisation is undefined."
+                )
+            self._mean[name] = float(np.mean(a))
+            self._std[name] = std
 
-    def _cdf(self, name: str, value: float) -> float:
-        mean, std = self._stats[name]
-        if std <= 0.0:
-            return 0.5
-        z = (value - mean) / std
-        return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+    # ------------------------------------------------------------------
+    # transform
+    # ------------------------------------------------------------------
 
-    def transform(self, name: str, value: float, higher_is_better: bool) -> float:
-        _require_fitted(self._stats, name, "ZScoreNormalizer")
-        c = self._cdf(name, value)
-        return c if higher_is_better else 1.0 - c
+    def transform(self, name: str, raw: float, higher_is_better: bool) -> float:
+        """Map raw value to ``Φ(z)`` goodness score.
 
-    # Already smooth — same mapping.
-    def transform_smooth(self, name: str, value: float, higher_is_better: bool) -> float:
-        return self.transform(name, value, higher_is_better)
+        Computes ``z = (raw - mean) / std`` then applies the standard-normal
+        CDF.  If ``higher_is_better=False`` the score is flipped via
+        ``1 - Φ(z)``.
+
+        Parameters
+        ----------
+        name:
+            Metric name (must be present in the fitted data).
+        raw:
+            Raw observed value.
+        higher_is_better:
+            Monotonicity direction.
+
+        Returns
+        -------
+        float
+            Goodness score in ``[0, 1]``.
+        """
+        self._check_fitted(name)
+        z = (raw - self._mean[name]) / self._std[name]
+        score = float(_norm.cdf(z))
+        if not higher_is_better:
+            score = 1.0 - score
+        return float(np.clip(score, 0.0, 1.0))
+
+    # ------------------------------------------------------------------
+    # transform_smooth  (identical — Gaussian CDF is C-infinity)
+    # ------------------------------------------------------------------
+
+    def transform_smooth(
+        self, name: str, raw: float, higher_is_better: bool
+    ) -> float:
+        """Smooth score — identical to :meth:`transform` for ``ZScoreNormalizer``.
+
+        The Gaussian CDF is already infinitely differentiable, so no
+        additional smoothing is required.
+
+        Parameters
+        ----------
+        name:
+            Metric name (must be present in the fitted data).
+        raw:
+            Raw observed value.
+        higher_is_better:
+            Monotonicity direction.
+
+        Returns
+        -------
+        float
+            Smooth goodness score in ``[0, 1]``.
+        """
+        return self.transform(name, raw, higher_is_better)
+
+    # ------------------------------------------------------------------
+    # internal helpers
+    # ------------------------------------------------------------------
+
+    def _check_fitted(self, name: str) -> None:
+        if not self._mean:
+            raise RuntimeError(
+                "ZScoreNormalizer has not been fitted yet. Call fit() first."
+            )
+        if name not in self._mean:
+            raise KeyError(
+                f"ZScoreNormalizer: metric '{name}' was not seen during fit. "
+                f"Available metrics: {sorted(self._mean)}"
+            )
+
+    def __repr__(self) -> str:  # pragma: no cover
+        n = len(self._mean)
+        fitted = f"fitted on {n} metric(s)" if n else "not fitted"
+        return f"ZScoreNormalizer({fitted})"
+
+
+# ---------------------------------------------------------------------------
+# MinMaxNormalizer
+# ---------------------------------------------------------------------------
 
 
 class MinMaxNormalizer:
-    """Affine normalisation onto [0, 1] using the reference min/max."""
+    """Linear min–max rescaling normalizer.
+
+    Maps raw values linearly onto ``[0, 1]`` using the minimum and maximum
+    of the reference sample.  Values outside the training range are clamped.
+
+    ``transform`` and ``transform_smooth`` are identical because the linear
+    mapping is already smooth.
+
+    .. warning::
+        Sensitive to outliers in the reference sample because a single extreme
+        value can dominate the range.  Consider using :class:`QuantileNormalizer`
+        when outliers are a concern.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> norm = MinMaxNormalizer()
+    >>> norm.fit({"price": np.array([10.0, 20.0, 30.0, 40.0, 50.0])})
+    >>> norm.transform("price", 30.0, higher_is_better=True)
+    0.5
+    >>> norm.transform("price", 30.0, higher_is_better=False)
+    0.5
+    """
 
     def __init__(self) -> None:
-        self._range: Dict[str, tuple] = {}
+        self._min: dict[str, float] = {}
+        self._max: dict[str, float] = {}
 
-    def fit(self, reference: Dict[str, np.ndarray]) -> None:
-        self._range = {}
-        for name, arr in reference.items():
-            a = np.asarray(arr, dtype=np.float64)
+    # ------------------------------------------------------------------
+    # fit
+    # ------------------------------------------------------------------
+
+    def fit(self, raw_by_metric: dict[str, np.ndarray]) -> None:
+        """Compute and store per-metric minimum and maximum.
+
+        Parameters
+        ----------
+        raw_by_metric:
+            Mapping of metric name → 1-D array of raw reference values.
+            NaN / inf values are silently dropped.
+
+        Raises
+        ------
+        ValueError
+            If all values for a metric are identical (range = 0) or the
+            finite sample is empty.
+        """
+        self._min.clear()
+        self._max.clear()
+        for name, arr in raw_by_metric.items():
+            a = np.asarray(arr, dtype=float).ravel()
             a = a[np.isfinite(a)]
-            if a.size < 2:
+            if a.size == 0:
                 raise ValueError(
-                    f"MinMaxNormalizer.fit: reference for '{name}' needs >= 2 "
-                    f"finite values, got {a.size}."
+                    f"MinMaxNormalizer.fit: metric '{name}' produced an empty "
+                    "finite array."
                 )
-            self._range[name] = (float(a.min()), float(a.max()))
+            lo, hi = float(np.min(a)), float(np.max(a))
+            if lo == hi:
+                raise ValueError(
+                    f"MinMaxNormalizer.fit: metric '{name}' has zero range "
+                    f"(all values = {lo}); min–max normalisation is undefined."
+                )
+            self._min[name] = lo
+            self._max[name] = hi
 
-    def transform(self, name: str, value: float, higher_is_better: bool) -> float:
-        _require_fitted(self._range, name, "MinMaxNormalizer")
-        lo, hi = self._range[name]
-        if hi - lo <= 0.0:
-            score = 0.5
-        else:
-            score = min(1.0, max(0.0, (value - lo) / (hi - lo)))
-        return score if higher_is_better else 1.0 - score
+    # ------------------------------------------------------------------
+    # transform
+    # ------------------------------------------------------------------
 
-    # Already piecewise-linear — same mapping.
-    def transform_smooth(self, name: str, value: float, higher_is_better: bool) -> float:
-        return self.transform(name, value, higher_is_better)
+    def transform(self, name: str, raw: float, higher_is_better: bool) -> float:
+        """Map raw value linearly to ``[0, 1]``.
+
+        Applies ``(raw - min) / (max - min)`` and flips if
+        ``higher_is_better=False``.  Values outside ``[min, max]`` are
+        clamped to ``[0, 1]``.
+
+        Parameters
+        ----------
+        name:
+            Metric name (must be present in the fitted data).
+        raw:
+            Raw observed value.
+        higher_is_better:
+            Monotonicity direction.
+
+        Returns
+        -------
+        float
+            Goodness score in ``[0, 1]``.
+        """
+        self._check_fitted(name)
+        lo = self._min[name]
+        hi = self._max[name]
+        score = (raw - lo) / (hi - lo)
+        if not higher_is_better:
+            score = 1.0 - score
+        return float(np.clip(score, 0.0, 1.0))
+
+    # ------------------------------------------------------------------
+    # transform_smooth  (identical — linear map is C-infinity)
+    # ------------------------------------------------------------------
+
+    def transform_smooth(
+        self, name: str, raw: float, higher_is_better: bool
+    ) -> float:
+        """Smooth score — identical to :meth:`transform` for ``MinMaxNormalizer``.
+
+        The linear map is already infinitely differentiable, so no additional
+        smoothing is required.
+
+        Parameters
+        ----------
+        name:
+            Metric name (must be present in the fitted data).
+        raw:
+            Raw observed value.
+        higher_is_better:
+            Monotonicity direction.
+
+        Returns
+        -------
+        float
+            Smooth goodness score in ``[0, 1]``.
+        """
+        return self.transform(name, raw, higher_is_better)
+
+    # ------------------------------------------------------------------
+    # internal helpers
+    # ------------------------------------------------------------------
+
+    def _check_fitted(self, name: str) -> None:
+        if not self._min:
+            raise RuntimeError(
+                "MinMaxNormalizer has not been fitted yet. Call fit() first."
+            )
+        if name not in self._min:
+            raise KeyError(
+                f"MinMaxNormalizer: metric '{name}' was not seen during fit. "
+                f"Available metrics: {sorted(self._min)}"
+            )
+
+    def __repr__(self) -> str:  # pragma: no cover
+        n = len(self._min)
+        fitted = f"fitted on {n} metric(s)" if n else "not fitted"
+        return f"MinMaxNormalizer({fitted})"

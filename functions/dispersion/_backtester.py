@@ -1,151 +1,956 @@
-"""_backtester.py — data loading, swap P&L kernels and basket backtesting.
-
-═══════════════════════════════════════════════════════════════════════════════
-SCAFFOLDING REPO DE TEST — NE PAS recopier dans le vrai repo.
-Le vrai repo possède son propre _backtester.py (Bloomberg/xbbg + kernels numba).
-Ce fichier fournit uniquement les noms importés par _optimizer.py/_api.py pour
-que les modules s'importent et que les tests offline tournent :
-
-    DispersionDataLoader, DispersionBacktester, SwapCalculator,
-    _rolling_pnl_volswap, _rolling_pnl_corridor
-
-- Les kernels rolling sont des implémentations numpy plausibles (fenêtre
-  n_exp, annualisation 252, cap local) pour des expériences synthétiques.
-- Tout accès données (DispersionDataLoader.load) ou backtest réel
-  (DispersionBacktester.run / run_from_optimization) lève une RuntimeError
-  claire : pas de Bloomberg ici, pas de fallback silencieux.
-═══════════════════════════════════════════════════════════════════════════════
+"""
+Backtest engine — swap calculation, basket backtesting, and data loading.
+Handles:
+  - DROP_INCOMPLETE_DAYS: only keep days where ALL legs have data
+  - ADAPTIVE_REWEIGHT: redistribute weights for missing legs, track active count
+  - Direct Bloomberg fetch via xbbg for price data
+Uses numpy throughout for performance — no pandas row iteration.
 """
 
 from __future__ import annotations
 
-from typing import Dict, Optional
-
 import numpy as np
+import numba as nb
 import pandas as pd
+from datetime import date, datetime, timedelta
+from dateutil.relativedelta import relativedelta
+from typing import Dict, List, Optional, Tuple, Any
 
-from functions.dispersion.models import BacktestResult, SwapConfig
-
-__all__ = [
-    "DispersionDataLoader",
-    "DispersionBacktester",
-    "SwapCalculator",
-    "_rolling_pnl_volswap",
-    "_rolling_pnl_corridor",
-]
-
-_SCAFFOLD_MSG = (
-    "test-repo scaffolding: functions/dispersion/_backtester.py is a stub. "
-    "Bloomberg/xbbg data access and the production backtester are only "
-    "available in the real repo. Offline paths: drive DispersionOptimizer "
-    "directly with a synthetic pnl_matrix, or replay a saved run bundle "
-    "(functions.dispersion.run_bundle)."
+from functions.dispersion.models import (
+    SwapConfig,
+    BacktestResult,
+    MissingDataPolicy,
+    DispersionLeg,
+    BasketInput,
+    ProductType,
 )
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Swap Calculator
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def _rolling_pnl_volswap(prices: np.ndarray, strike: float, n_exp: int,
-                         local_cap: float) -> np.ndarray:
-    """Rolling vol-swap payoff (decimal): min(realized_vol, cap·K) − K.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Numba kernels (cached for fast re-execution)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    Realized vol at row t = annualised std of log-returns over the trailing
-    ``n_exp`` observations ending at t.  Rows before warm-up are NaN.
+@nb.jit(nopython=True, cache=True)
+def _vol_swap_window(prices: np.ndarray, strike: float, n_exp: int, local_cap: float) -> float:
+    """Vol swap P&L for a single rolling window. Skips first return to match original."""
+    if np.isnan(prices).any():
+        return np.nan
+    n = len(prices)
+    sq_logs = np.empty(n - 1)
+    for i in range(1, n):
+        if prices[i - 1] <= 0:
+            return np.nan
+        sq_logs[i - 1] = np.log(prices[i] / prices[i - 1]) ** 2
+    # Original Gaia_PP uses sq_logs[1:] — skips the first daily return in window
+    realized = np.sqrt(np.sum(sq_logs[1:]) * 252.0 / n_exp)
+    if strike != 0:
+        return min(realized, local_cap * strike) - strike
+    return realized
+
+@nb.jit(nopython=True, cache=True)
+def _corridor_varswap_window(
+    prices_var: np.ndarray,
+    prices_corr: np.ndarray,
+    strike: float,
+    ubar: float,
+    dbar: float,
+    n_exp: int,
+    local_cap: float,
+) -> float:
+    """Corridor variance swap P&L. Corridor observed on prices_corr, variance on prices_var."""
+    if np.isnan(prices_var).any() or np.isnan(prices_corr).any():
+        return np.nan
+
+    upper = prices_corr[0] * ubar
+    lower = prices_corr[0] * dbar
+    n = len(prices_var)
+    sq_logs = np.empty(n - 1)
+    for i in range(1, n):
+        if prices_var[i - 1] <= 0:
+            return np.nan
+        sq_logs[i - 1] = np.log(prices_var[i] / prices_var[i - 1]) ** 2
+    min_len = min(len(prices_var), len(prices_corr))
+    in_corridor = np.zeros(min_len - 1)
+    for i in range(1, min_len):
+        if lower <= prices_corr[i] <= upper and lower <= prices_corr[i - 1] <= upper:
+            in_corridor[i - 1] = 1.0
+    M = np.sum(in_corridor)
+    if M > 0:
+        corridor_sum = 0.0
+        for i in range(len(in_corridor)):
+            if in_corridor[i] > 0:
+                corridor_sum += sq_logs[i]
+        # Expected Var mode: strike=0 means return realized variance (no cap, no P&L)
+        if strike == 0.0:
+            return 252.0 / n_exp * corridor_sum
+        capped = min(252.0 / M * corridor_sum, (strike * local_cap) ** 2)
+        return ((capped - strike ** 2) * M / n_exp) / (2.0 * strike)
+    return 0.0
+
+@nb.jit(nopython=True, cache=True)
+def _rolling_pnl_volswap(prices: np.ndarray, strike: float, n_exp: int, local_cap: float) -> np.ndarray:
     """
-    p = np.asarray(prices, dtype=np.float64)
-    out = np.full(p.shape[0], np.nan)
-    if p.shape[0] < n_exp + 1:
-        return out
-    with np.errstate(divide="ignore", invalid="ignore"):
-        r = np.diff(np.log(p))
-    r2 = r * r
-    csum = np.concatenate([[0.0], np.nancumsum(r2)])
-    cap = local_cap * strike
-    for t in range(n_exp, p.shape[0]):
-        window_sum = csum[t] - csum[t - n_exp]
-        rv = np.sqrt(252.0 * window_sum / n_exp)
-        out[t] = min(rv, cap) - strike
-    return out
-
-
-def _rolling_pnl_corridor(var_prices: np.ndarray, corridor_prices: np.ndarray,
-                          strike: float, barrier_up: float, barrier_down: float,
-                          n_exp: int, local_cap: float) -> np.ndarray:
-    """Rolling corridor-variance payoff (decimal): capped corridor vol − K.
-
-    A day contributes its squared log-return of ``var_prices`` only when the
-    T−1 corridor price lies within [barrier_down, barrier_up] × the corridor
-    price at the window start.  Annualisation divides by ``n_exp`` (expected
-    observation count), the corridor convention.
+    Full rolling vol swap P&L array with skip-NaN windowing.
+    Matches original Gaia_PP behavior: for each date, take the last n_exp+1 VALID
+    observations (skipping NaN days), allowing the window to extend further back.
+    Optimized: O(n) cumulative valid count instead of O(n^2) linear search.
     """
-    pv = np.asarray(var_prices, dtype=np.float64)
-    pc = np.asarray(corridor_prices, dtype=np.float64)
-    n = min(pv.shape[0], pc.shape[0])
-    out = np.full(pv.shape[0], np.nan)
-    if n < n_exp + 1:
-        return out
-    with np.errstate(divide="ignore", invalid="ignore"):
-        rv = np.diff(np.log(pv[:n]))
-    rv2 = np.concatenate([[0.0], rv * rv])  # aligned: rv2[u] = return into day u
-    cap_var = (local_cap * strike) ** 2
-    for t in range(n_exp, n):
-        s = t - n_exp
-        ref = pc[s]
-        if not np.isfinite(ref) or ref <= 0:
+    n = len(prices)
+    out = np.full(n, np.nan)
+    # Pre-compute valid indices
+    valid_indices = np.empty(n, dtype=np.int64)
+    n_valid = 0
+    for i in range(n):
+        if not np.isnan(prices[i]):
+            valid_indices[n_valid] = i
+            n_valid += 1
+    # Pre-compute cumulative valid count at each position (O(n))
+    cum_valid = np.zeros(n, dtype=np.int64)
+    count = 0
+    for i in range(n):
+        if not np.isnan(prices[i]):
+            count += 1
+        cum_valid[i] = count
+    # For each date, use cumulative count to find window start (O(1) per date)
+    for i in range(n):
+        c = cum_valid[i]
+        if c < n_exp + 1:
             continue
-        lo, hi = barrier_down * ref, barrier_up * ref
-        acc = 0.0
-        for u in range(s + 1, t + 1):
-            cond = pc[u - 1]  # T/T-1 corridor condition
-            if np.isfinite(cond) and lo <= cond <= hi and np.isfinite(rv2[u]):
-                acc += rv2[u]
-        realized_var = min(252.0 * acc / n_exp, cap_var)
-        out[t] = np.sqrt(realized_var) - strike
+
+        # Extract last n_exp+1 valid prices
+        window = np.empty(n_exp + 1)
+        start_v = c - (n_exp + 1)
+        for k in range(n_exp + 1):
+            window[k] = prices[valid_indices[start_v + k]]
+        out[i] = _vol_swap_window(window, strike, n_exp, local_cap)
     return out
 
+@nb.jit(nopython=True, cache=True)
+def _rolling_pnl_corridor(
+    prices_var: np.ndarray,
+    prices_corr: np.ndarray,
+    strike: float,
+    ubar: float,
+    dbar: float,
+    n_exp: int,
+    local_cap: float,
+) -> np.ndarray:
+    """
+    Full rolling corridor var swap P&L array with skip-NaN windowing.
+    For each date, take last n_exp+1 observations where BOTH var and corr are valid.
+    """
+    n = min(len(prices_var), len(prices_corr))
+    out = np.full(n, np.nan)
+    # Pre-compute jointly-valid indices
+    valid_indices = np.empty(n, dtype=np.int64)
+    n_valid = 0
+    for i in range(n):
+        if not np.isnan(prices_var[i]) and not np.isnan(prices_corr[i]):
+            valid_indices[n_valid] = i
+            n_valid += 1
+    for i in range(n):
+        count = 0
+        for v in range(n_valid):
+            if valid_indices[v] <= i:
+                count += 1
+            else:
+                break
+
+        if count < n_exp + 1:
+            continue
+
+        start_v = count - (n_exp + 1)
+        w_var = np.empty(n_exp + 1)
+        w_corr = np.empty(n_exp + 1)
+        for k in range(n_exp + 1):
+            idx = valid_indices[start_v + k]
+            w_var[k] = prices_var[idx]
+            w_corr[k] = prices_corr[idx]
+        out[i] = _corridor_varswap_window(w_var, w_corr, strike, ubar, dbar, n_exp, local_cap)
+    return out
 
 class SwapCalculator:
-    """Dispatch P&L kernel by product type (scaffold)."""
-
-    def __init__(self, config: SwapConfig) -> None:
-        self.config = config
-
-    def compute(self, prices: np.ndarray, strike: float,
-                corridor_prices: Optional[np.ndarray] = None) -> np.ndarray:
-        cfg = self.config
-        if cfg.is_vol_swap:
-            return _rolling_pnl_volswap(prices, strike, cfg.n_exp, cfg.local_cap)
-        corr = corridor_prices if corridor_prices is not None else prices
-        return _rolling_pnl_corridor(
-            prices, corr, strike, cfg.barrier_up, cfg.barrier_down,
-            cfg.n_exp, cfg.local_cap)
-
-
-class DispersionDataLoader:
-    """Bloomberg price loader — unavailable in the test repo (scaffold)."""
-
-    def __init__(self, config: SwapConfig) -> None:
-        self.config = config
-
-    def load(self, basket) -> Dict:
-        raise RuntimeError(_SCAFFOLD_MSG)
-
-
-class DispersionBacktester:
-    """Basket backtester — construction only in the test repo (scaffold).
-
-    DispersionOptimizer.__init__ instantiates this class, so the constructor
-    must succeed; any actual backtest run raises with a clear message.
+    """
+    Computes rolling P&L for vol swaps, var swaps, and corridor var swaps.
+    Wraps numba kernels with a clean Python API.
+    Usage:
+        calc = SwapCalculator(config)
+        pnl_array = calc.compute(prices, strike=0.22)
+        pnl_cross = calc.compute(leg_prices, strike=0.25, corridor_prices=index_prices)
     """
 
-    def __init__(self, config: SwapConfig) -> None:
+    def __init__(self, config: SwapConfig):
         self.config = config
 
-    def run(self, price_data: pd.DataFrame, legs, weights,
-            index_data: Optional[pd.DataFrame] = None,
-            start_date=None) -> BacktestResult:
-        raise RuntimeError(_SCAFFOLD_MSG)
+    def compute(
+        self,
+        prices: np.ndarray,
+        strike: float,
+        corridor_prices: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """
+        Compute rolling swap P&L for one leg.
+        Args:
+            prices: Price array (variance asset)
+            strike: Swap strike as decimal (e.g. 0.22)
+            corridor_prices: If provided, corridor observed on this asset (cross-corridor)
+        Returns:
+            np.ndarray of P&L values. NaN where insufficient data.
+        """
+        c = self.config
+        # Expected Var mode: strike=0, compute realized variance/vol (no P&L)
+        if strike == 0.0:
+            if c.is_vol_swap:
+                return _rolling_pnl_volswap(prices, 0.0, c.n_exp, c.local_cap)
+            elif corridor_prices is not None:
+                return _rolling_pnl_corridor(prices, corridor_prices, 0.0, c.barrier_up, c.barrier_down, c.n_exp, c.local_cap)
+            else:
+                return _rolling_pnl_corridor(prices, prices, 0.0, c.barrier_up, c.barrier_down, c.n_exp, c.local_cap)
 
-    def run_from_optimization(self, price_data: pd.DataFrame, long_basket,
-                              short_basket, legs,
-                              index_data: Optional[pd.DataFrame] = None,
-                              start_date=None) -> BacktestResult:
-        raise RuntimeError(_SCAFFOLD_MSG)
+        if c.is_vol_swap:
+            return _rolling_pnl_volswap(prices, strike, c.n_exp, c.local_cap)
+        elif corridor_prices is not None:
+            # Cross-corridor: variance from `prices`, corridor from `corridor_prices`
+            return _rolling_pnl_corridor(prices, corridor_prices, strike, c.barrier_up, c.barrier_down, c.n_exp, c.local_cap)
+        else:
+            # Standard corridor: same asset for both
+            return _rolling_pnl_corridor(prices, prices, strike, c.barrier_up, c.barrier_down, c.n_exp, c.local_cap)
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Dispersion Backtester
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _build_active_mask(is_valid: np.ndarray, weighted_idx: List[int],
+                       n_rows: int, n_cols: int, grace: int) -> np.ndarray:
+    """
+    Build active mask: a leg is active once it has its first valid data point,
+    and stays active unless consecutive NaN exceeds grace days.
+    Vectorized per-column (one loop over columns, not rows).
+    """
+    active_mask = np.zeros((n_rows, n_cols), dtype=bool)
+    for j in weighted_idx:
+        col_valid = is_valid[:, j]  # bool array length n_rows
+        # Find first valid index — leg not active before this
+        first_valid_indices = np.where(col_valid)[0]
+        if len(first_valid_indices) == 0:
+            continue
+        first_valid = first_valid_indices[0]
+        # From first_valid onward, compute consecutive NaN stretches
+        # A leg is active on day i if:
+        #   - it has valid data on day i, OR
+        #   - it started AND consecutive NaN count <= grace
+        consecutive_nan = 0
+        for i in range(first_valid, n_rows):
+            if col_valid[i]:
+                consecutive_nan = 0
+                active_mask[i, j] = True
+            else:
+                consecutive_nan += 1
+                if consecutive_nan <= grace:
+                    active_mask[i, j] = True
+    return active_mask
+
+class DispersionBacktester:
+    """
+    Runs basket-level backtests.
+    Two missing-data strategies:
+      1. DROP_INCOMPLETE_DAYS: Remove any day where ANY basket leg has no data.
+      2. ADAPTIVE_REWEIGHT: Redistribute weight from missing legs to available ones.
+    Usage:
+        config = SwapConfig.volswap(n_exp=310, missing_data_policy=MissingDataPolicy.ADAPTIVE_REWEIGHT)
+        bt = DispersionBacktester(config)
+        result = bt.run(price_data, legs, weights)
+    """
+
+    def __init__(self, config: SwapConfig):
+        self.config = config
+        self._calc = SwapCalculator(config)
+        self._cross_legs = {}  # populated during cross-corridor _compute_all_pnl
+
+    def _series_key(self, leg: DispersionLeg) -> str:
+        """Return key for weights/indices: Corridor Condition Asset for cross-corridor, else variance_asset."""
+        if self.config.is_cross_corridor and leg.corridor_condition_asset:
+            return leg.corridor_condition_asset
+        return leg.variance_asset
+
+    def run(
+        self,
+        price_data: pd.DataFrame,
+        legs: List[DispersionLeg],
+        weights: Dict[str, float],
+        index_data: Optional[pd.DataFrame] = None,
+        start_date: Optional[date] = None,
+    ) -> BacktestResult:
+        """
+        Run basket backtest.
+        Args:
+            price_data: Prices DataFrame (columns = tickers, index = dates)
+            legs: List of DispersionLeg objects
+            weights: {ticker: weight} — positive=long, negative=short
+            index_data: For cross-corridor mode (corridor observation prices)
+            start_date: Filter output from this date (default: 5 years ago)
+        """
+        if start_date is None:
+            start_date = date.today() - relativedelta(years=20)  # fetch max available history
+        # Step 1: Compute per-leg rolling P&L as numpy matrix
+        pnl_matrix, pnl_column_keys, dates_index = self._compute_all_pnl(price_data, legs, index_data)
+        # Step 1b: Convert weights to use pnl_column_keys (Corridor Condition Asset for cross-corridor)
+        weights_by_key = {}
+        for leg in legs:
+            key = self._series_key(leg)
+            if key in weights:
+                weights_by_key[key] = weights[key]
+        # Step 2: Apply missing data policy (all numpy)
+        policy = self.config.missing_data_policy
+        if policy == MissingDataPolicy.FILL_ZERO:
+            long_pnl, short_pnl, active_count, valid_mask = self._apply_fill_zero_policy(
+                pnl_matrix, pnl_column_keys, weights_by_key
+            )
+        elif policy == MissingDataPolicy.DROP_INCOMPLETE_DAYS:
+            long_pnl, short_pnl, active_count, valid_mask = self._apply_drop_policy(
+                pnl_matrix, pnl_column_keys, weights_by_key
+            )
+        else:
+            long_pnl, short_pnl, active_count, valid_mask = self._apply_adaptive_policy(
+                pnl_matrix, pnl_column_keys, weights_by_key
+            )
+        # Step 3: Build result DataFrame
+        dates = dates_index[valid_mask] if valid_mask is not None else dates_index
+        result = long_pnl + short_pnl
+        # Apply global cap/floor (vol swap only) — clips the final basket payout
+        if self.config.is_vol_swap:
+            result = np.clip(result, self.config.global_floor, self.config.global_cap)
+        result_df = pd.DataFrame({
+            "Long Leg": long_pnl,
+            "Short Leg": short_pnl,
+            "Result": result,
+        }, index=dates)
+        # Compute actual active count from weighted legs only (for both policies)
+        # Build index arrays for long/short to identify which legs are weighted
+        long_idx = [i for i, t in enumerate(pnl_column_keys) if weights_by_key.get(t, 0) > 0]
+        short_idx = [i for i, t in enumerate(pnl_column_keys) if weights_by_key.get(t, 0) < 0]
+        all_weighted_idx = long_idx + short_idx
+        if self.config.missing_data_policy == MissingDataPolicy.DROP_INCOMPLETE_DAYS:
+            # DROP_INCOMPLETE_DAYS: all weighted legs must have data, so active count is constant
+            if all_weighted_idx:
+                actual_active = np.full(len(dates), len(all_weighted_idx), dtype=int)
+            else:
+                actual_active = np.zeros(len(dates), dtype=int)
+        elif self.config.missing_data_policy == MissingDataPolicy.FILL_ZERO:
+            # FILL_ZERO: count legs with actual non-NaN data (but all rows are kept)
+            if all_weighted_idx:
+                weighted_pnl = pnl_matrix[:, all_weighted_idx]
+                actual_active = np.sum(~np.isnan(weighted_pnl), axis=1)
+            else:
+                actual_active = np.zeros(len(dates), dtype=int)
+        else:
+            # ADAPTIVE_REWEIGHT: count legs that are both active AND valid on each row
+            grace = self.config.reweight_grace_days
+            is_valid = ~np.isnan(pnl_matrix)
+            active_mask = _build_active_mask(is_valid, all_weighted_idx, pnl_matrix.shape[0], pnl_matrix.shape[1], grace)
+            if valid_mask is not None:
+                usable = active_mask[valid_mask][:, all_weighted_idx] & is_valid[valid_mask][:, all_weighted_idx]
+            else:
+                usable = active_mask[:, all_weighted_idx] & is_valid[:, all_weighted_idx]
+            actual_active = usable.sum(axis=1)
+        active_series = pd.Series(actual_active, index=dates, name="Active Stocks")
+
+        # Build per-leg P&L DataFrame for individual contributions view
+        per_leg_df = pd.DataFrame(pnl_matrix, index=dates_index, columns=pnl_column_keys)
+        if valid_mask is not None:
+            per_leg_df = per_leg_df[valid_mask]
+        # Step 4: Filter from start_date
+        start_date = pd.Timestamp(start_date).normalize()
+        mask = pd.to_datetime(result_df.index).normalize() >= start_date
+        result_df = result_df[mask]
+        if active_series is not None:
+            active_series = active_series[mask]
+        per_leg_df = per_leg_df[per_leg_df.index.isin(result_df.index)]
+        # For cross-corridor: build separate leg dataframes
+        cross_leg_df = None
+        if self.config.is_cross_corridor and self._cross_legs:
+            leg_columns = {}
+            for leg_key, leg_data in self._cross_legs.items():
+                corr_asset = leg_data['corridor_asset']
+                # Pad to match dates_index length
+                stock_pnl = np.full(len(dates_index), np.nan)
+                index_pnl = np.full(len(dates_index), np.nan)
+                n = len(leg_data['stock_pnl'])
+                stock_pnl[:n] = leg_data['stock_pnl']
+                index_pnl[:n] = leg_data['index_pnl']
+                leg_columns[f"{leg_key} (stock leg)"] = stock_pnl
+                leg_columns[f"{leg_key} (index leg: {corr_asset})"] = index_pnl
+            cross_leg_df = pd.DataFrame(leg_columns, index=dates_index)
+            if valid_mask is not None:
+                cross_leg_df = cross_leg_df[valid_mask]
+            cross_leg_df = cross_leg_df[cross_leg_df.index.isin(result_df.index)]
+            self._cross_legs = {}  # clear after use
+        bt = BacktestResult(timeseries=result_df, active_legs_count=active_series, per_leg_pnl=per_leg_df)
+        bt.cross_leg_pnl = cross_leg_df  # None for mono, DataFrame for cross
+        bt.compute_metrics()
+        return bt
+
+    def run_from_optimization(
+        self,
+        price_data: pd.DataFrame,
+        long_basket: List[Tuple[str, float]],
+        short_basket: List[Tuple[str, float]],
+        legs: List[DispersionLeg],
+        index_data: Optional[pd.DataFrame] = None,
+        start_date: Optional[date] = None,
+    ) -> BacktestResult:
+        """Run backtest directly from optimizer output.
+        
+        long_basket/short_basket keys are already the correct series_key
+        (Corridor Condition Asset for cross-corridor, variance_asset for mono)
+        as produced by _candidate_key() in the optimizer.
+        """
+        weights = {}
+        for key, w in long_basket:
+            weights[key] = w
+        for key, w in short_basket:
+            weights[key] = -w
+        
+        # Guard: if optimizer returned empty/degenerate basket, return empty result
+        if not weights or all(abs(v) < 1e-10 for v in weights.values()):
+            empty_df = pd.DataFrame({"Long Leg": [], "Short Leg": [], "Result": []})
+            bt = BacktestResult(timeseries=empty_df, active_legs_count=None, per_leg_pnl=pd.DataFrame())
+            bt.metrics = {"hit_ratio": 0, "mean_return": 0, "last_value": 0, "max_drawdown": 0, "n_observations": 0}
+            return bt
+
+        return self.run(price_data, legs, weights, index_data, start_date)
+
+    # ─── Internal ────────────────────────────────────────────────────────────────
+
+    def _compute_all_pnl(
+        self,
+        price_data: pd.DataFrame,
+        legs: List[DispersionLeg],
+        index_data: Optional[pd.DataFrame],
+    ) -> Tuple[np.ndarray, List[str], pd.DatetimeIndex]:
+        """
+        Compute per-leg P&L as a pure numpy matrix.
+        For cross-corridor mode:
+          - Each row has Variance Asset (variance_asset field) and Corridor Condition Asset (leg)
+          - Column key = Corridor Condition Asset for uniqueness
+        For standard mode:
+          - Single P&L per leg using its own corridor/prices
+        Returns: (pnl_matrix [n_rows x n_cols], column_keys, dates_index)
+        NOTE: NaN is preserved to indicate "no data for this leg on this date"
+        (e.g. leg not yet listed). The missing-data policy handles NaN downstream.
+        """
+        # Build column keys: for cross-corridor, use Corridor Condition Asset to avoid duplicates
+        leg_map = {}
+        column_keys = []
+        for s in legs:
+            if s.variance_asset not in price_data.columns:
+                continue
+            # For cross-corridor: key by Corridor Condition Asset (s.corridor_condition_asset) to avoid
+            # overwriting when all legs share the same Variance Asset (e.g. .SPX)
+            if self.config.is_cross_corridor and s.corridor_condition_asset:
+                map_key = s.corridor_condition_asset
+            else:
+                map_key = s.variance_asset
+            leg_map[map_key] = s
+            if self.config.is_cross_corridor and s.corridor_condition_asset:
+                # Use Corridor Condition Asset as column key (e.g., NVDA US Equity)
+                # This ensures unique column per leg in cross-corridor mode
+                column_keys.append(s.corridor_condition_asset)
+            else:
+                column_keys.append(s.variance_asset)
+
+        n_rows = len(price_data)
+        pnl_data = np.full((n_rows, len(column_keys)), np.nan)
+
+        for i, map_key in enumerate(leg_map.keys()):
+            leg = leg_map[map_key]
+            prices = price_data[leg.variance_asset].values.astype(np.float64)
+
+            if self.config.is_cross_corridor and leg.corridor_condition_asset and index_data is not None:
+                if leg.corridor_condition_asset in index_data.columns:
+                    index_prices = index_data[leg.corridor_condition_asset].values.astype(np.float64)
+                    # Cross-corridor backtest:
+                    #   Mono leg:   corridor=Corridor Condition Asset (leg), variance=Corridor Condition Asset
+                    #   Cross leg:  corridor=Corridor Condition Asset (leg), variance=Variance Asset (index)
+                    if self.config.is_vol_swap:
+                        # Mono leg: realized_vol on Corridor Condition Asset
+                        pnl_long = _rolling_pnl_volswap(index_prices, leg.strike_mono_var_swap, self.config.n_exp, self.config.local_cap)
+                        # Cross leg: realized_vol on Variance Asset
+                        idx_strike = leg.strike_cross_corridor if leg.strike_cross_corridor else leg.strike_mono_var_swap
+                        pnl_short = _rolling_pnl_volswap(prices, idx_strike, self.config.n_exp, self.config.local_cap)
+                    else:
+                        # Mono leg: variance=Corridor Condition Asset, corridor=Corridor Condition Asset
+                        pnl_long = _rolling_pnl_corridor(index_prices, index_prices, leg.strike_mono_var_swap,
+                                                         self.config.barrier_up, self.config.barrier_down, self.config.n_exp, self.config.local_cap)
+                        # Cross leg: variance=Variance Asset, corridor=Corridor Condition Asset
+                        idx_strike = leg.strike_cross_corridor if leg.strike_cross_corridor else leg.strike_mono_var_swap
+                        pnl_short = _rolling_pnl_corridor(prices, index_prices, idx_strike,
+                                                          self.config.barrier_up, self.config.barrier_down, self.config.n_exp, self.config.local_cap)
+                    # Net = long - short (per line)
+                    n = min(len(pnl_long), len(pnl_short), n_rows)
+                    pnl_data[:n, i] = (pnl_long[:n] - pnl_short[:n]) * 100
+                    # Store individual legs for cross-corridor breakdown
+                    self._cross_legs[map_key] = {
+                        'stock_pnl': pnl_long[:n] * 100,
+                        'index_pnl': pnl_short[:n] * 100,
+                        'corridor_asset': leg.corridor_condition_asset,
+                    }
+                else:
+                    # Fallback: just leg on itself
+                    pnl = self._calc.compute(prices, leg.strike_mono_var_swap, corridor_prices=None)
+                    n = min(len(pnl), n_rows)
+                    pnl_data[:n, i] = pnl[:n] * 100
+            else:
+                # Standard: corridor on self or vol swap
+                pnl = self._calc.compute(prices, leg.strike_mono_var_swap, corridor_prices=None)
+                n = min(len(pnl), n_rows)
+                pnl_data[:n, i] = pnl[:n] * 100
+
+        # Diagnostic: check pnl is non-trivial
+        non_nan_count = (~np.isnan(pnl_data)).sum()
+        non_zero_count = (np.nan_to_num(pnl_data, nan=0.0) != 0).sum()
+        if non_nan_count == 0:
+            import warnings
+            warnings.warn(f"[Backtester] pnl_data is ALL NaN! shape={pnl_data.shape}, "
+                         f"tickers={list(leg_map.keys())[:5]}..., n_rows={n_rows}")
+
+        return pnl_data, column_keys, price_data.index
+
+    def _apply_fill_zero_policy(
+        self,
+        pnl_matrix: np.ndarray,
+        tickers: List[str],
+        weights: Dict[str, float],
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Original Gaia_PP behavior: fillna(0) then weight.
+        Missing legs contribute 0 P&L (no row dropping, no weight redistribution).
+        Returns: (long_pnl, short_pnl, active_count, valid_mask)
+        """
+        long_idx = [i for i, t in enumerate(tickers) if weights.get(t, 0) > 0]
+        short_idx = [i for i, t in enumerate(tickers) if weights.get(t, 0) < 0]
+        if not long_idx and not short_idx:
+            n = pnl_matrix.shape[0]
+            return np.zeros(n), np.zeros(n), np.zeros(n), None
+
+        # Fill NaN with 0 — exactly what Gaia_PP does
+        pnl_filled = np.nan_to_num(pnl_matrix, nan=0.0)
+        long_weights = np.array([abs(weights[tickers[i]]) for i in long_idx]) if long_idx else np.array([])
+        short_weights = np.array([abs(weights[tickers[i]]) for i in short_idx]) if short_idx else np.array([])
+        n = pnl_filled.shape[0]
+        if long_idx and long_weights.sum() > 0:
+            long_pnl = pnl_filled[:, long_idx] @ long_weights
+        else:
+            long_pnl = np.zeros(n)
+        if short_idx and short_weights.sum() > 0:
+            # In Gaia_PP, short_weights are already negative → dot gives negative result
+            # Here short_weights are abs values, so negate
+            short_pnl = -(pnl_filled[:, short_idx] @ short_weights)
+        else:
+            short_pnl = np.zeros(n)
+        # No rows dropped — all dates kept (valid_mask = None means "keep all")
+        return long_pnl, short_pnl, None, None
+
+    def _apply_drop_policy(
+        self,
+        pnl_matrix: np.ndarray,
+        tickers: List[str],
+        weights: Dict[str, float],
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Drop any row where ANY weighted ticker has NaN.
+        Returns: (long_pnl, short_pnl, active_count, valid_row_mask)
+        """
+        # Build index arrays for long/short
+        long_idx = [i for i, t in enumerate(tickers) if weights.get(t, 0) > 0]
+        short_idx = [i for i, t in enumerate(tickers) if weights.get(t, 0) < 0]
+        all_idx = long_idx + short_idx
+        if not all_idx:
+            n = pnl_matrix.shape[0]
+            return np.zeros(n), np.zeros(n), np.zeros(n), np.ones(n, dtype=bool)
+
+        # Only keep rows where all weighted tickers have valid data
+        sub = pnl_matrix[:, all_idx]
+        valid_mask = ~np.isnan(sub).any(axis=1)
+        # Weighted sums on valid rows
+        long_weights = np.array([abs(weights[tickers[i]]) for i in long_idx]) if long_idx else np.array([])
+        short_weights = np.array([abs(weights[tickers[i]]) for i in short_idx]) if short_idx else np.array([])
+        valid_pnl = pnl_matrix[valid_mask]
+        n_valid = valid_pnl.shape[0]
+        if long_idx and long_weights.sum() > 0:
+            long_pnl = valid_pnl[:, long_idx] @ long_weights
+        else:
+            long_pnl = np.zeros(n_valid)
+        if short_idx and short_weights.sum() > 0:
+            short_pnl = -(valid_pnl[:, short_idx] @ short_weights)
+        else:
+            short_pnl = np.zeros(n_valid)
+        # Return None for active_count — computed fresh in run() from pnl_matrix
+        return long_pnl, short_pnl, None, valid_mask
+
+    def _apply_adaptive_policy(
+        self,
+        pnl_matrix: np.ndarray,
+        tickers: List[str],
+        weights: Dict[str, float],
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Adaptive reweighting: when a leg has NaN P&L, redistribute its weight
+        among available legs on that day. Tracks active count.
+        Vectorized numpy — no Python row iteration.
+        """
+        grace = self.config.reweight_grace_days
+        long_idx = [i for i, t in enumerate(tickers) if weights.get(t, 0) > 0]
+        short_idx = [i for i, t in enumerate(tickers) if weights.get(t, 0) < 0]
+        long_abs_weights = np.array([abs(weights[tickers[i]]) for i in long_idx]) if long_idx else np.array([])
+        short_abs_weights = np.array([abs(weights[tickers[i]]) for i in short_idx]) if short_idx else np.array([])
+        n_rows = pnl_matrix.shape[0]
+        # Precompute NaN mask: True where data is valid
+        is_valid = ~np.isnan(pnl_matrix)  # [n_rows x n_tickers]
+        all_weighted_idx = long_idx + short_idx
+        if not all_weighted_idx:
+            return np.zeros(n_rows), np.zeros(n_rows), np.zeros(n_rows), np.ones(n_rows, dtype=bool)
+
+        # Build "active" mask using vectorized numpy operations
+        # A leg is "active" once it has produced its first valid data point.
+        # After first valid data: active unless consecutive NaN > grace.
+        active_mask = _build_active_mask(is_valid, all_weighted_idx, n_rows, pnl_matrix.shape[1], grace)
+        # Compute long leg with adaptive reweighting (redistribution, not normalization)
+        long_pnl = np.zeros(n_rows)
+        short_pnl = np.zeros(n_rows)
+        active_count = np.zeros(n_rows)
+        # For cross-corridor: apply REAL adaptive reweight (same as standard mode).
+        # Business requirement: constant-vega exposure — when a leg has NaN, redistribute
+        # weight to active legs. Use FILL_ZERO policy to get old nan→0 behavior.
+        if long_idx:
+            long_pnl_cols = pnl_matrix[:, long_idx]
+            long_valid = ~np.isnan(long_pnl_cols)  # True where data exists
+            # Build active mask with grace days
+            long_active = active_mask[:, long_idx]
+            usable = long_active & long_valid  # [n_rows x n_long]
+            pnl_filled = np.nan_to_num(long_pnl_cols, nan=0.0)
+            total_long_weight = long_abs_weights.sum()
+            active_weight_sum = (long_abs_weights[np.newaxis, :] * usable).sum(axis=1)
+            # Scale factor: redistribute missing weight to active legs
+            with np.errstate(divide='ignore', invalid='ignore'):
+                scale = np.where(active_weight_sum > 0, total_long_weight / active_weight_sum, 0.0)
+            weighted = pnl_filled * long_abs_weights[np.newaxis, :]
+            weighted_masked = weighted * usable
+            long_pnl = weighted_masked.sum(axis=1) * scale
+            active_count += usable.sum(axis=1)
+        if short_idx:
+            short_pnl_cols = pnl_matrix[:, short_idx]
+            short_valid = ~np.isnan(short_pnl_cols)
+            short_active = active_mask[:, short_idx]
+            usable_s = short_active & short_valid
+            pnl_filled_s = np.nan_to_num(short_pnl_cols, nan=0.0)
+            total_short_weight = short_abs_weights.sum()
+            active_weight_sum_s = (short_abs_weights[np.newaxis, :] * usable_s).sum(axis=1)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                scale_s = np.where(active_weight_sum_s > 0, total_short_weight / active_weight_sum_s, 0.0)
+            weighted_s = pnl_filled_s * short_abs_weights[np.newaxis, :]
+            weighted_masked_s = weighted_s * usable_s
+            short_pnl = -(weighted_masked_s.sum(axis=1) * scale_s)
+            active_count += usable_s.sum(axis=1)
+        # All rows are kept (scale=0 already produces pnl=0 for fully-inactive days).
+        # Return None as valid_mask so downstream uses the full dates_index.
+        return long_pnl, short_pnl, active_count, None
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Data Loader
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize index to pd.DatetimeIndex (handles date, str, or Timestamp)."""
+    if df.empty:
+        return df
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index)
+    return df
+
+# ── Bloomberg data caching ──────────────────────────────────────────────────
+# Module-level cache: avoids re-fetching on Streamlit reruns
+_bbg_cache: dict = {}
+_bbg_cache_ts: dict = {}
+
+def _cached_bdh(tickers: list, field: str, start: str, end: str):
+    """Bloomberg fetch with Streamlit-aware caching. Falls back to in-memory TTL cache."""
+    # Try Streamlit cache first (survives reruns, 10 min TTL)
+    try:
+        import streamlit as st
+        return _st_cached_bdh(tuple(sorted(tickers)), field, start, end)
+    except (ImportError, Exception):
+        pass
+
+    # Fallback: in-memory dict cache (5 min TTL)
+    import time as _time
+    key = f"{sorted(tickers)}|{field}|{start}|{end}"
+    now = _time.time()
+    if key in _bbg_cache and (now - _bbg_cache_ts.get(key, 0)) < 300:
+        return _bbg_cache[key]
+
+    from xbbg import blp
+    df = blp.bdh(tickers, field, start, end)
+    _bbg_cache[key] = df
+    _bbg_cache_ts[key] = now
+    return df
+
+def _st_cached_bdh(tickers_tuple: tuple, field: str, start: str, end: str):
+    """Streamlit-cached Bloomberg fetch (10 min TTL, persists across reruns)."""
+    import streamlit as st
+
+    @st.cache_data(ttl=600, show_spinner=False)
+    def _fetch(tickers_key, field, start, end):
+        from xbbg import blp
+        return blp.bdh(list(tickers_key), field, start, end)
+
+    return _fetch(tickers_tuple, field, start, end)
+
+class DispersionDataLoader:
+    """
+    Fetches price data from Bloomberg and computes per-leg swap metrics.
+    Usage:
+        loader = DispersionDataLoader(config)
+        data = loader.load(basket)
+        # data['price_data'], data['index_data'], data['legs']
+    """
+
+    def __init__(self, config: SwapConfig, logger=None):
+        self.config = config
+        self._calc = SwapCalculator(config)
+        self._logger = logger or (lambda level, msg: None)
+
+    def load(self, basket: BasketInput) -> Dict:
+        """
+        Load all data needed for optimization and backtesting.
+        Returns:
+            {
+                'price_data': pd.DataFrame (stocks, union calendar),
+                'index_data': pd.DataFrame or None (for cross-corridor),
+                'legs': List[DispersionLeg] (with metrics populated),
+                'n_long': int,
+            }
+        """
+        start = self._start_date()
+        all_stocks = basket.all_candidates
+        if self.config.is_cross_corridor:
+            price_data, index_data = self._fetch_cross_corridor(all_stocks, start)
+        else:
+            price_data = self._fetch_standard(all_stocks, start)
+            index_data = None
+        # Compute per-leg metrics
+        self._compute_metrics(all_stocks, price_data, index_data)
+        return {
+            "price_data": price_data,
+            "index_data": index_data,
+            "legs": all_stocks,
+            "n_long": len(basket.long_candidates),
+            "long_legs": all_stocks[:len(basket.long_candidates)],
+            "short_legs": all_stocks[len(basket.long_candidates):],
+        }
+
+    # def _start_date(self) -> str:
+    #     dt = date.today() - relativedelta(years=self.config.lookback_years + 2)
+    #     return dt.strftime("%m/%d/%Y")
+    #
+    def _start_date(self) -> str:
+        if self.config.start_date is not None:
+            # Fetch extra history to initialise the rolling P&L at the requested date
+            buffer_days = int(self.config.n_exp * 365 / 252) + 30
+            dt = self.config.start_date - timedelta(days=buffer_days)
+        else:
+            dt = date.today() - relativedelta(
+                years=self.config.lookback_years + 2
+            )
+
+        return pd.Timestamp(dt).strftime("%m/%d/%Y")
+
+
+    def _fetch_standard(self, legs: List[DispersionLeg], start: str) -> pd.DataFrame:
+        field = "TOT_RETURN_INDEX_GROSS_DVDS" if self.config.adj_divs else "PX_LAST"
+        all_tickers = [s.variance_asset for s in legs]
+        today_str = date.today().strftime("%m/%d/%Y")
+        self._logger("INFO", f"Fetching {len(all_tickers)} tickers from Bloomberg ({start} → today)...")
+        try:
+            df = _cached_bdh(all_tickers, field, start, today_str)
+        except Exception as e:
+            self._logger("ERROR", f"Bloomberg batch fetch failed: {e}")
+            return pd.DataFrame()
+
+        if df is None or df.empty:
+            self._logger("ERROR", f"Bloomberg returned empty DataFrame for {len(all_tickers)} tickers")
+            return pd.DataFrame()
+
+        # xbbg returns MultiIndex columns (ticker, field) — flatten
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        # Strip whitespace from column names
+        df.columns = [str(c).strip() for c in df.columns]
+        # Log diagnostic: which requested tickers are missing from result
+        returned_cols = set(df.columns)
+        missing = [t for t in all_tickers if t not in returned_cols]
+        if missing:
+            self._logger("WARNING", f"{len(missing)}/{len(all_tickers)} tickers not in Bloomberg response: {missing[:5]}...")
+        df = _ensure_datetime_index(df)
+        return df.sort_index()
+
+    def _fetch_cross_corridor(self, legs: List[DispersionLeg], start: str):
+        var_tickers = list({s.variance_asset for s in legs})
+        corr_tickers = list({s.corridor_condition_asset for s in legs if s.corridor_condition_asset})
+        field = "TOT_RETURN_INDEX_GROSS_DVDS" if self.config.adj_divs else "PX_LAST"
+        today_str = date.today().strftime("%m/%d/%Y")
+        # Fetch variance asset prices (batch)
+        try:
+            stock_df = _cached_bdh(var_tickers, field, start, today_str)
+        except Exception as e:
+            self._logger("ERROR", f"Bloomberg variance asset fetch failed: {e}")
+            return pd.DataFrame(), pd.DataFrame()
+
+        if stock_df is None or stock_df.empty:
+            self._logger("ERROR", f"Bloomberg returned empty data for {len(var_tickers)} variance asset tickers")
+            return pd.DataFrame(), pd.DataFrame()
+
+        if isinstance(stock_df.columns, pd.MultiIndex):
+            stock_df.columns = stock_df.columns.get_level_values(0)
+        stock_df.columns = [str(c).strip() for c in stock_df.columns]
+        stock_df = _ensure_datetime_index(stock_df)
+        # Log missing variance assets
+        missing_var = [t for t in var_tickers if t not in stock_df.columns]
+        if missing_var:
+            self._logger("WARNING", f"{len(missing_var)}/{len(var_tickers)} variance assets missing from Bloomberg: {missing_var[:5]}")
+        # Fetch corridor condition asset prices (batch) — always PX_LAST
+        index_df = pd.DataFrame()
+        if corr_tickers:
+            try:
+                index_df = _cached_bdh(corr_tickers, "PX_LAST", start, today_str)
+            except Exception as e:
+                self._logger("ERROR", f"Bloomberg corridor asset fetch failed: {e}")
+                index_df = pd.DataFrame()
+            if index_df is not None and not index_df.empty:
+                if isinstance(index_df.columns, pd.MultiIndex):
+                    index_df.columns = index_df.columns.get_level_values(0)
+                index_df.columns = [str(c).strip() for c in index_df.columns]
+                index_df = _ensure_datetime_index(index_df)
+                missing_corr = [t for t in corr_tickers if t not in index_df.columns]
+                if missing_corr:
+                    self._logger("WARNING", f"Corridor condition assets missing from Bloomberg: {missing_corr}")
+        # Align to same dates
+        if not index_df.empty:
+            all_dates = stock_df.index.union(index_df.index)
+            stock_df = stock_df.reindex(all_dates)
+            index_df = index_df.reindex(all_dates)
+        return stock_df.sort_index(), index_df.sort_index() if not index_df.empty else pd.DataFrame()
+
+    def _compute_metrics(
+        self, legs: List[DispersionLeg], price_data: pd.DataFrame, index_data: Optional[pd.DataFrame]
+    ):
+        """Populate each leg's .metrics dict with backtest stats."""
+        for leg in legs:
+            if leg.variance_asset not in price_data.columns:
+                leg.metrics = {"last_value": 0, "avg_5y": 0, "avg_3y": 0, "hit_ratio": 50, "max_drawdown": 0}
+                continue
+
+            prices = price_data[leg.variance_asset].dropna().values.astype(np.float64)
+            # Determine corridor prices for cross-corridor
+            corridor_prices = None
+            if self.config.is_cross_corridor and leg.corridor_condition_asset and index_data is not None:
+                if leg.corridor_condition_asset in index_data.columns:
+                    corridor_prices = index_data[leg.corridor_condition_asset].dropna().values.astype(np.float64)
+            if len(prices) < self.config.n_exp + 1:
+                leg.metrics = {"last_value": 0, "avg_5y": 0, "avg_3y": 0, "hit_ratio": 50, "max_drawdown": 0}
+                continue
+
+            pnl = self._calc.compute(prices, leg.strike_mono_var_swap, corridor_prices)
+            valid = pnl[~np.isnan(pnl)]
+            if len(valid) == 0:
+                leg.metrics = {"last_value": 0, "avg_5y": 0, "avg_3y": 0, "hit_ratio": 50, "max_drawdown": 0}
+                continue
+
+            n_3y = min(len(valid), 252 * 3)
+            n_5y = min(len(valid), 252 * 5)
+            cumsum = np.cumsum(valid)
+            leg.metrics = {
+                "last_value": float(valid[-1]),
+                "avg_5y": float(valid[-n_5y:].mean()),
+                "avg_3y": float(valid[-n_3y:].mean()),
+                "hit_ratio": float((valid > 0).sum() / max(1, (valid != 0).sum()) * 100),
+                "max_drawdown": float((cumsum - np.maximum.accumulate(cumsum)).min()),
+            }
+
+def run_backtest(
+    tickers: List[str],
+    strikes: Dict[str, float],
+    weights: Dict[str, float],
+    config: SwapConfig,
+    corridor_condition_assets: Dict[str, str] = None,
+    start_date: Optional[date] = None,
+    index_strikes: Dict[str, float] = None,
+    logger: Optional[Callable[[str, str], None]] = None,
+) -> BacktestResult:
+    """
+    Canonical backtest entry point for dispersion trading.
+    
+    Usage:
+        from functions.dispersion import run_backtest, SwapConfig
+        
+        result = run_backtest(
+            tickers=['AAPL.O', 'MSFT.O'],
+            strikes={'AAPL.O': 0.05, 'MSFT.O': 0.05},
+            weights={'AAPL.O': 0.5, 'MSFT.O': 0.5},
+            config=SwapConfig.cross_corridor(n_exp=252)
+        )
+    
+    Args:
+        tickers: List of leg tickers
+        strikes: Dict mapping ticker → strike (decimal, e.g. 0.05 = 5%)
+        weights: Dict mapping ticker → weight (decimal, e.g. 0.5 = 50%)
+        config: SwapConfig with product type, n_exp, barriers, etc.
+        corridor_condition_assets: Dict mapping ticker → corridor condition asset (for cross-corridor)
+        start_date: Start date for backtest (default: config.start_date)
+        index_strikes: Dict mapping ticker → cross corridor strike (for cross-corridor)
+        logger: Optional logger function (level, msg)
+    
+    Returns:
+        BacktestResult with timeseries, metrics, per-leg PnL
+    """
+    from functions.dispersion import BasketInput, Basket, DispersionDataLoader, DispersionBacktester
+    
+    # Build DispersionLeg objects
+    legs = []
+    for t in tickers:
+        leg_kwargs = {
+            'variance_asset': t,
+            'strike_mono_var_swap': strikes.get(t),
+            'weight': weights.get(t, 0),
+        }
+        if corridor_condition_assets and t in corridor_condition_assets:
+            leg_kwargs['corridor_condition_asset'] = corridor_condition_assets[t]
+            if index_strikes and t in index_strikes:
+                leg_kwargs['strike_cross_corridor'] = index_strikes[t]
+        legs.append(DispersionLeg(**leg_kwargs))
+    
+    # Build BasketInput and load data
+    basket_input = BasketInput(long_candidates=legs, short_candidates=[])
+    loader = DispersionDataLoader(config, logger=logger)
+    data = loader.load(basket_input)
+    
+    # Run backtest
+    backtester = DispersionBacktester(config, logger=logger)
+    # Convert weights to use series_key (Corridor Condition Asset for cross-corridor)
+    weights_by_key = {}
+    for s in legs:
+        key = backtester._series_key(s)
+        if key in weights:
+            weights_by_key[key] = weights[key]
+    result = backtester.run(
+        price_data=data['price_data'],
+        legs=data['legs'],
+        weights=weights_by_key,
+        index_data=data.get('index_data'),
+        start_date=start_date or config.start_date,
+    )
+    
+    return result

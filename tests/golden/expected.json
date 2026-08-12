@@ -1,6 +1,6 @@
 {
   "bundle_a_linear": {
-    "generations_run": 41,
+    "generations_run": 27,
     "long_basket": [
       [
         "G5",
@@ -12,11 +12,11 @@
       ]
     ],
     "net_strike": 0.13720000000000002,
-    "score": 0.8848484848484848,
+    "score": 0.8833333333333333,
     "scoring_signature": "0d180ba8bc9f98b5"
   },
   "bundle_b_minpayoff": {
-    "generations_run": 52,
+    "generations_run": 26,
     "long_basket": [
       [
         "G2",
@@ -40,19 +40,19 @@
     "long_basket": [
       [
         "G7",
-        0.23306896274218863
+        0.2727272727272727
       ],
       [
         "G8",
-        0.36219166908569816
+        0.36363636363636365
       ],
       [
         "G9",
-        0.4047393681721132
+        0.36363636363636365
       ]
     ],
-    "net_strike": 0.14903002243257957,
-    "score": 0.9721176470588235,
+    "net_strike": 0.14854545454545456,
+    "score": 0.969529411764706,
     "scoring_signature": "a7bbf0a6dcbf20fb"
   }
 }

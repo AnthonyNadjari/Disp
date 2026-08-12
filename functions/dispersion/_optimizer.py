@@ -352,6 +352,9 @@ class DispersionOptimizer:
         self.seed = int(seed)
         self._rng = random.Random(self.seed)
         self._np_rng = np.random.default_rng(self.seed)
+        # Dedicated stream for vega reference V draws — keeps the main GA
+        # stream identical whether the vega toggle is ON or OFF
+        self._vega_rng = random.Random(self.seed * 1_000_003 + 77)
         # Store original P&L matrix (with NaN) for adaptive reweighting in fitness
         self._orig_ts_mat = pnl_matrix.astype(np.float64).copy()
         # Also store filled version for backward compatibility (e.g., GA initialization)
@@ -621,7 +624,7 @@ class DispersionOptimizer:
         normalizer sees the whole criterion distribution).  Empty when OFF."""
         if self._vega is None:
             return {}
-        v_total = self._rng.uniform(self._vega.v_min, self._vega.v_max)
+        v_total = self._vega_rng.uniform(self._vega.v_min, self._vega.v_max)
         idx = list(long_indices)
         v_abs = np.minimum(np.asarray(long_w, dtype=np.float64) * v_total,
                            self._vega_caps[idx])
@@ -1408,9 +1411,13 @@ class DispersionOptimizer:
             )
             if not result.feasible:
                 self._lp_infeasible_streak += 1
-                if self._lp_infeasible_streak >= TUNING.infeasible_streak_limit:
+                # Units-mismatch fail-fast only when nothing else can explain a
+                # long infeasible streak (bucket/vega constraints legitimately
+                # make many subsets infeasible, e.g. size-2 under bucket caps)
+                if (self._lp_infeasible_streak >= TUNING.infeasible_streak_limit
+                        and not self._bucket_constraints and self._vega is None):
                     raise RuntimeError(
-                        f"First 20 exact inner solves all infeasible — likely units mismatch. "
+                        f"First {TUNING.infeasible_streak_limit} exact inner solves all infeasible — likely units mismatch. "
                         f"strikes.min={strikes.min():.4f}, strikes.max={strikes.max():.4f}, "
                         f"max_net_strike={self.c.max_net_strike}"
                     )
@@ -1779,6 +1786,21 @@ class DispersionOptimizer:
         # FIT the score function with collected samples (extras carry per-sample
         # weighted strikes so the strike objective normalises like any metric)
         self._score_fn.build_reference(sample_pnls, ctx, sample_extras=sample_extras)
+        # Non-degeneracy for extras-carried ACTIVE metrics (weighted_strike,
+        # axe criteria): a constant reference saturates the rank normalizer
+        # (every candidate scores 0 under strictly-less tie semantics)
+        _active_extras = (set(self._score_fn.weights.active_names)
+                          & {"weighted_strike", "axe_book_cleaned", "axe_package_recycled"})
+        for _name in sorted(_active_extras):
+            _vals = np.array([e[_name] for e in sample_extras if _name in e], dtype=np.float64)
+            _vals = _vals[np.isfinite(_vals)]
+            if len(_vals) > 10 and np.std(_vals) < 1e-10:
+                raise RuntimeError(
+                    f"Reference sample non-degenerate check failed: metric '{_name}' "
+                    f"has zero spread (all values ≈ {_vals[0]:.6f}) across the sampled "
+                    f"baskets — the quantile normalizer would score every candidate 0. "
+                    f"Vary the inputs (targets/caps/strikes) or deactivate the metric."
+                )
         self._reference_size = len(sample_pnls)
         self._ref_n_samples = int(n_samples)
         # Sanity: verify max_drawdown (and all metrics) have non-degenerate spread

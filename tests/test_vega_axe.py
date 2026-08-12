@@ -167,7 +167,9 @@ def test_vega_pnl_only_same_basket_as_off_plus_V():
 def test_vega_package_recycled_direction():
     """weight=1 on axe_package_recycled ⇒ near-total recycling is reachable
     when every selectable name carries a big axe (small V, v_i <= target)."""
-    targets = np.full(N, 500.0)
+    # Varied targets: half big axes, half small — keeps the reference for
+    # criterion B non-degenerate (a constant reference is refused by design)
+    targets = np.where(np.arange(N) % 2 == 0, 500.0, 30.0)
     caps = np.full(N, np.inf)
     universe = _universe(seed=52, targets=targets, caps=caps)
     _, _, _, result = _run({"axe_package_recycled": 1.0},

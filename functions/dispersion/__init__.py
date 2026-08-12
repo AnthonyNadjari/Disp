@@ -1,5 +1,59 @@
-# scaffolding repo de test — NE PAS recopier dans le vrai repo.
-# Shim vide : le vrai repo re-exporte ici optimize/backtest/solve/price et les
-# modèles publics (la page fait `from functions.dispersion import optimize, ...`).
-# Ce shim reste vide pour ne pas deviner la surface réelle ; les tests
-# importent les sous-modules directement (functions.dispersion.models, etc.).
+"""
+Dispersion Trading Engine.
+
+Public API:
+    from functions.dispersion import solve, price, optimize, backtest
+    from functions.dispersion import DispersionConfig, OptimizationConstraints
+    from functions.dispersion import SolveResult, PriceResult, OptimizationResult, BacktestResult
+"""
+
+# Public functions
+from functions.dispersion._api import solve, price, optimize, backtest
+
+# Config classes (users construct these)
+from functions.dispersion.models import (
+    DispersionConfig,
+    OptimizationConstraints,
+    MissingDataPolicy,
+    ProductType,
+)
+
+# Result types (users receive these — never construct)
+from functions.dispersion.models import (
+    SolveResult,
+    PriceResult,
+    OptimizationResult,
+    BacktestResult,
+)
+
+# Internal exports (not for direct public use, but used by pages/✅Dispersion_Optimizer.py)
+from functions.dispersion._optimizer import DispersionOptimizer
+from functions.common.utils import get_n_exp_from_date
+from functions.dispersion._backtester import (
+    DispersionBacktester,
+    DispersionDataLoader,
+    SwapCalculator,
+    _rolling_pnl_corridor,
+)
+from functions.dispersion._portal import (
+    ensure_portal,
+    refresh_token,
+    reset_portal,
+    get_calendar,
+    get_currency_calendar,
+    payment_dates,
+    observation_schedule,
+    load_instrument,
+    preload_instruments,
+    clear_instrument_cache,
+)
+
+# Internal exports (not for direct public use, but used by pages/✅Dispersion_Optimizer.py)
+from functions.dispersion._pricing import (
+    PricingEngine,
+    PricingConfig,
+    CrossCorridorVarianceSwap,
+    _load_instrument_impl,
+    get_trading_calendar,
+    calculate_payment_dates,
+)

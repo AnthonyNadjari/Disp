@@ -124,3 +124,36 @@ vrai `normalizers.py` diffère, re-générer les goldens sur place (les bundles 
   mesurable ici.
 - Phase 7 (mode explain, bouton valider config, presets) : non commencée — optionnelle,
   sur demande.
+
+## Addendum — Intégration des vrais fichiers (post-livraison initiale)
+
+Les vrais `normalizers.py`, `aggregators.py`, `_backtester.py` et
+`functions/dispersion/__init__.py` ont remplacé mes scaffoldings. Le vrai
+`__init__` importe `_portal`/`_pricing`/`functions.common` → stubs marqués
+ajoutés pour ces trois-là (seuls restes de scaffolding avec les kernels du
+backtester désormais réels).
+
+Écarts découverts avec la vraie stack et corrections :
+1. **Ties du vrai QuantileNormalizer** (`bisect_left`, strictement-inférieur) :
+   les scores aux ex æquo diffèrent de ma reconstruction → goldens re-générés,
+   **mêmes paniers dans les 3 cas** :
+   - a: score 0.8848484848 → 0.8833333333 (gens 41→27)
+   - b: 1.0 → 1.0 (gens 52→26)
+   - c: 0.9721176471 → 0.9695294118 (gens 27→27)
+2. **Garde-fou « 20 solves infaisables = strikes mal scalés »** : il se
+   déclenchait à tort sous contraintes buckets/vega (l'infaisabilité de
+   sous-ensembles y est normale, ex. taille 2 sous cap US 35 % + plancher EU
+   30 %) → scope restreint aux runs sans buckets/vega.
+3. **Tirage V du mode vega** : déplacé sur un flux RNG dédié — la référence est
+   identique toggle ON/OFF (le test d'iso P&L-only vérifie panier ET score).
+4. **Référence dégénérée sur métriques extras** (weighted_strike, A/B) : une
+   référence constante score tout candidat 0 sous les ties strictement-inférieurs
+   → check de non-dégénérescence étendu aux extras (erreur claire).
+5. **Diagnostic 2-starts** : tolérance du test recalibrée 0.02 → 0.035 (le
+   smooth pleine résolution du vrai normalizer porte plus de micro-plateaux ;
+   le solve de production multi-départs+sweep reste l'arbitre via les tests
+   corner, tous verts).
+
+Suite finale sur stack réelle : `54 passed in 94.78s`. Il ne reste comme
+scaffolding que : shims `functions/__init__.py`, `functions/common/*`,
+`_portal.py`, `_pricing.py` (stubs d'import pour le vrai `__init__`).
