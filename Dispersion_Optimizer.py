@@ -507,21 +507,35 @@ with tab1:
                     'Min Weight': [],
                     'Max Weight': []
                 })
+            # Base columns + optional group tag (Sector, for buckets) and, in
+            # Vega mode, the per-name axe inventory (Axe Target / Axe Cap).
+            _xc_paste_cols = ['Variance Asset', 'Corridor Condition Asset', 'Strike Cross Corridor (%)',
+                              'Strike Mono Var Swap (%)', 'Min Weight', 'Max Weight',
+                              'Sector', 'Axe Target', 'Axe Cap']
+            _xc_show_cols = ['Variance Asset', 'Corridor Condition Asset', 'Strike Cross Corridor (%)',
+                             'Strike Mono Var Swap (%)', 'Min Weight', 'Max Weight', 'Sector']
+            if st.session_state.get('_vega_toggle', False):
+                _xc_show_cols = _xc_show_cols + ['Axe Target', 'Axe Cap']
+            _xc_show = st.session_state.long_df_cross.copy()
+            for _c in _xc_show_cols:
+                if _c not in _xc_show.columns:
+                    _xc_show[_c] = ''
             st.data_editor(
-                st.session_state.long_df_cross[
-                    ['Variance Asset', 'Corridor Condition Asset', 'Strike Cross Corridor (%)',
-                     'Strike Mono Var Swap (%)', 'Min Weight', 'Max Weight']],
+                _xc_show[_xc_show_cols],
                 num_rows="dynamic",
                 use_container_width=True,
                 key="long_editor_cross",
-                column_order=['Variance Asset', 'Corridor Condition Asset', 'Strike Cross Corridor (%)',
-                              'Strike Mono Var Swap (%)', 'Min Weight', 'Max Weight'],
+                column_order=_xc_show_cols,
             )
+            st.caption(
+                "💡 'Sector' tags each name into a group (used by the Bucket "
+                "constraints below). In Vega mode, 'Axe Target'/'Axe Cap' set the "
+                "per-name vega inventory. Paste them as extra columns.")
             long_pasted_text = st.text_area(
                 "Paste long basket data here:",
                 height=100,
                 key="long_paste_cross",
-                help="Format: Variance Asset, Corridor Condition Asset, Strike Cross Corridor (%), Strike Mono Var Swap (%), Min Weight, Max Weight"
+                help="Format: Variance Asset, Corridor Condition Asset, Strike Cross Corridor (%), Strike Mono Var Swap (%), Min Weight, Max Weight[, Sector, Axe Target, Axe Cap]"
             )
             if st.button("Fill Long Basket", key="fill_long_cross"):
                 if long_pasted_text:
@@ -530,9 +544,7 @@ with tab1:
                             values = long_pasted_text.split(
                                 '\t') if '\t' in long_pasted_text else long_pasted_text.split(',')
                             row_data = {}
-                            for i, col in enumerate(
-                                    ['Variance Asset', 'Corridor Condition Asset', 'Strike Cross Corridor (%)',
-                                     'Strike Mono Var Swap (%)', 'Min Weight', 'Max Weight']):
+                            for i, col in enumerate(_xc_paste_cols):
                                 row_data[col] = [values[i] if i < len(values) else '']
                             st.session_state.long_df_cross = pd.DataFrame(row_data)
                         else:
@@ -546,9 +558,7 @@ with tab1:
                                 df = df.iloc[1:].reset_index(drop=True)
                                 st.toast("⚠️ Header row detected and skipped", icon="ℹ️")
                             new_data = pd.DataFrame()
-                            for i, col in enumerate(
-                                    ['Variance Asset', 'Corridor Condition Asset', 'Strike Cross Corridor (%)',
-                                     'Strike Mono Var Swap (%)', 'Min Weight', 'Max Weight']):
+                            for i, col in enumerate(_xc_paste_cols):
                                 new_data[col] = df.iloc[:, i] if i < df.shape[1] else [''] * len(df)
                             st.session_state.long_df_cross = new_data
                         st.rerun()
@@ -560,8 +570,10 @@ with tab1:
                 _opt_std_cols = ['Underlying', 'Strike (%)', 'Min Weight', 'Max Weight']
             else:
                 _opt_std_cols = ['Variance Asset', 'Strike Mono Var Swap (%)', 'Min Weight', 'Max Weight']
-            # Reset if columns changed (product type switch)
-            if 'long_df' not in st.session_state or list(st.session_state.long_df.columns) != _opt_std_cols:
+            # Reset only on a product-type switch (base columns absent), NOT when
+            # the optional Sector / Axe columns have been added by a paste.
+            if 'long_df' not in st.session_state or not all(
+                    c in st.session_state.long_df.columns for c in _opt_std_cols):
                 st.session_state.long_df = pd.DataFrame({
                     _opt_std_cols[0]: ['SAN FP Equity', 'BNP FP Equity', 'ACA FP Equity', 'GLE FP Equity',
                                        'DBK GR Equity', 'CBK GR Equity', 'ISP IM Equity', 'UCG IM Equity',
@@ -570,17 +582,31 @@ with tab1:
                     'Min Weight': [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
                     'Max Weight': [25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25]
                 })
+            # Optional group tag (Sector, for buckets) + per-name axe inventory (Vega mode)
+            _std_paste_cols = _opt_std_cols + ['Sector', 'Axe Target', 'Axe Cap']
+            _std_show_cols = _opt_std_cols + ['Sector']
+            if st.session_state.get('_vega_toggle', False):
+                _std_show_cols = _std_show_cols + ['Axe Target', 'Axe Cap']
+            _std_show = st.session_state.long_df.copy()
+            for _c in _std_show_cols:
+                if _c not in _std_show.columns:
+                    _std_show[_c] = ''
             st.data_editor(
-                st.session_state.long_df,
+                _std_show[_std_show_cols],
                 num_rows="dynamic",
                 use_container_width=True,
-                key="long_editor"
+                key="long_editor",
+                column_order=_std_show_cols,
             )
+            st.caption(
+                "💡 'Sector' tags each name into a group (used by the Bucket "
+                "constraints below). In Vega mode, 'Axe Target'/'Axe Cap' set the "
+                "per-name vega inventory. Paste them as extra columns.")
             long_pasted_text = st.text_area(
                 "Paste long basket data here:",
                 height=100,
                 key="long_paste",
-                help=f"Format: {', '.join(_opt_std_cols)}"
+                help=f"Format: {', '.join(_opt_std_cols)}[, Sector, Axe Target, Axe Cap]"
             )
             if st.button("Fill Long Basket", key="fill_long"):
                 if long_pasted_text:
@@ -589,7 +615,7 @@ with tab1:
                             values = long_pasted_text.split(
                                 '\t') if '\t' in long_pasted_text else long_pasted_text.split(',')
                             row_data = {}
-                            for i, col in enumerate(_opt_std_cols):
+                            for i, col in enumerate(_std_paste_cols):
                                 row_data[col] = [values[i] if i < len(values) else '']
                             st.session_state.long_df = pd.DataFrame(row_data)
                         else:
@@ -597,7 +623,7 @@ with tab1:
                                              sep='\t' if '\t' in long_pasted_text else ',',
                                              header=None)
                             new_data = pd.DataFrame()
-                            for i, col in enumerate(_opt_std_cols):
+                            for i, col in enumerate(_std_paste_cols):
                                 new_data[col] = df.iloc[:, i] if i < df.shape[1] else [''] * len(df)
                             st.session_state.long_df = new_data
                         st.rerun()
@@ -823,11 +849,13 @@ with tab1:
                 "🚫 Exclude names (one per line or comma-separated)",
                 value="", height=68,
                 help="Removed from the candidate universe (long and short) before optimization.")
-            with st.expander("🌍 Bucket constraints (region/sector, optional)"):
+            with st.expander("🌍 Groups / buckets — force N names & % per group (optional)"):
                 st.caption(
-                    "Buckets match the 'Sector' column of the long input. "
-                    "Leave the table empty to deactivate. Weights in %, "
-                    "blank Max = unlimited.")
+                    "Tag each name with a group in the 'Sector' column of the long "
+                    "table above, then set one row per group here: Min/Max **names** "
+                    "and Min/Max **weight (%)**. Example — two groups: 'US' min 2 / "
+                    "max 3 names, 30–60%; 'EU' min 1, 40–70%. "
+                    "Leave the table empty to deactivate. Blank Max = unlimited.")
                 _bucket_default = pd.DataFrame(
                     {"Bucket": pd.Series(dtype="str"),
                      "Min names": pd.Series(dtype="float"),
@@ -871,10 +899,13 @@ with tab1:
                 "⚡ Absolute Vega mode (axe recycling)", value=False, key="_vega_toggle",
                 help="OFF = historical percentage weights (sum=1). ON = absolute Vega "
                      "per name with free total V in [V min, V max]; Min/Max Weight "
-                     "become concentration bounds on v_i/V; add 'Axe Target' and "
-                     "'Axe Cap' columns to the long table for per-name axes. Basket "
-                     "P&L stays Σ(v_i·pnl_i)/V — comparable with the toggle OFF.")
+                     "become concentration bounds on v_i/V. When ON, the long table "
+                     "shows 'Axe Target' / 'Axe Cap' columns for the per-name vega "
+                     "inventory. Basket P&L stays Σ(v_i·pnl_i)/V — comparable OFF.")
             if vega_on:
+                st.caption(
+                    "⬆️ The long table now shows **Axe Target** / **Axe Cap** columns — "
+                    "enter the per-name vega inventory (absolute vega units) there.")
                 _vg_c1, _vg_c2 = st.columns(2)
                 vega_v_min = _vg_c1.number_input("V min (Vega)", value=50.0, min_value=0.01)
                 vega_v_max = _vg_c2.number_input("V max (Vega)", value=200.0, min_value=0.01)

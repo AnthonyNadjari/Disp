@@ -731,11 +731,46 @@ def _prepare_optimization_inputs(
                 _matched |= hit
         _unmatched = forced_set - _matched
         if _unmatched:
-            _sample = sorted({s.variance_asset for s in long_valid})[:15]
+            import difflib
+            # In cross-corridor mode the per-name key IS the Corridor Condition
+            # Asset (the traded single stock), NOT the shared Variance Asset
+            # (index). Report the candidates under the key the user must force,
+            # otherwise the sample is just the 2-3 indices and misleads them.
+            if config.cross_corridor:
+                _cand_keys = sorted(
+                    {s.corridor_condition_asset for s in long_valid if s.corridor_condition_asset})
+                _key_label = "Corridor Condition Asset"
+            else:
+                _cand_keys = sorted({s.variance_asset for s in long_valid})
+                _key_label = "Variance Asset"
+            _cand_lower = {k.casefold(): k for k in _cand_keys}
+            # Did the name appear in the RAW input but get dropped (no price data
+            # / 0%-HR / exclusion)?  long_legs = the user's parsed rows, pre-load.
+            _raw_keys = set()
+            for _s in long_legs:
+                _raw_keys |= _leg_keys(_s)
+            _lines = []
+            for u in sorted(_unmatched):
+                near = [_cand_lower[n] for n in
+                        difflib.get_close_matches(u, list(_cand_lower.keys()), n=3, cutoff=0.6)]
+                if u in _raw_keys:
+                    _lines.append(
+                        f"  - '{u}': present in your input but NOT a candidate — its "
+                        f"price series failed to load, or it was removed by the 0%-HR "
+                        f"filter / exclusions.")
+                elif near:
+                    _lines.append(f"  - '{u}': not found. Did you mean {near}?")
+                else:
+                    _lines.append(f"  - '{u}': not found.")
+            _hint = ""
+            if config.cross_corridor:
+                _hint = (
+                    f"\nCross-corridor: force the {_key_label} (the traded single "
+                    f"stock, e.g. '005930 KS Equity'), not the Variance Asset (index).")
             raise ValueError(
-                f"Forced ticker(s) not found in the candidate universe after "
-                f"filtering: {sorted(_unmatched)}. "
-                f"Check spelling/exclusions. Available sample: {_sample}"
+                f"Forced ticker(s) not found among the {len(_cand_keys)} candidate "
+                f"name(s) after filtering:\n" + "\n".join(_lines) + _hint +
+                f"\nAvailable {_key_label} sample: {_cand_keys[:15]}"
             )
 
     return {

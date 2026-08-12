@@ -122,3 +122,61 @@ def test_api_forced_present_and_bundle_saved(api_offline, tmp_path):
     assert replay.long_basket == res.long_basket
     assert replay.score == pytest.approx(res.score, abs=0)
     assert replay.scoring_signature == res.scoring_signature
+
+
+def _xc_universe(n=5, seed=17):
+    """Cross-corridor universe: ONE shared Variance Asset (index), n distinct
+    Corridor Condition Assets (the traded single stocks) — the per-name key."""
+    rng = np.random.default_rng(seed)
+    corr = [f"{100 + i} XX Equity" for i in range(n)]     # the traded stocks
+    means = np.linspace(0.0, 1.5, n)
+    pnl = np.column_stack([rng.normal(means[i], 0.8, N_DAYS) for i in range(n)])
+    col_map = {corr[i]: i for i in range(n)}              # keyed by CORRIDOR asset
+    long_df = pd.DataFrame({
+        "Variance Asset": ["IDX Index"] * n,             # shared index
+        "Corridor Condition Asset": corr,
+        "Strike Cross Corridor (%)": [20.0 + i for i in range(n)],
+        "Strike Mono Var Swap (%)": [12.0 + 0.5 * i for i in range(n)],
+        "Min Weight": 5.0,
+        "Max Weight": 60.0,
+    })
+    return corr, pnl, col_map, long_df
+
+
+def test_api_cross_corridor_force_corridor_asset(api_offline):
+    """Issue 3: in cross-corridor mode the forcible/candidate key is the
+    Corridor Condition Asset (stock), not the shared Variance Asset (index).
+    Forcing the stock must work; forcing a bogus name must raise a message that
+    reports the CORRIDOR sample (stocks), not the index."""
+    corr, pnl, col_map, long_df = _xc_universe()
+    api = api_offline(pnl, col_map, ["IDX Index"])
+    cfg = DispersionConfig(cross_corridor=True, missing_data_policy=MissingDataPolicy.FILL_ZERO)
+
+    # (a) forcing the actual corridor stock succeeds (matched on the corridor key)
+    target = corr[0]
+    res = api.optimize(long_df, cfg, _cons(), score_weights={"mean_payoff": 1.0},
+                       seed=0, forced_tickers=[target.lower()])   # casefold match
+    assert target in [k for k, _ in res.long_basket], (
+        f"forced corridor asset {target} missing from basket {res.long_basket}")
+
+    # (b) forcing a bogus name raises, and the message is corridor-aware:
+    #     it names the Corridor Condition Asset key and samples the STOCKS.
+    with pytest.raises(ValueError) as ei:
+        api.optimize(long_df, cfg, _cons(), score_weights={"mean_payoff": 1.0},
+                     seed=0, forced_tickers=["005930 kp equity"])
+    msg = str(ei.value)
+    assert "Corridor Condition Asset" in msg, msg
+    assert "005930 kp equity" in msg, msg
+    assert corr[0] in msg, f"sample should list the stocks, got: {msg}"
+    assert "IDX Index" not in msg, f"sample must NOT be the index: {msg}"
+
+
+def test_api_mono_force_bogus_message(api_offline):
+    """Mono mode: the bogus-forced message reports the Variance Asset key."""
+    tickers, pnl, col_map, long_df = _universe()
+    api = api_offline(pnl, col_map, tickers)
+    cfg = DispersionConfig(missing_data_policy=MissingDataPolicy.FILL_ZERO)
+    with pytest.raises(ValueError) as ei:
+        api.optimize(long_df, cfg, _cons(), score_weights={"mean_payoff": 1.0},
+                     seed=0, forced_tickers=["nope zz equity"])
+    assert "Variance Asset" in str(ei.value)
