@@ -516,6 +516,60 @@ class OptimizationConstraints:
     tournament_size: int = 3     # Number of individuals in tournament selection
 
 @dataclass
+class BucketConstraint:
+    """Per-bucket (region/sector) constraints for the LONG leg.
+
+    ``bucket`` matches :attr:`DispersionLeg.sector` (the 'Sector' column of
+    the input DataFrame — free label, e.g. "US" / "EU").
+
+    Cardinality: between ``min_names`` and ``max_names`` selected names from
+    the bucket (``max_names=None`` = unlimited).
+    Weight: total long weight of the bucket in [min_weight, max_weight],
+    DECIMAL convention (0.30 = 30%; ``max_weight=None`` = unlimited).
+
+    Defaults are fully inactive.  A ``min_weight > 0`` requires
+    ``min_names >= 1`` (a subset without the bucket could never satisfy the
+    weight floor) — validated by the optimizer at construction time.
+    """
+    bucket: str
+    min_names: int = 0
+    max_names: Optional[int] = None
+    min_weight: float = 0.0
+    max_weight: Optional[float] = None
+
+    def __post_init__(self):
+        if not str(self.bucket).strip():
+            raise ValueError("BucketConstraint.bucket must be a non-empty label")
+        if self.min_names < 0:
+            raise ValueError(f"BucketConstraint({self.bucket}): min_names must be >= 0, got {self.min_names}")
+        if self.max_names is not None and self.max_names < self.min_names:
+            raise ValueError(
+                f"BucketConstraint({self.bucket}): max_names ({self.max_names}) "
+                f"< min_names ({self.min_names})")
+        if not (0.0 <= self.min_weight <= 1.0):
+            raise ValueError(
+                f"BucketConstraint({self.bucket}): min_weight must be a DECIMAL in [0, 1] "
+                f"(0.30 = 30%), got {self.min_weight}")
+        if self.max_weight is not None:
+            if not (0.0 < self.max_weight <= 1.0):
+                raise ValueError(
+                    f"BucketConstraint({self.bucket}): max_weight must be a DECIMAL in (0, 1] "
+                    f"(0.30 = 30%), got {self.max_weight}")
+            if self.max_weight < self.min_weight:
+                raise ValueError(
+                    f"BucketConstraint({self.bucket}): max_weight ({self.max_weight}) "
+                    f"< min_weight ({self.min_weight})")
+
+    @property
+    def has_weight_bounds(self) -> bool:
+        return self.min_weight > 0.0 or self.max_weight is not None
+
+    @property
+    def has_count_bounds(self) -> bool:
+        return self.min_names > 0 or self.max_names is not None
+
+
+@dataclass
 class ScoreWeights:
     """
     Multi-objective fitness weights for optimization. Auto-normalized to sum=1.

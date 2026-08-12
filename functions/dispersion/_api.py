@@ -42,6 +42,7 @@ from datetime import date
 from typing import Callable, Dict, List, Optional, Tuple
 
 from functions.dispersion.models import (
+    BucketConstraint,
     DispersionConfig,
     OptimizationConstraints,
     OptimizationResult,
@@ -498,6 +499,7 @@ def optimize(
     excluded_tickers: List[str] = None,
     save_bundle_path: str = None,
     n_reference_samples: int = None,
+    bucket_constraints: List = None,
 ) -> OptimizationResult:
     """
     Find optimal basket via genetic algorithm.
@@ -542,6 +544,12 @@ def optimize(
         Size of the random-basket reference sample used to fit the quantile
         normalizer.  Default None = adaptive (300, or 800 when a tail metric
         such as min_payoff / cvar_5 is active).  Must be >= 100.
+    bucket_constraints : list, optional
+        Per-bucket (region/sector) constraints on the LONG leg — list of
+        :class:`~functions.dispersion.models.BucketConstraint` or plain dicts
+        with the same fields ({'bucket': 'US', 'min_names': 1, 'max_names': 3,
+        'min_weight': 0.2, 'max_weight': 0.6}; weights DECIMAL).  Buckets
+        match the input DataFrame's 'Sector' column.  None/empty = inactive.
 
     Returns
     -------
@@ -551,6 +559,25 @@ def optimize(
     # ── Forced / excluded: cheap validation before any data load ──
     def _norm_ticker_set(lst):
         return {str(t).strip().casefold() for t in (lst or []) if str(t).strip()}
+
+    # ── Bucket constraints: normalize dicts → BucketConstraint (validates) ──
+    _bucket_cons: List[BucketConstraint] = []
+    for _bc in (bucket_constraints or []):
+        if isinstance(_bc, BucketConstraint):
+            _bucket_cons.append(_bc)
+        elif isinstance(_bc, dict):
+            try:
+                _bucket_cons.append(BucketConstraint(**_bc))
+            except TypeError as _te:
+                raise ValueError(
+                    f"bucket_constraints entry {_bc!r} is invalid: {_te}. Expected "
+                    f"fields: bucket, min_names, max_names, min_weight, max_weight."
+                )
+        else:
+            raise TypeError(
+                f"bucket_constraints entries must be BucketConstraint or dict, "
+                f"got {type(_bc).__name__}"
+            )
 
     _forced_set = _norm_ticker_set(forced_tickers)
     _excluded_set = _norm_ticker_set(excluded_tickers)
@@ -831,6 +858,7 @@ def optimize(
         smooth_eps=0.05,
         forced_long_indices=_forced_indices if _forced_indices else None,
         n_reference_samples=n_reference_samples,
+        bucket_constraints=_bucket_cons if _bucket_cons else None,
     )
     opt_result = optimizer.run()
     opt_result._final_raw_min = getattr(optimizer, '_final_raw_min', None)
@@ -857,6 +885,7 @@ def optimize(
             bisect_in_ga=bisect_in_ga,
             forced_long_indices=_forced_indices if _forced_indices else None,
             n_reference_samples=n_reference_samples,
+            bucket_constraints=_bucket_cons if _bucket_cons else None,
             dates=list(_optimizer_dates),
             config=_dc.asdict(config),
             provenance={

@@ -70,6 +70,7 @@ from functions.dispersion.models import (
     Basket,
     BacktestResult,
     BasketInput,
+    BucketConstraint,
     DispersionLeg,
     MissingDataPolicy,
     OptimizationConstraints,
@@ -205,6 +206,7 @@ class DispersionOptimizer:
         smooth_eps: float = 0.05,
         forced_long_indices: Optional[List[int]] = None,
         n_reference_samples: Optional[int] = None,
+        bucket_constraints: Optional[List[BucketConstraint]] = None,
     ):
         self.long_candidates = long_candidates
         self.short_candidates = short_candidates
@@ -271,6 +273,8 @@ class DispersionOptimizer:
             "invalid_score": 0,
             "last_carry_zero": 0,
             "len_valid_lt_50": 0,
+            "bucket_counts": 0,
+            "bucket_weights": 0,
         }
         self._strike_logged = False
         self._lp_infeasible_streak = 0
@@ -294,12 +298,146 @@ class DispersionOptimizer:
                     f"Infeasible forced set: sum of min weights of forced names = "
                     f"{forced_min_sum:.4f} > 1.0 ({names}). Lower their Min Weight inputs."
                 )
+        # ── Regional/sector bucket constraints (long leg) ──
+        self._bucket_constraints: List[BucketConstraint] = list(bucket_constraints or [])
+        self._bucket_of: List[Optional[str]] = [
+            (s.sector if s.sector else None) for s in self.long_candidates
+        ]
+        self._bucket_members: Dict[str, List[int]] = {}
+        for i, b in enumerate(self._bucket_of):
+            if b is not None:
+                self._bucket_members.setdefault(b, []).append(i)
+        if self._bucket_constraints:
+            self._validate_bucket_constraints()
+        # Precomputed count bounds per constrained bucket: {bucket: (lo, hi)}
+        self._bucket_count_bounds: Dict[str, Tuple[int, Optional[int]]] = {
+            bc.bucket: (bc.min_names, bc.max_names) for bc in self._bucket_constraints
+        }
         # Print all config at init
         _dlog(f"🔬 [OPTIM-INIT] {len(long_candidates)} long, {len(short_candidates)} short | "
               f"pop={self.c.population_size} gen={self.c.max_generations} time={self.c.time_limit_seconds}s")
         if long_candidates:
             s = long_candidates[0]
             _dlog(f"🔬 [OPTIM-INIT] bounds sample: min_w={s.min_weight:.4f} max_w={s.max_weight:.4f}")
+    # ══════════════════════════════════════════════════════════════════════════
+    # BUCKET CONSTRAINTS (regional/sector, long leg)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _validate_bucket_constraints(self) -> None:
+        """Config-time feasibility of the bucket constraints. Raises with an
+        actionable message on the first violation found."""
+        c = self.c
+        seen = set()
+        for bc in self._bucket_constraints:
+            if bc.bucket in seen:
+                raise ValueError(f"Duplicate BucketConstraint for bucket '{bc.bucket}'.")
+            seen.add(bc.bucket)
+            members = self._bucket_members.get(bc.bucket, [])
+            if not members and (bc.min_names > 0 or bc.min_weight > 0):
+                available = sorted(self._bucket_members.keys())
+                raise ValueError(
+                    f"Bucket '{bc.bucket}' has no candidates (check the 'Sector' "
+                    f"column of the input). Available buckets: {available or 'none'}."
+                )
+            if bc.min_names > len(members):
+                raise ValueError(
+                    f"Bucket '{bc.bucket}': min_names={bc.min_names} > "
+                    f"{len(members)} available candidate(s) in that bucket."
+                )
+            if bc.min_weight > 0 and bc.min_names < 1:
+                raise ValueError(
+                    f"Bucket '{bc.bucket}': min_weight={bc.min_weight:.4f} requires "
+                    f"min_names >= 1 (a basket without the bucket can never reach "
+                    f"the weight floor). Set min_names accordingly."
+                )
+            if bc.min_weight > 0 and members:
+                max_reachable = sum(self.long_candidates[i].max_weight for i in members)
+                if bc.min_weight > max_reachable + 1e-9:
+                    raise ValueError(
+                        f"Bucket '{bc.bucket}': min_weight={bc.min_weight:.4f} exceeds "
+                        f"the sum of Max Weight over its {len(members)} candidate(s) "
+                        f"({max_reachable:.4f}). Raise their Max Weight or lower the floor."
+                    )
+            # Forced names inside the bucket must fit under max_names
+            forced_in = sum(1 for i in self._forced_long if self._bucket_of[i] == bc.bucket)
+            if bc.max_names is not None and forced_in > bc.max_names:
+                raise ValueError(
+                    f"Bucket '{bc.bucket}': {forced_in} forced name(s) exceed "
+                    f"max_names={bc.max_names}."
+                )
+        total_min_names = sum(bc.min_names for bc in self._bucket_constraints)
+        if total_min_names > c.max_stocks_long:
+            raise ValueError(
+                f"Sum of bucket min_names ({total_min_names}) > max_stocks_long "
+                f"({c.max_stocks_long}). Relax the bucket minima or raise max_stocks_long."
+            )
+        # Effective floor with forced names: forced inside a constrained bucket
+        # count toward (or exceed) its minimum; forced outside add on top.
+        eff_min = 0
+        for bc in self._bucket_constraints:
+            forced_in = sum(1 for i in self._forced_long if self._bucket_of[i] == bc.bucket)
+            eff_min += max(bc.min_names, forced_in)
+        constrained = {bc.bucket for bc in self._bucket_constraints}
+        eff_min += sum(1 for i in self._forced_long
+                       if self._bucket_of[i] is None or self._bucket_of[i] not in constrained)
+        if eff_min > c.max_stocks_long:
+            raise ValueError(
+                f"Bucket minima + forced names require at least {eff_min} names > "
+                f"max_stocks_long ({c.max_stocks_long})."
+            )
+        total_min_weight = sum(bc.min_weight for bc in self._bucket_constraints)
+        if total_min_weight > 1.0 + 1e-9:
+            raise ValueError(
+                f"Sum of bucket min_weight floors ({total_min_weight:.4f}) > 1.0 — "
+                f"the long weights cannot satisfy all floors simultaneously."
+            )
+        # Overall capacity: can any subset of allowed size exist?
+        capped = 0
+        for b, members in self._bucket_members.items():
+            lo_hi = next(((bc.min_names, bc.max_names) for bc in self._bucket_constraints
+                          if bc.bucket == b), None)
+            cap = len(members)
+            if lo_hi is not None and lo_hi[1] is not None:
+                cap = min(cap, lo_hi[1])
+            capped += cap
+        unbucketed = sum(1 for b in self._bucket_of if b is None)
+        if capped + unbucketed < max(c.min_stocks_long, total_min_names, len(self._forced_long)):
+            raise ValueError(
+                f"Bucket caps leave at most {capped + unbucketed} selectable names — "
+                f"fewer than the required basket size "
+                f"({max(c.min_stocks_long, total_min_names, len(self._forced_long))})."
+            )
+
+    def _bucket_count(self, indices, bucket: str) -> int:
+        return sum(1 for i in indices if self._bucket_of[i] == bucket)
+
+    def _bucket_counts_ok(self, indices) -> bool:
+        """Cardinality bounds per bucket on a candidate subset."""
+        for bucket, (lo, hi) in self._bucket_count_bounds.items():
+            cnt = self._bucket_count(indices, bucket)
+            if cnt < lo:
+                return False
+            if hi is not None and cnt > hi:
+                return False
+        return True
+
+    def _bucket_groups_for(self, indices) -> Optional[list]:
+        """Per-bucket WEIGHT bounds for the inner solver, as
+        (positions-within-subset, lo, hi) tuples. None when inactive."""
+        if not self._bucket_constraints:
+            return None
+        groups = []
+        for bc in self._bucket_constraints:
+            if not bc.has_weight_bounds:
+                continue
+            pos = [k for k, i in enumerate(indices) if self._bucket_of[i] == bc.bucket]
+            if not pos:
+                continue  # min_weight>0 implies min_names>=1, enforced upstream
+            groups.append((np.asarray(pos, dtype=int),
+                           bc.min_weight if bc.min_weight > 0 else None,
+                           bc.max_weight))
+        return groups or None
+
     def _print_candidate_table(self):
         """Print a visible table of long/short candidates with PnL data quality."""
         lines = []
@@ -647,6 +785,7 @@ class DispersionOptimizer:
                 strikes=strikes if _pass_strikes else None,
                 per_stock_bounds=per_stock_bounds,
                 active_mask=self._valid_mask,
+                group_bounds=self._bucket_groups_for(ind.long_indices[:n_long]),
             )
             if not result.feasible:
                 n_infeasible += 1
@@ -765,6 +904,8 @@ class DispersionOptimizer:
 
         def _eval_subset(indices: List[int]):
             """-> (raw_scalar, step_score, weights) at exact optimal weights, or None."""
+            if self._bucket_count_bounds and not self._bucket_counts_ok(indices):
+                return None
             ids = [_candidate_key(self.long_candidates[i], self.is_cross_corridor) for i in indices]
             pos = np.array([self._col_pos[c] for c in ids if c in self._col_pos])
             if len(pos) != len(indices):
@@ -777,6 +918,7 @@ class DispersionOptimizer:
                 pnl_matrix=self._ts_mat, stock_indices=pos,
                 strikes=strikes if _pass_strikes else None,
                 per_stock_bounds=bounds, active_mask=self._valid_mask,
+                group_bounds=self._bucket_groups_for(indices),
             )
             if not res.feasible:
                 return None
@@ -1020,6 +1162,12 @@ class DispersionOptimizer:
         if len(long_pos) == 0 or len(long_pos) != len(individual.long_indices):
             return 0.0
 
+        # ── Bucket cardinality bounds on the subset ──
+        if self._bucket_count_bounds and not self._bucket_counts_ok(individual.long_indices):
+            self._rejection_reasons["bucket_counts"] += 1
+            return 0.0
+        _groups = self._bucket_groups_for(individual.long_indices)
+
         # ── Long weights: deterministic function of the subset ──
         if self._exact_fitness and self._weight_solver is not None:
             strikes = self._solver_strikes(individual.long_indices, self.long_candidates)
@@ -1038,6 +1186,7 @@ class DispersionOptimizer:
                 strikes=strikes if _pass_strikes else None,
                 per_stock_bounds=per_stock_bounds,
                 active_mask=self._valid_mask,
+                group_bounds=_groups,
             )
             if not result.feasible:
                 self._lp_infeasible_streak += 1
@@ -1055,6 +1204,17 @@ class DispersionOptimizer:
             if long_w is None:
                 self._rejection_reasons["no_weights"] += 1
                 return 0.0
+            # Bucket WEIGHT bounds: L1-project the equal-weight point into the
+            # group box (deterministic LP) when the plain projection violates it
+            if _groups and not self._weight_solver._groups_satisfied(long_w, _groups):
+                lb = np.array([self.long_candidates[i].min_weight
+                               for i in individual.long_indices], dtype=np.float64)
+                ub = np.array([self.long_candidates[i].max_weight
+                               for i in individual.long_indices], dtype=np.float64)
+                long_w = self._weight_solver.project_to_group_feasible(long_w, lb, ub, _groups)
+                if long_w is None:
+                    self._rejection_reasons["bucket_weights"] += 1
+                    return 0.0
         individual.long_weights = long_w
 
         # ── Short leg: bounded equal-weight projection ──
@@ -1538,7 +1698,42 @@ class DispersionOptimizer:
 
     def _pick_long_subset(self, pool: List[int], n_long: int) -> List[int]:
         """Pick a long subset of size n_long from pool, always containing the
-        forced names.  ``pool`` must not contain the forced indices."""
+        forced names and honouring per-bucket count bounds.  ``pool`` must
+        not contain the forced indices.  When the pool cannot satisfy a
+        bucket minimum (crossover unions may lack bucket names), the deficit
+        is drawn from that bucket's candidates outside the pool."""
+        if self._bucket_count_bounds:
+            picked = set(self._forced_long)
+            # 1) satisfy each constrained bucket's minimum
+            for bucket in sorted(self._bucket_count_bounds):
+                lo, _hi = self._bucket_count_bounds[bucket]
+                need = lo - self._bucket_count(picked, bucket)
+                if need <= 0:
+                    continue
+                in_pool = [i for i in pool
+                           if i not in picked and self._bucket_of[i] == bucket]
+                if len(in_pool) < need:
+                    in_pool += [i for i in self._bucket_members.get(bucket, [])
+                                if i not in picked and i not in in_pool]
+                take = min(need, len(in_pool))
+                if take > 0:
+                    picked |= set(self._rng.sample(sorted(in_pool), take))
+            # 2) fill up to n_long, skipping buckets at their cap
+            while len(picked) < n_long:
+                avail = []
+                for i in pool:
+                    if i in picked:
+                        continue
+                    b = self._bucket_of[i]
+                    if b is not None and b in self._bucket_count_bounds:
+                        hi_b = self._bucket_count_bounds[b][1]
+                        if hi_b is not None and self._bucket_count(picked, b) >= hi_b:
+                            continue
+                    avail.append(i)
+                if not avail:
+                    break
+                picked.add(self._rng.choice(sorted(avail)))
+            return sorted(picked)
         forced = self._forced_long
         n_free = n_long - len(forced)
         if n_free < 0:
@@ -1549,11 +1744,30 @@ class DispersionOptimizer:
         return sorted(set(picked) | set(forced))
 
     def _long_size_bounds(self, pool_extra: int) -> Tuple[int, int]:
-        """[lo, hi] basket sizes honouring cardinality inputs and forced names.
+        """[lo, hi] basket sizes honouring cardinality inputs, forced names
+        and per-bucket count bounds.
         ``pool_extra`` = number of NON-forced candidates available."""
         k = len(self._forced_long)
         lo = max(self.c.min_stocks_long, k)
         hi = min(self.c.max_stocks_long, k + pool_extra)
+        if self._bucket_count_bounds:
+            eff_min = 0
+            for bucket, (blo, _bhi) in self._bucket_count_bounds.items():
+                forced_in = sum(1 for i in self._forced_long
+                                if self._bucket_of[i] == bucket)
+                eff_min += max(blo, forced_in)
+            eff_min += sum(1 for i in self._forced_long
+                           if (self._bucket_of[i] is None
+                               or self._bucket_of[i] not in self._bucket_count_bounds))
+            lo = max(lo, eff_min)
+            capped_total = 0
+            for b, members in self._bucket_members.items():
+                cap = len(members)
+                if b in self._bucket_count_bounds and self._bucket_count_bounds[b][1] is not None:
+                    cap = min(cap, self._bucket_count_bounds[b][1])
+                capped_total += cap
+            capped_total += sum(1 for bb in self._bucket_of if bb is None)
+            hi = min(hi, capped_total)
         return lo, max(lo, hi)
 
     def _create_random_individual(self) -> Optional[_Individual]:
@@ -1628,7 +1842,27 @@ class DispersionOptimizer:
                          if long_indices[p] not in self._forced_long]
             if avail and swappable:
                 pos = self._rng.choice(swappable)
-                long_indices[pos] = self._rng.choice(avail)
+                if self._bucket_count_bounds:
+                    # A swap must keep every bucket inside its count bounds
+                    b_rm = self._bucket_of[long_indices[pos]]
+
+                    def _swap_ok(j):
+                        b_in = self._bucket_of[j]
+                        if b_in == b_rm:
+                            return True
+                        if b_rm is not None and b_rm in self._bucket_count_bounds:
+                            lo_rm = self._bucket_count_bounds[b_rm][0]
+                            if self._bucket_count(long_indices, b_rm) - 1 < lo_rm:
+                                return False
+                        if b_in is not None and b_in in self._bucket_count_bounds:
+                            hi_in = self._bucket_count_bounds[b_in][1]
+                            if hi_in is not None and self._bucket_count(long_indices, b_in) + 1 > hi_in:
+                                return False
+                        return True
+
+                    avail = [j for j in avail if _swap_ok(j)]
+                if avail:
+                    long_indices[pos] = self._rng.choice(avail)
         else:
             # Swap one stock in short leg
             avail = sorted(set(range(len(self.short_candidates))) - set(short_indices))
@@ -1698,6 +1932,7 @@ class DispersionOptimizer:
                     stock_indices=np.array(long_pos_final, dtype=int),
                     active_mask=self._valid_mask,
                     tol="fine",
+                    group_bounds=self._bucket_groups_for(best.long_indices),
                 )
                 self._weight_solver._missing_data_policy = _orig_policy
                 if resolv.feasible:
@@ -1905,6 +2140,17 @@ class DispersionOptimizer:
             net_strike_val = abs(net)
         else:
             net_strike_val = abs(ls - ss)
+
+        # ═══ BUCKET AUDIT (delivered basket must honour the constraints) ═══
+        if self._bucket_constraints:
+            if not self._bucket_counts_ok(best.long_indices):
+                print(f"⚠️ [BUCKET-WARNING] Delivered basket violates bucket COUNT bounds", flush=True)
+                self.log("WARN", "[BUCKET] Delivered basket violates bucket count bounds")
+            _g_final = self._bucket_groups_for(best.long_indices)
+            if _g_final and not self._weight_solver._groups_satisfied(
+                    np.asarray(best.long_weights, dtype=np.float64), _g_final, tol=1e-4):
+                print(f"⚠️ [BUCKET-WARNING] Delivered basket violates bucket WEIGHT bounds", flush=True)
+                self.log("WARN", "[BUCKET] Delivered basket violates bucket weight bounds")
 
         # ═══ STRIKE AUDIT LOG ═══
         _binding = net_strike_val >= (self.c.max_net_strike - 1e-6) if self.c.max_net_strike > 0 else False

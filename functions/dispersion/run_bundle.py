@@ -52,6 +52,7 @@ import numpy as np
 import pandas as pd
 
 from functions.dispersion.models import (
+    BucketConstraint,
     DispersionLeg,
     MissingDataPolicy,
     OptimizationConstraints,
@@ -174,6 +175,7 @@ class RunBundle:
     bisect_in_ga: bool = False
     forced_long_indices: Optional[List[int]] = None
     n_reference_samples: Optional[int] = None  # None = adaptive default (300/800)
+    bucket_constraints: Optional[List[BucketConstraint]] = None
     dates: Optional[List] = None            # optional row index of pnl_matrix
     config: Optional[Dict] = None           # DispersionConfig snapshot (informational)
     provenance: Dict = field(default_factory=dict)  # forced/excluded tickers, dates, ...
@@ -220,6 +222,8 @@ class RunBundle:
             forced_long_indices=(list(self.forced_long_indices)
                                  if self.forced_long_indices else None),
             n_reference_samples=self.n_reference_samples,
+            bucket_constraints=([dataclasses.replace(bc) for bc in self.bucket_constraints]
+                                if self.bucket_constraints else None),
         )
         return optimizer.run()
 
@@ -248,6 +252,7 @@ def save_run_bundle(
     bisect_in_ga: bool = False,
     forced_long_indices: Optional[List[int]] = None,
     n_reference_samples: Optional[int] = None,
+    bucket_constraints: Optional[List[BucketConstraint]] = None,
     dates=None,
     config: Optional[Dict] = None,
     provenance: Optional[Dict] = None,
@@ -297,6 +302,8 @@ def save_run_bundle(
                                     if forced_long_indices else None),
             "n_reference_samples": (int(n_reference_samples)
                                     if n_reference_samples is not None else None),
+            "bucket_constraints": ([dataclasses.asdict(bc) for bc in bucket_constraints]
+                                   if bucket_constraints else None),
         },
         "long_candidates": [_leg_to_dict(l) for l in long_candidates],
         "short_candidates": [_leg_to_dict(l) for l in short_candidates],
@@ -355,6 +362,8 @@ def load_run_bundle(path: str) -> RunBundle:
         bisect_in_ga=bool(opt.get("bisect_in_ga", False)),
         forced_long_indices=opt.get("forced_long_indices"),
         n_reference_samples=opt.get("n_reference_samples"),
+        bucket_constraints=([BucketConstraint(**d) for d in opt["bucket_constraints"]]
+                            if opt.get("bucket_constraints") else None),
         dates=dates,
         config=payload.get("config"),
         provenance=dict(payload.get("provenance") or {}),

@@ -795,6 +795,50 @@ with tab1:
                 "🚫 Exclude names (one per line or comma-separated)",
                 value="", height=68,
                 help="Removed from the candidate universe (long and short) before optimization.")
+            with st.expander("🌍 Bucket constraints (region/sector, optional)"):
+                st.caption(
+                    "Buckets match the 'Sector' column of the long input. "
+                    "Leave the table empty to deactivate. Weights in %, "
+                    "blank Max = unlimited.")
+                _bucket_default = pd.DataFrame(
+                    {"Bucket": pd.Series(dtype="str"),
+                     "Min names": pd.Series(dtype="float"),
+                     "Max names": pd.Series(dtype="float"),
+                     "Min weight (%)": pd.Series(dtype="float"),
+                     "Max weight (%)": pd.Series(dtype="float")})
+                _bucket_df = st.data_editor(
+                    st.session_state.get('_bucket_df', _bucket_default),
+                    num_rows="dynamic", use_container_width=True,
+                    key="_bucket_editor")
+                st.session_state['_bucket_df'] = _bucket_df
+
+            def _parse_bucket_constraints(df):
+                out = []
+                if df is None or df.empty:
+                    return None
+                for _, r in df.iterrows():
+                    b = str(r.get("Bucket", "") or "").strip()
+                    if not b:
+                        continue
+                    def _num(v):
+                        try:
+                            f = float(v)
+                            return None if pd.isna(f) else f
+                        except (TypeError, ValueError):
+                            return None
+                    mn = _num(r.get("Min names"))
+                    mx = _num(r.get("Max names"))
+                    mw = _num(r.get("Min weight (%)"))
+                    xw = _num(r.get("Max weight (%)"))
+                    out.append({
+                        "bucket": b,
+                        "min_names": int(mn) if mn is not None else 0,
+                        "max_names": int(mx) if mx is not None else None,
+                        "min_weight": (mw / 100.0) if mw is not None else 0.0,
+                        "max_weight": (xw / 100.0) if xw is not None else None,
+                    })
+                return out or None
+
             run_milp = st.checkbox("🔬 Certify vs exact optimum (MILP, slow)", value=False)
             st.session_state['_run_milp'] = run_milp
             bisect_in_ga = st.checkbox("🎯 Exact solver in GA (slow, certification runs)", value=False)
@@ -985,6 +1029,8 @@ with tab1:
                                     seed=int(seed),
                                     forced_tickers=_parse_ticker_list(forced_tickers_raw),
                                     excluded_tickers=_parse_ticker_list(excluded_tickers_raw),
+                                    bucket_constraints=_parse_bucket_constraints(
+                                        st.session_state.get('_bucket_df')),
                                 )
                             except Exception as _e:
                                 _opt_error = _e
