@@ -507,35 +507,21 @@ with tab1:
                     'Min Weight': [],
                     'Max Weight': []
                 })
-            # Base columns + optional group tag (Sector, for buckets) and, in
-            # Vega mode, the per-name axe inventory (Axe Target / Axe Cap).
-            _xc_paste_cols = ['Variance Asset', 'Corridor Condition Asset', 'Strike Cross Corridor (%)',
-                              'Strike Mono Var Swap (%)', 'Min Weight', 'Max Weight',
-                              'Sector', 'Axe Target', 'Axe Cap']
-            _xc_show_cols = ['Variance Asset', 'Corridor Condition Asset', 'Strike Cross Corridor (%)',
-                             'Strike Mono Var Swap (%)', 'Min Weight', 'Max Weight', 'Sector']
-            if st.session_state.get('_vega_toggle', False):
-                _xc_show_cols = _xc_show_cols + ['Axe Target', 'Axe Cap']
-            _xc_show = st.session_state.long_df_cross.copy()
-            for _c in _xc_show_cols:
-                if _c not in _xc_show.columns:
-                    _xc_show[_c] = ''
             st.data_editor(
-                _xc_show[_xc_show_cols],
+                st.session_state.long_df_cross[
+                    ['Variance Asset', 'Corridor Condition Asset', 'Strike Cross Corridor (%)',
+                     'Strike Mono Var Swap (%)', 'Min Weight', 'Max Weight']],
                 num_rows="dynamic",
                 use_container_width=True,
                 key="long_editor_cross",
-                column_order=_xc_show_cols,
+                column_order=['Variance Asset', 'Corridor Condition Asset', 'Strike Cross Corridor (%)',
+                              'Strike Mono Var Swap (%)', 'Min Weight', 'Max Weight'],
             )
-            st.caption(
-                "💡 'Sector' tags each name into a group (used by the Bucket "
-                "constraints below). In Vega mode, 'Axe Target'/'Axe Cap' set the "
-                "per-name vega inventory. Paste them as extra columns.")
             long_pasted_text = st.text_area(
                 "Paste long basket data here:",
                 height=100,
                 key="long_paste_cross",
-                help="Format: Variance Asset, Corridor Condition Asset, Strike Cross Corridor (%), Strike Mono Var Swap (%), Min Weight, Max Weight[, Sector, Axe Target, Axe Cap]"
+                help="Format: Variance Asset, Corridor Condition Asset, Strike Cross Corridor (%), Strike Mono Var Swap (%), Min Weight, Max Weight"
             )
             if st.button("Fill Long Basket", key="fill_long_cross"):
                 if long_pasted_text:
@@ -544,7 +530,9 @@ with tab1:
                             values = long_pasted_text.split(
                                 '\t') if '\t' in long_pasted_text else long_pasted_text.split(',')
                             row_data = {}
-                            for i, col in enumerate(_xc_paste_cols):
+                            for i, col in enumerate(
+                                    ['Variance Asset', 'Corridor Condition Asset', 'Strike Cross Corridor (%)',
+                                     'Strike Mono Var Swap (%)', 'Min Weight', 'Max Weight']):
                                 row_data[col] = [values[i] if i < len(values) else '']
                             st.session_state.long_df_cross = pd.DataFrame(row_data)
                         else:
@@ -558,7 +546,9 @@ with tab1:
                                 df = df.iloc[1:].reset_index(drop=True)
                                 st.toast("⚠️ Header row detected and skipped", icon="ℹ️")
                             new_data = pd.DataFrame()
-                            for i, col in enumerate(_xc_paste_cols):
+                            for i, col in enumerate(
+                                    ['Variance Asset', 'Corridor Condition Asset', 'Strike Cross Corridor (%)',
+                                     'Strike Mono Var Swap (%)', 'Min Weight', 'Max Weight']):
                                 new_data[col] = df.iloc[:, i] if i < df.shape[1] else [''] * len(df)
                             st.session_state.long_df_cross = new_data
                         st.rerun()
@@ -570,10 +560,8 @@ with tab1:
                 _opt_std_cols = ['Underlying', 'Strike (%)', 'Min Weight', 'Max Weight']
             else:
                 _opt_std_cols = ['Variance Asset', 'Strike Mono Var Swap (%)', 'Min Weight', 'Max Weight']
-            # Reset only on a product-type switch (base columns absent), NOT when
-            # the optional Sector / Axe columns have been added by a paste.
-            if 'long_df' not in st.session_state or not all(
-                    c in st.session_state.long_df.columns for c in _opt_std_cols):
+            # Reset if columns changed (product type switch)
+            if 'long_df' not in st.session_state or list(st.session_state.long_df.columns) != _opt_std_cols:
                 st.session_state.long_df = pd.DataFrame({
                     _opt_std_cols[0]: ['SAN FP Equity', 'BNP FP Equity', 'ACA FP Equity', 'GLE FP Equity',
                                        'DBK GR Equity', 'CBK GR Equity', 'ISP IM Equity', 'UCG IM Equity',
@@ -582,31 +570,17 @@ with tab1:
                     'Min Weight': [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
                     'Max Weight': [25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25]
                 })
-            # Optional group tag (Sector, for buckets) + per-name axe inventory (Vega mode)
-            _std_paste_cols = _opt_std_cols + ['Sector', 'Axe Target', 'Axe Cap']
-            _std_show_cols = _opt_std_cols + ['Sector']
-            if st.session_state.get('_vega_toggle', False):
-                _std_show_cols = _std_show_cols + ['Axe Target', 'Axe Cap']
-            _std_show = st.session_state.long_df.copy()
-            for _c in _std_show_cols:
-                if _c not in _std_show.columns:
-                    _std_show[_c] = ''
             st.data_editor(
-                _std_show[_std_show_cols],
+                st.session_state.long_df,
                 num_rows="dynamic",
                 use_container_width=True,
-                key="long_editor",
-                column_order=_std_show_cols,
+                key="long_editor"
             )
-            st.caption(
-                "💡 'Sector' tags each name into a group (used by the Bucket "
-                "constraints below). In Vega mode, 'Axe Target'/'Axe Cap' set the "
-                "per-name vega inventory. Paste them as extra columns.")
             long_pasted_text = st.text_area(
                 "Paste long basket data here:",
                 height=100,
                 key="long_paste",
-                help=f"Format: {', '.join(_opt_std_cols)}[, Sector, Axe Target, Axe Cap]"
+                help=f"Format: {', '.join(_opt_std_cols)}"
             )
             if st.button("Fill Long Basket", key="fill_long"):
                 if long_pasted_text:
@@ -615,7 +589,7 @@ with tab1:
                             values = long_pasted_text.split(
                                 '\t') if '\t' in long_pasted_text else long_pasted_text.split(',')
                             row_data = {}
-                            for i, col in enumerate(_std_paste_cols):
+                            for i, col in enumerate(_opt_std_cols):
                                 row_data[col] = [values[i] if i < len(values) else '']
                             st.session_state.long_df = pd.DataFrame(row_data)
                         else:
@@ -623,7 +597,7 @@ with tab1:
                                              sep='\t' if '\t' in long_pasted_text else ',',
                                              header=None)
                             new_data = pd.DataFrame()
-                            for i, col in enumerate(_std_paste_cols):
+                            for i, col in enumerate(_opt_std_cols):
                                 new_data[col] = df.iloc[:, i] if i < df.shape[1] else [''] * len(df)
                             st.session_state.long_df = new_data
                         st.rerun()
@@ -845,70 +819,167 @@ with tab1:
                 value="", height=68,
                 help="These names WILL be in the final basket. Their weights stay "
                      "governed by the Min/Max Weight inputs. Never removed by the 0%-HR filter.")
-            excluded_tickers_raw = st.text_area(
-                "🚫 Exclude names (one per line or comma-separated)",
-                value="", height=68,
-                help="Removed from the candidate universe (long and short) before optimization.")
-            with st.expander("🌍 Groups / buckets — force N names & % per group (optional)"):
+            with st.expander("🌍 Groupes (max 2) — borne le % et/ou le nombre de noms par groupe"):
                 st.caption(
-                    "Tag each name with a group in the 'Sector' column of the long "
-                    "table above, then set one row per group here: Min/Max **names** "
-                    "and Min/Max **weight (%)**. Example — two groups: 'US' min 2 / "
-                    "max 3 names, 30–60%; 'EU' min 1, 40–70%. "
-                    "Leave the table empty to deactivate. Blank Max = unlimited.")
-                _bucket_default = pd.DataFrame(
-                    {"Bucket": pd.Series(dtype="str"),
-                     "Min names": pd.Series(dtype="float"),
-                     "Max names": pd.Series(dtype="float"),
-                     "Min weight (%)": pd.Series(dtype="float"),
-                     "Max weight (%)": pd.Series(dtype="float")})
-                _bucket_df = st.data_editor(
-                    st.session_state.get('_bucket_df', _bucket_default),
-                    num_rows="dynamic", use_container_width=True,
-                    key="_bucket_editor")
-                st.session_state['_bucket_df'] = _bucket_df
-
-            def _parse_bucket_constraints(df):
-                out = []
-                if df is None or df.empty:
-                    return None
-                for _, r in df.iterrows():
-                    b = str(r.get("Bucket", "") or "").strip()
-                    if not b:
-                        continue
-                    def _num(v):
-                        try:
-                            f = float(v)
-                            return None if pd.isna(f) else f
-                        except (TypeError, ValueError):
-                            return None
-                    mn = _num(r.get("Min names"))
-                    mx = _num(r.get("Max names"))
-                    mw = _num(r.get("Min weight (%)"))
-                    xw = _num(r.get("Max weight (%)"))
-                    out.append({
-                        "bucket": b,
-                        "min_names": int(mn) if mn is not None else 0,
-                        "max_names": int(mx) if mx is not None else None,
-                        "min_weight": (mw / 100.0) if mw is not None else 0.0,
-                        "max_weight": (xw / 100.0) if xw is not None else None,
+                    "Colle une liste de noms par groupe, puis borne son poids (%) "
+                    "et/ou son nombre de noms **dans le panier final**. Un nom ne peut "
+                    "appartenir qu'à un seul groupe ; les noms hors groupe restent "
+                    "libres (pas besoin de tout partitionner). Valeurs neutres = pas "
+                    "de contrainte : 0 % = pas de plancher, 100 % = pas de plafond, "
+                    "0 nom = pas de limite.")
+                _grp_spec = []
+                for _gi, _gph in ((1, "US"), (2, "EU")):
+                    st.markdown(f"**Groupe {_gi}**")
+                    _glabel = st.text_input(
+                        f"Libellé du groupe {_gi}", key=f"_grp{_gi}_label",
+                        placeholder=f"ex. {_gph}")
+                    _gnames_raw = st.text_area(
+                        f"Noms du groupe {_gi} (un par ligne ou séparés par des virgules)",
+                        value="", height=68, key=f"_grp{_gi}_names")
+                    _gc1, _gc2, _gc3, _gc4 = st.columns(4)
+                    _minw = _gc1.number_input("% min", min_value=0.0, max_value=100.0,
+                                              value=0.0, step=1.0, key=f"_grp{_gi}_minw")
+                    _maxw = _gc2.number_input("% max", min_value=0.0, max_value=100.0,
+                                              value=100.0, step=1.0, key=f"_grp{_gi}_maxw")
+                    _minn = _gc3.number_input("Nb min", min_value=0, value=0, step=1,
+                                              key=f"_grp{_gi}_minn")
+                    _maxn = _gc4.number_input("Nb max", min_value=0, value=0, step=1,
+                                              key=f"_grp{_gi}_maxn")
+                    _gnames = [t.strip() for t in (_gnames_raw or "").replace(',', '\n').splitlines()
+                               if t.strip()]
+                    _grp_spec.append({
+                        'label': (_glabel.strip() or f"Groupe {_gi}"),
+                        'names': _gnames,
+                        'min_w': float(_minw), 'max_w': float(_maxw),
+                        'min_n': int(_minn), 'max_n': int(_maxn),
                     })
+                st.session_state['_groups_spec'] = _grp_spec
+
+            def _build_group_constraints():
+                """Two group blocks → BucketConstraint dicts (engine format).
+                Only groups that carry names AND at least one active bound are kept."""
+                groups = st.session_state.get('_groups_spec') or []
+                out = []
+                for g in groups:
+                    if not g.get('names'):
+                        continue
+                    bc = {"bucket": g['label']}
+                    if g.get('min_w'):
+                        bc["min_weight"] = float(g['min_w']) / 100.0
+                    if g.get('max_w') is not None and float(g['max_w']) < 100.0:
+                        bc["max_weight"] = float(g['max_w']) / 100.0
+                    if g.get('min_n'):
+                        bc["min_names"] = int(g['min_n'])
+                    if g.get('max_n'):
+                        bc["max_names"] = int(g['max_n'])
+                    if len(bc) > 1:          # a bound beyond the label
+                        out.append(bc)
                 return out or None
+
+            def _inject_axes_groups(df, is_xc):
+                """Attach 'Sector' (from the 2 group name-lists) and, in Vega mode,
+                'Axe Target'/'Axe Cap' (from the per-name Vega inventory) onto a COPY
+                of the candidate df — matched by the per-row candidate key (Corridor
+                Condition Asset in cross-corridor, else Variance Asset). The engine
+                already reads these columns; this is pure UI→engine glue.
+                Returns (df, warnings)."""
+                warns = []
+                if df is None or df.empty:
+                    return df, warns
+                key_col = 'Corridor Condition Asset' if is_xc else 'Variance Asset'
+                if key_col not in df.columns:
+                    return df, warns
+                df = df.copy()
+                keys = [str(v).strip().casefold() for v in df[key_col]]
+                cand = set(keys)
+                # ── Groups → Sector tag ──
+                groups = st.session_state.get('_groups_spec') or []
+                name2grp, overlap = {}, []
+                for g in groups:
+                    for nm in (g.get('names') or []):
+                        k = str(nm).strip().casefold()
+                        if not k:
+                            continue
+                        if k in name2grp and name2grp[k] != g['label']:
+                            overlap.append(nm)
+                            continue
+                        name2grp[k] = g['label']
+                if overlap:
+                    warns.append(f"Noms présents dans deux groupes (gardés dans le 1er): "
+                                 f"{sorted(set(map(str, overlap)))}")
+                if name2grp:
+                    df['Sector'] = [name2grp.get(k, '') for k in keys]
+                    miss = sorted({str(nm) for g in groups for nm in (g.get('names') or [])
+                                   if str(nm).strip().casefold() not in cand})
+                    if miss:
+                        warns.append(f"Noms de groupe absents des candidats (ignorés): {miss}")
+                # ── Vega inventory → Axe Target / Axe Cap ──
+                if st.session_state.get('_vega_toggle', False):
+                    inv = st.session_state.get('_vega_inv_df')
+                    if inv is not None and not inv.empty:
+                        tgt, cap = {}, {}
+                        for _, r in inv.iterrows():
+                            k = str(r.get('Nom', '')).strip().casefold()
+                            if not k:
+                                continue
+                            tgt[k] = r.get('Cible', '')
+                            cap[k] = r.get('Plafond', '')
+                        df['Axe Target'] = [tgt.get(k, '') for k in keys]
+                        df['Axe Cap'] = [cap.get(k, '') for k in keys]
+                        miss_v = sorted({str(r.get('Nom', '')) for _, r in inv.iterrows()
+                                         if str(r.get('Nom', '')).strip().casefold()
+                                         and str(r.get('Nom', '')).strip().casefold() not in cand})
+                        if miss_v:
+                            warns.append(f"Inventaire Vega — noms absents des candidats (ignorés): {miss_v}")
+                return df, warns
 
             vega_on = st.toggle(
                 "⚡ Absolute Vega mode (axe recycling)", value=False, key="_vega_toggle",
                 help="OFF = historical percentage weights (sum=1). ON = absolute Vega "
                      "per name with free total V in [V min, V max]; Min/Max Weight "
-                     "become concentration bounds on v_i/V. When ON, the long table "
-                     "shows 'Axe Target' / 'Axe Cap' columns for the per-name vega "
-                     "inventory. Basket P&L stays Σ(v_i·pnl_i)/V — comparable OFF.")
+                     "become concentration bounds on v_i/V. When ON, a dedicated "
+                     "'Inventaire Vega par nom' table appears below (Cible + Plafond "
+                     "per name). Basket P&L stays Σ(v_i·pnl_i)/V — comparable OFF.")
             if vega_on:
-                st.caption(
-                    "⬆️ The long table now shows **Axe Target** / **Axe Cap** columns — "
-                    "enter the per-name vega inventory (absolute vega units) there.")
                 _vg_c1, _vg_c2 = st.columns(2)
                 vega_v_min = _vg_c1.number_input("V min (Vega)", value=50.0, min_value=0.01)
                 vega_v_max = _vg_c2.number_input("V max (Vega)", value=200.0, min_value=0.01)
+                st.markdown("**⚡ Inventaire Vega par nom (cible + plafond)**")
+                st.caption(
+                    "Colle une ligne par nom : `Nom  Cible  Plafond` (tab ou virgule), "
+                    "puis « Remplir ». Cible = axe à recycler ; Plafond = v_i max pour "
+                    "ce nom. Les noms doivent aussi figurer dans la table de candidats.")
+                if '_vega_inv_df' not in st.session_state:
+                    st.session_state['_vega_inv_df'] = pd.DataFrame(
+                        {'Nom': pd.Series(dtype='str'),
+                         'Cible': pd.Series(dtype='float'),
+                         'Plafond': pd.Series(dtype='float')})
+                _vega_paste = st.text_area(
+                    "Coller l'inventaire Vega (Nom, Cible, Plafond)",
+                    value="", height=100, key="_vega_inv_paste")
+                if st.button("Remplir l'inventaire Vega", key="_vega_inv_fill"):
+                    if _vega_paste.strip():
+                        try:
+                            _rows = []
+                            for _line in _vega_paste.splitlines():
+                                _line = _line.strip()
+                                if not _line:
+                                    continue
+                                _sep = '\t' if '\t' in _line else ','
+                                _p = [x.strip() for x in _line.split(_sep)]
+                                _rows.append({
+                                    'Nom': _p[0] if len(_p) > 0 else '',
+                                    'Cible': _p[1] if len(_p) > 1 else '',
+                                    'Plafond': _p[2] if len(_p) > 2 else '',
+                                })
+                            st.session_state['_vega_inv_df'] = pd.DataFrame(_rows)
+                            st.rerun()
+                        except Exception as _ve:
+                            st.error(f"Erreur inventaire Vega: {_ve}")
+                _vega_inv_edited = st.data_editor(
+                    st.session_state['_vega_inv_df'],
+                    num_rows="dynamic", use_container_width=True, key="_vega_inv_editor")
+                st.session_state['_vega_inv_df'] = _vega_inv_edited
             else:
                 vega_v_min = None
                 vega_v_max = None
@@ -1101,6 +1172,10 @@ with tab1:
                                 if 'Underlying' in _short_src.columns:
                                     _short_src.rename(columns=_vs_rename, inplace=True)
                         _short_df_arg = _short_src if len(_short_src) > 0 else None
+                        # Attach group tags (Sector) + per-name Vega inventory from the dedicated widgets
+                        _long_src, _inj_warns = _inject_axes_groups(_long_src, _is_xc)
+                        for _w in _inj_warns:
+                            st.warning(_w)
                         with st.spinner("Loading data & running optimization..."):
                             _opt_error = None
                             result = None
@@ -1126,9 +1201,7 @@ with tab1:
                                     bisect_in_ga=bisect_in_ga,
                                     seed=int(seed),
                                     forced_tickers=_parse_ticker_list(forced_tickers_raw),
-                                    excluded_tickers=_parse_ticker_list(excluded_tickers_raw),
-                                    bucket_constraints=_parse_bucket_constraints(
-                                        st.session_state.get('_bucket_df')),
+                                    bucket_constraints=_build_group_constraints(),
                                     vega=({"v_min": float(vega_v_min), "v_max": float(vega_v_max)}
                                           if vega_on else None),
                                     robustness_check=robustness_check,
@@ -1297,6 +1370,10 @@ with tab1:
                             max_net_strike=max_strike / 100.0,
                             time_limit_seconds=float(time_limit),
                         )
+                        # Attach group tags (Sector) + per-name Vega inventory from the dedicated widgets
+                        _mc_long, _mc_warns = _inject_axes_groups(_mc_long, _is_xc_mc)
+                        for _w in _mc_warns:
+                            st.warning(_w)
                         with st.spinner(f"Running {len(_mc_configs)} configs on one data load..."):
                             _mc = optimize_multi(
                                 _mc_long, _mc_cfg, _mc_cons,
@@ -1306,9 +1383,7 @@ with tab1:
                                 filter_zero_hr=filter_zero_hr,
                                 seed=int(seed),
                                 forced_tickers=_parse_ticker_list_mc(forced_tickers_raw),
-                                excluded_tickers=_parse_ticker_list_mc(excluded_tickers_raw),
-                                bucket_constraints=_parse_bucket_constraints(
-                                    st.session_state.get('_bucket_df')),
+                                bucket_constraints=_build_group_constraints(),
                             )
                         st.session_state['_mc_result'] = _mc
                 except Exception as _mc_e:
