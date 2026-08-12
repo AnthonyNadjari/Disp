@@ -22,10 +22,111 @@ import time
 import os
 import numpy as np
 import pandas as pd
+from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from functions.dispersion._logging import logger as _engine_log
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Engine tuning constants (single home for every GA-side magic number)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@dataclass(frozen=True)
+class _TuningConstants:
+    """Every tunable magic number of the GA engine, in one place.
+
+    Defaults are STRICTLY the historical values.  Numerical tolerances
+    (1e-8 / 1e-9 / 1e-12 feasibility epsilons) are correctness guards, not
+    tuning knobs, and deliberately stay inline.  Solver-side numbers live in
+    scoring.weight_solver._SolverTuning (the solver cannot import from here).
+    """
+
+    # ── Scoring / ranking ──
+    #: Quantile score above which the GA switches to the raw tie-break.
+    #: Higher → tie-break rarer (top-percentile baskets rank equal);
+    #: lower → raw blend dominates earlier. Range [0.9, 0.999].
+    tiebreak_threshold: float = 0.99
+    #: Reference sample size, no tail metric active.  More = finer quantile
+    #: resolution, slower setup. Range [100, 2000].
+    n_reference_base: int = 300
+    #: Reference sample size when a tail metric (min_payoff/cvar_5) is
+    #: active — tails need more mass. Range [300, 3000].
+    n_reference_tail: int = 800
+    #: Minimum fitted reference size before the run aborts. Below this the
+    #: quantile normalizer is meaningless. Range [50, 300].
+    min_reference_size: int = 100
+    #: Reference build gives up after n_samples × this many attempts.
+    #: Higher tolerates more rejected baskets (slow data). Range [2, 10].
+    reference_attempts_factor: int = 3
+    #: Elite baskets injected into the reference: min(this, n_samples // 10).
+    #: More = normalizer ceiling closer to the GA's elite. Range [10, 100].
+    reference_elite_cap: int = 50
+
+    # ── Data validity ──
+    #: Minimum non-zero P&L observations for a basket to be scoreable, and
+    #: minimum valid rows in the drop-incomplete path.  Higher = stricter
+    #: history requirement, more rejections. Range [20, 150].
+    min_valid_days: int = 50
+
+    # ── Population / evolution ──
+    #: Population init and per-generation fill give up after size × this
+    #: many attempts. Range [2, 10].
+    population_attempts_factor: int = 3
+    #: Attempts to build one random individual before giving up. Range [5, 50].
+    create_attempts: int = 20
+    #: Random immigrants per generation: max(immigrants_min, size × frac).
+    #: More = diversity, slower convergence. Ranges [0, 20] / [0.0, 0.3].
+    immigrants_min: int = 4
+    immigrants_frac: float = 0.10
+    #: Population floor after crossover failures: max(min_abs, size × frac).
+    pop_floor_abs: int = 30
+    pop_floor_frac: float = 0.6
+    #: Backfill attempts factor over the missing count. Range [1, 5].
+    pop_backfill_factor: int = 2
+    #: Consecutive infeasible exact solves before aborting with a units
+    #: error (fail-fast on mis-scaled strikes). Range [5, 100].
+    infeasible_streak_limit: int = 20
+
+    # ── Post-GA refinement / local search ──
+    #: Elites refined by the inner solver after the GA. More = better
+    #: subsets found, slower. Range [5, 100].
+    refine_top_k: int = 30
+    #: Local search wall budget: min(cap_s, max(floor_s, frac × time_limit)).
+    local_search_cap_s: float = 8.0
+    local_search_floor_s: float = 2.0
+    local_search_frac: float = 0.4
+    #: Best-improvement sweeps per descent. Range [2, 20].
+    local_search_sweeps: int = 6
+    #: Multi-start seeds (incumbent + this many distinct elites). Range [0, 10].
+    local_search_seeds: int = 3
+    #: Safety-net score tie window — below it the raw min decides. Range
+    #: [1e-6, 1e-2].
+    safety_tie_window: float = 1e-4
+
+    # ── Reference weight-strategy mix (cumulative draw thresholds) ──
+    #: P(equal weights) = mix_equal; P(QP-diversified) = mix_qp − mix_equal;
+    #: P(greedy-spread) = mix_greedy − mix_qp; remainder = Dirichlet.
+    mix_equal: float = 0.4
+    mix_qp: float = 0.7
+    mix_greedy: float = 0.9
+    #: Greedy reference allocator: best name gets lb + frac × (ub − lb).
+    greedy_best_frac: float = 0.6
+    #: Greedy remainder spread multiplier over quality share. Range [1, 3].
+    greedy_spread_boost: float = 1.5
+    #: QP diversification penalty λ (0 = LP corners, big = equal-weight).
+    qp_diversification_penalty: float = 0.3
+
+    # ── Bootstrap robustness diagnostic ──
+    bootstrap_draws: int = 300
+    bootstrap_top_k: int = 10
+    #: Final-population snapshot kept as challenger source. Range [10, 200].
+    bootstrap_population_snapshot: int = 60
+
+
+#: Module-level defaults (import and share; construct a custom instance only
+#: for experiments — the engine reads THIS object).
+TUNING = _TuningConstants()
 
 def _scoring_signature(metric_weights, seed: int, n_samples: int,
                        reference_size: int) -> str:
@@ -115,7 +216,7 @@ class _Individual:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _qp_diversified_weights(col_means: np.ndarray, lb: np.ndarray, ub: np.ndarray,
-                            diversification_penalty: float = 0.3) -> np.ndarray:
+                            diversification_penalty: float = TUNING.qp_diversification_penalty) -> np.ndarray:
     """
     Find weights that maximize expected return MINUS a diversification penalty.
 
@@ -259,10 +360,6 @@ class DispersionOptimizer:
         self._n_rows = self._ts_mat.shape[0]
         # Precompute validity mask for adaptive reweight (True where data exists)
         self._valid_mask = ~np.isnan(self._orig_ts_mat)  # [n_rows x n_cols]
-        # Build date index for 3Y/5Y window calculation
-        # Use row count as proxy: 252 trading days/year
-        self._n_3y = min(self._n_rows, 252 * 3)
-        self._n_5y = min(self._n_rows, 252 * 5)
         self._long_only = len(self.short_candidates) == 0
         # Rejection tracking
         self._rejection_reasons = {
@@ -638,7 +735,7 @@ class DispersionOptimizer:
             # An explicit n_reference_samples overrides the adaptive default.
             has_tail = any(getattr(m, 'is_tail_metric', False) for m in active_metrics)
             n_samples = (self._n_reference_samples if self._n_reference_samples
-                         else (800 if has_tail else 300))
+                         else (TUNING.n_reference_tail if has_tail else TUNING.n_reference_base))
             self._weight_solver = None  # not available during reference build
             self._build_reference_sample(n_samples=n_samples)
             # ── TABLE: Long candidates + PnL data quality ──
@@ -683,7 +780,7 @@ class DispersionOptimizer:
         # Create initial population
         population = []
         attempts = 0
-        while len(population) < self.c.population_size and attempts < self.c.population_size * 3:
+        while len(population) < self.c.population_size and attempts < self.c.population_size * TUNING.population_attempts_factor:
             ind = self._create_random_individual()
             if ind is not None:
                 population.append(ind)
@@ -717,7 +814,7 @@ class DispersionOptimizer:
             crossover_ok = 0
             crossover_fail = 0
             mutations_applied = 0
-            while len(new_population) < self.c.population_size and fill_attempts < self.c.population_size * 3:
+            while len(new_population) < self.c.population_size and fill_attempts < self.c.population_size * TUNING.population_attempts_factor:
                 fill_attempts += 1
                 p1 = self._tournament_select(population)
                 p2 = self._tournament_select(population)
@@ -733,7 +830,7 @@ class DispersionOptimizer:
                         mutations_applied += 1
                 new_population.append(child)
             # Random immigrants: inject fresh individuals to maintain diversity
-            n_immigrants = max(4, int(self.c.population_size * 0.10))
+            n_immigrants = max(TUNING.immigrants_min, int(self.c.population_size * TUNING.immigrants_frac))
             for _ in range(n_immigrants):
                 immigrant = self._create_random_individual()
                 if immigrant is not None:
@@ -749,10 +846,10 @@ class DispersionOptimizer:
                         new_population.append(immigrant)
             population = new_population
             # Population floor: if crossover failures shrank the pop, backfill with random
-            min_pop = max(30, int(self.c.population_size * 0.6))
+            min_pop = max(TUNING.pop_floor_abs, int(self.c.population_size * TUNING.pop_floor_frac))
             if len(population) < min_pop:
                 backfill_attempts = 0
-                while len(population) < min_pop and backfill_attempts < min_pop * 2:
+                while len(population) < min_pop and backfill_attempts < min_pop * TUNING.pop_backfill_factor:
                     backfill_attempts += 1
                     ind = self._create_random_individual()
                     if ind is not None:
@@ -789,7 +886,7 @@ class DispersionOptimizer:
             # through the smooth-normalised SLSQP inner solver.
             pre_score = best_score
             population.sort(key=lambda x: x.fitness, reverse=True)
-            top_k = min(30, len(population))
+            top_k = min(TUNING.refine_top_k, len(population))
             best_individual, best_score = self._refine_top_individuals(
                 population[:top_k], best_individual, best_score
             )
@@ -807,7 +904,7 @@ class DispersionOptimizer:
         if (self._use_new_scoring and self._weight_solver is not None
                 and getattr(self, "_exact_fitness", False)):
             pre_ls = best_score
-            _ls_pool = sorted(population, key=lambda x: x.fitness, reverse=True)[:30]
+            _ls_pool = sorted(population, key=lambda x: x.fitness, reverse=True)[:TUNING.refine_top_k]
             best_individual, best_score = self._exact_swap_local_search(
                 best_individual, best_score, start_pool=_ls_pool)
             if best_score > pre_ls + 1e-12:
@@ -822,7 +919,7 @@ class DispersionOptimizer:
             (list(ind.long_indices), np.array(ind.long_weights, dtype=np.float64),
              list(ind.short_indices), np.array(ind.short_weights, dtype=np.float64),
              float(ind.fitness))
-            for ind in sorted(population, key=lambda x: x.fitness, reverse=True)[:60]
+            for ind in sorted(population, key=lambda x: x.fitness, reverse=True)[:TUNING.bootstrap_population_snapshot]
         ]
         return self._to_result(best_individual, generations_run + 1)
 
@@ -924,7 +1021,7 @@ class DispersionOptimizer:
                     _short_w_r = ind.short_weights
             net_pnl = self._adaptive_net_pnl(long_pos, result.weights, _short_pos_r, _short_w_r)
             n_nz = int(np.count_nonzero(net_pnl))
-            if n_nz < 50:
+            if n_nz < TUNING.min_valid_days:
                 continue
             _cand_ctx = _ctx_for(ind, result.weights, solve_extra=result.extra)
             score = self._score_fn.score(net_pnl, _cand_ctx)
@@ -1002,7 +1099,7 @@ class DispersionOptimizer:
         (mirrors _refine_top_individuals).  Wall-time bounded.
         """
         if time_budget is None:
-            time_budget = min(8.0, max(2.0, 0.4 * float(self.c.time_limit_seconds)))
+            time_budget = min(TUNING.local_search_cap_s, max(TUNING.local_search_floor_s, TUNING.local_search_frac * float(self.c.time_limit_seconds)))
         t0 = time.time()
         lam = self._score_fn.weights
         metric_map = {m.name: m for m in self._score_fn.metrics}
@@ -1049,7 +1146,7 @@ class DispersionOptimizer:
                                          best.short_indices, best.short_weights):
                 return None
             net = self._adaptive_net_pnl(pos, res.weights, _short_pos, _short_w)
-            if int(np.count_nonzero(net)) < 50:
+            if int(np.count_nonzero(net)) < TUNING.min_valid_days:
                 return None
             ws = (self._net_strike(indices, res.weights,
                                    best.short_indices, best.short_weights)
@@ -1069,7 +1166,7 @@ class DispersionOptimizer:
         def _descend_1swap(indices, scalar, score, w):
             """Best-improvement 1-swap descent to a local optimum (or budget)."""
             nonlocal n_evals
-            for _sweep in range(6):
+            for _sweep in range(TUNING.local_search_sweeps):
                 if time.time() - t0 > time_budget:
                     break
                 best_move = None  # (scalar, score, weights, indices)
@@ -1126,7 +1223,7 @@ class DispersionOptimizer:
         queue = [(inc_scalar, inc_score, inc_w, list(best.long_indices))]
         seen = {tuple(sorted(best.long_indices))}
         for cand in (start_pool or []):
-            if len(queue) >= 4:  # incumbent + up to 3 elite seeds
+            if len(queue) >= 1 + TUNING.local_search_seeds:  # incumbent + elite seeds
                 break
             key = tuple(sorted(cand.long_indices))
             if key in seen:
@@ -1202,7 +1299,7 @@ class DispersionOptimizer:
         elif use_drop:
             all_pos = np.concatenate([long_pos, short_pos]) if (short_pos is not None and len(short_pos) > 0) else long_pos
             valid_rows = ~np.isnan(self._orig_ts_mat[:, all_pos]).any(axis=1)
-            if valid_rows.sum() < 50:
+            if valid_rows.sum() < TUNING.min_valid_days:
                 return np.zeros(0)
             L = self._orig_ts_mat[valid_rows][:, long_pos] @ long_w
             if short_pos is not None and len(short_pos) > 0:
@@ -1311,7 +1408,7 @@ class DispersionOptimizer:
             )
             if not result.feasible:
                 self._lp_infeasible_streak += 1
-                if self._lp_infeasible_streak >= 20:
+                if self._lp_infeasible_streak >= TUNING.infeasible_streak_limit:
                     raise RuntimeError(
                         f"First 20 exact inner solves all infeasible — likely units mismatch. "
                         f"strikes.min={strikes.min():.4f}, strikes.max={strikes.max():.4f}, "
@@ -1367,7 +1464,7 @@ class DispersionOptimizer:
             long_pos, long_w, short_pos_arr,
             short_w if short_pos_arr is not None else None)
         n_nonzero = int(np.count_nonzero(net_pnl_raw))
-        if n_nonzero < 50:
+        if n_nonzero < TUNING.min_valid_days:
             self._rejection_reasons["len_valid_lt_50"] += 1
             return 0.0
         _ws = (self._net_strike(individual.long_indices, long_w,
@@ -1399,7 +1496,7 @@ class DispersionOptimizer:
         score = self._score_fn.score(net_pnl_raw, ctx)
         if np.isnan(score) or np.isinf(score):
             return None
-        if score >= 0.99:
+        if score >= TUNING.tiebreak_threshold:
             raw = self._score_fn.raw_metrics(net_pnl_raw, ctx)
             lam = self._score_fn.weights
             metric_map = {m.name: m for m in self._score_fn.metrics}
@@ -1466,7 +1563,7 @@ class DispersionOptimizer:
             all_pos = long_pos + short_pos
             combined = self._orig_ts_mat[:, all_pos]
             valid_rows = ~np.isnan(combined).any(axis=1)
-            if valid_rows.sum() < 50:
+            if valid_rows.sum() < TUNING.min_valid_days:
                 return None
             L = self._orig_ts_mat[valid_rows][:, long_pos] @ long_w
             S = (self._orig_ts_mat[valid_rows][:, short_pos] @ short_w) if len(short_pos) else 0.0
@@ -1474,7 +1571,7 @@ class DispersionOptimizer:
             L = self._ts_mat[:, long_pos] @ long_w
             S = (self._ts_mat[:, short_pos] @ short_w) if len(short_pos) else 0.0
             valid_rows = np.ones(self._n_rows, dtype=bool)
-        if valid_rows.sum() < 50:
+        if valid_rows.sum() < TUNING.min_valid_days:
             return None
         net = (L + S) if self.is_cross_corridor else (L - S)
         if self.global_cap < 9999998 or self.global_floor > -9999998:
@@ -1488,7 +1585,7 @@ class DispersionOptimizer:
                 n_trailing_zeros += 1
             else:
                 break
-        if nonzero_mask.sum() < 50:
+        if nonzero_mask.sum() < TUNING.min_valid_days:
             return None
         # ── ALIGNED WITH BACKTESTER: return full series including zeros ──
         # Cross-corridor backtester keeps all rows. Zeros are valid observations.
@@ -1505,7 +1602,7 @@ class DispersionOptimizer:
         sample_pnls = []
         sample_extras = []  # aligned with sample_pnls: {"weighted_strike": ...}
         attempts = 0
-        max_attempts = n_samples * 3
+        max_attempts = n_samples * TUNING.reference_attempts_factor
         _free_pool_ref = [i for i in range(len(self.long_candidates))
                           if i not in self._forced_long]
 
@@ -1522,9 +1619,9 @@ class DispersionOptimizer:
             # Mix weight strategies so reference spans the same distribution as GA evaluations:
             # 40% equal weights, 30% QP-diversified (penalizes corners), 20% greedy-spread, 10% Dirichlet
             r = self._rng.random()
-            if r < 0.4:
+            if r < TUNING.mix_equal:
                 long_w = np.full(n_long, 1.0 / n_long)
-            elif r < 0.7:
+            elif r < TUNING.mix_qp:
                 # QP-optimal on column means with diversification penalty (per-stock bounds)
                 long_pos = []
                 for idx in long_indices:
@@ -1540,7 +1637,7 @@ class DispersionOptimizer:
                     long_w = _qp_diversified_weights(col_means, lb, ub)
                 else:
                     long_w = np.full(n_long, 1.0 / n_long)
-            elif r < 0.9:
+            elif r < TUNING.mix_greedy:
                 # Greedy with diversification: bias toward best but spread remainder
                 long_pos = []
                 for idx in long_indices:
@@ -1555,7 +1652,7 @@ class DispersionOptimizer:
                     # Give best stock 50-75% of its max (not full max)
                     best_col = np.argmax(col_means)
                     long_w = lb.copy()
-                    best_alloc = lb[best_col] + 0.6 * (ub[best_col] - lb[best_col])
+                    best_alloc = lb[best_col] + TUNING.greedy_best_frac * (ub[best_col] - lb[best_col])
                     long_w[best_col] = best_alloc
                     remaining = 1.0 - long_w.sum()
                     if remaining > 0:
@@ -1566,7 +1663,7 @@ class DispersionOptimizer:
                             if idx2 == best_col:
                                 continue
                             share = max(0, col_means[idx2]) / quality_sum
-                            add = min(remaining, ub[idx2] - long_w[idx2], remaining * share * 1.5)
+                            add = min(remaining, ub[idx2] - long_w[idx2], remaining * share * TUNING.greedy_spread_boost)
                             long_w[idx2] += add
                             remaining -= add
                             if remaining < 1e-9:
@@ -1610,7 +1707,7 @@ class DispersionOptimizer:
             if net_pnl is None:
                 reason = "net_pnl is None"
                 rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
-            elif len(net_pnl) < 50:
+            elif len(net_pnl) < TUNING.min_valid_days:
                 reason = "len < 50"
                 rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
             else:
@@ -1630,7 +1727,7 @@ class DispersionOptimizer:
                 col = self._col_pos[key]
                 all_col_means.append((i, self._ts_mat[:, col].mean()))
         all_col_means.sort(key=lambda x: -x[1])  # descending by mean
-        n_elite_baskets = min(50, n_samples // 10)
+        n_elite_baskets = min(TUNING.reference_elite_cap, n_samples // 10)
         for offset in range(n_elite_baskets):
             _lo_e, _hi_e = self._long_size_bounds(len(_free_pool_ref))
             n_long = self._rng.randint(_lo_e, _hi_e)
@@ -1665,7 +1762,7 @@ class DispersionOptimizer:
                 short_w_e = np.full(max(len(short_indices_e), 1), 1.0 / max(len(short_indices_e), 1)) if short_indices_e else np.zeros(0)
 
             elite_pnl = self._compute_net_pnl(long_indices_e, long_w_e, short_indices_e, short_w_e)
-            if elite_pnl is not None and len(elite_pnl) >= 50:
+            if elite_pnl is not None and len(elite_pnl) >= TUNING.min_valid_days:
                 sample_pnls.append(elite_pnl)
                 _extra_e = {
                     "weighted_strike": self._net_strike(
@@ -1674,7 +1771,7 @@ class DispersionOptimizer:
                 _extra_e.update(self._reference_axe_extras(long_indices_e, long_w_e))
                 sample_extras.append(_extra_e)
 
-        if len(sample_pnls) < 100:
+        if len(sample_pnls) < TUNING.min_reference_size:
             self.log("WARN", f"⚠️ Reference sample too small ({len(sample_pnls)}/{n_samples} after {attempts} attempts), falling back to legacy scoring")
             self._use_new_scoring = False
             self._scoring_mode = "legacy"
@@ -1851,7 +1948,7 @@ class DispersionOptimizer:
     def _create_random_individual(self) -> Optional[_Individual]:
         """Create an individual — the genome is ONLY the stock subsets;
         weights are derived deterministically inside _fitness."""
-        max_attempts = 20
+        max_attempts = TUNING.create_attempts
         _free_pool = [i for i in range(len(self.long_candidates)) if i not in self._forced_long]
         for _ in range(max_attempts):
             _lo, _hi = self._long_size_bounds(len(_free_pool))
@@ -2060,7 +2157,7 @@ class DispersionOptimizer:
 
                     # NEVER DOWNGRADE: pick the better weight set by user's blend objective
                     # TIE-BREAK: when scores are within 1e-4, prefer higher raw min_payoff
-                    if abs(bisect_score - ga_score) < 1e-4:
+                    if abs(bisect_score - ga_score) < TUNING.safety_tie_window:
                         winner = "bisect" if bisect_min > ga_min else "ga"
                         _engine_log.debug(f"[SAFETY-NET] tie on score ({ga_score:.4f} vs {bisect_score:.4f}), min decides: {winner} (ga_min={ga_min:.4f} bisect_min={bisect_min:.4f})")
                         if winner == "bisect":
@@ -2329,7 +2426,8 @@ class DispersionOptimizer:
 
     # ── Bootstrap robustness diagnostic (called externally if robustness_check=True) ──
 
-    def bootstrap_robustness(self, n_draws: int = 300, top_k: int = 10,
+    def bootstrap_robustness(self, n_draws: int = TUNING.bootstrap_draws,
+                             top_k: int = TUNING.bootstrap_top_k,
                              seed: Optional[int] = None) -> Optional[Dict]:
         """Day-resampling robustness of the delivered basket.
 

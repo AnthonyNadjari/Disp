@@ -89,6 +89,62 @@ __all__ = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Solver tuning constants (single home for every solver-side magic number)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class _SolverTuning:
+    """Every tunable magic number of the inner weight solver.
+
+    Defaults are STRICTLY the historical values.  Pure numerical tolerances
+    (1e-9/1e-12 feasibility epsilons) stay inline by convention.  GA-side
+    numbers live in _optimizer._TuningConstants (this module cannot import
+    from the optimizer).
+    """
+
+    #: Tiny linear pull toward high-mean names in the SLSQP objective —
+    #: breaks flat plateaus. Bigger distorts the objective. Range [0, 1e-2].
+    reg_strength: float = 1e-4
+    #: Quantile score above which the sweep ranks on the raw tie-break
+    #: (must match the GA's tiebreak_threshold). Range [0.9, 0.999].
+    tiebreak_threshold: float = 0.99
+    #: Minimum full-active days for the linear-exact LP restrictions, and
+    #: minimum active days for the bisection. Ranges [20, 150] / [5, 50].
+    min_lp_days: int = 50
+    min_bisect_days: int = 10
+    #: Bisection tolerances (GA proxy vs fine/safety-net) and LP-iteration
+    #: caps for each. Coarser GA tol = fewer LPs per subset.
+    bisect_tol_ga: float = 0.01
+    bisect_tol_fine: float = 1e-6
+    bisect_iters_ga: int = 6
+    bisect_iters_fine: int = 45
+    #: Warm-start windows around cached / best-known f*: |f|·rel + abs.
+    warm_rel_self: float = 0.2
+    warm_abs_self: float = 0.01
+    warm_rel_global: float = 0.3
+    warm_abs_global: float = 0.05
+    #: SLSQP iteration caps (solve vs 2-start diagnostic).
+    slsqp_maxiter: int = 30
+    diagnose_maxiter: int = 50
+    #: Step-sweep size: Dirichlet draws + full simplex grid when n <= grid_max_n.
+    sweep_dirichlet: int = 300
+    sweep_grid_steps: int = 5
+    sweep_grid_max_n: int = 4
+    #: LP projections of group-violating sweep candidates (HiGHS each).
+    sweep_projection_budget: int = 12
+    #: V-grid resolution for the per-evaluation vega choice. Range [9, 101].
+    vega_grid_points: int = 33
+    #: last_carry proxy window (days) in the bisection step-2 LP objective.
+    bisect_carry_window: int = 63
+    #: Post-smoothing eps ladder multipliers.
+    smooth_eps_ladder: Tuple[int, ...] = (1, 2, 4)
+
+
+#: Module-level defaults — the solver reads THIS object.
+SOLVER_TUNING = _SolverTuning()
+
+
 def project_to_bounded_simplex(w: np.ndarray, lb: np.ndarray, ub: np.ndarray) -> np.ndarray:
     """THE canonical projection onto {w : Σw = 1, lb <= w <= ub}.
 
@@ -437,7 +493,7 @@ class WeightSolver:
         v_hi = min(float(vega.v_max), v_cap)
         if v_hi < float(vega.v_min) - 1e-9:
             return None
-        grid = np.linspace(float(vega.v_min), v_hi, 33)
+        grid = np.linspace(float(vega.v_min), v_hi, SOLVER_TUNING.vega_grid_points)
         # Tie preference: with B active, ties break toward the LOWEST V
         # (recycled fraction favours small packages); otherwise toward the
         # LARGEST V (max-clean spirit: A is nondecreasing in V, and a basket
@@ -686,7 +742,7 @@ class WeightSolver:
                     lo, hi))
 
         # Determine bisection tolerance from caller hint
-        bisect_tol = 0.01 if tol == "ga" else 1e-6
+        bisect_tol = SOLVER_TUNING.bisect_tol_ga if tol == "ga" else SOLVER_TUNING.bisect_tol_fine
 
         # Compute active_mask_sub for bisection paths (subset columns from active_mask)
         active_mask_sub = None
@@ -835,7 +891,7 @@ class WeightSolver:
         w0_equal = np.full(n, 1.0 / n)
         res_equal = minimize(objective, w0_equal, method="SLSQP",
                              bounds=bounds, constraints=constraints,
-                             options={"maxiter": 50, "ftol": 1e-7})
+                             options={"maxiter": SOLVER_TUNING.diagnose_maxiter, "ftol": 1e-7})
         w_equal = np.clip(res_equal.x, c.min_weight, c.max_weight)
         w_equal = w_equal / w_equal.sum()
         score_equal = self._score_fn.score(sub_pnl @ w_equal, _ctx_for(w_equal))
@@ -859,7 +915,7 @@ class WeightSolver:
 
         res_greedy = minimize(objective, greedy_w, method="SLSQP",
                               bounds=bounds, constraints=constraints,
-                              options={"maxiter": 50, "ftol": 1e-7})
+                              options={"maxiter": SOLVER_TUNING.diagnose_maxiter, "ftol": 1e-7})
         w_greedy = np.clip(res_greedy.x, c.min_weight, c.max_weight)
         w_greedy = w_greedy / w_greedy.sum()
         score_greedy = self._score_fn.score(sub_pnl @ w_greedy, _ctx_for(w_greedy))
@@ -1054,7 +1110,7 @@ class WeightSolver:
             return 2.0 * (w - target)
 
         # ── Fallback ladder: try eps, 2*eps, 4*eps ──
-        for mult in [1, 2, 4]:
+        for mult in SOLVER_TUNING.smooth_eps_ladder:
             cur_eps = eps_min * mult
             floor_min = ref_min - cur_eps
             floor_blend = ref_blend - cur_eps
@@ -1141,8 +1197,8 @@ class WeightSolver:
             sub_pnl = sub_pnl[full_active_days]
             n_full = sub_pnl.shape[0]
             self._log("DEBUG", f"[WEIGHT-SOLVER] concave_blend LP days: full={n_full}/{n_total}")
-            if n_full < 50:
-                self._log("WARNING", f"[WEIGHT-SOLVER] concave_blend LP: insufficient full-active days ({n_full}<50)")
+            if n_full < SOLVER_TUNING.min_lp_days:
+                self._log("WARNING", f"[WEIGHT-SOLVER] concave_blend LP: insufficient full-active days ({n_full}<{SOLVER_TUNING.min_lp_days})")
                 return WeightSolverResult(weights=np.full(n, 1.0 / n), score=-np.inf, feasible=False, n_evals=0)
         else:
             # Fallback: drop all-zero rows
@@ -1408,7 +1464,7 @@ class WeightSolver:
         mask_active = active_mask_sub[day_has_any]
         n_active_days = pnl_active.shape[0]
 
-        if n_active_days < 10:
+        if n_active_days < SOLVER_TUNING.min_bisect_days:
             return WeightSolverResult(weights=np.full(n, 1.0 / n), score=-np.inf, feasible=False, n_evals=0)
 
         # Compute initial bounds for bisection
@@ -1423,7 +1479,7 @@ class WeightSolver:
         # Warm-start from cache (parent's f_star or global best)
         if cache_key is not None and cache_key in self._fstar_cache:
             cached_f = self._fstar_cache[cache_key]
-            margin = abs(cached_f) * 0.2 + 0.01
+            margin = abs(cached_f) * SOLVER_TUNING.warm_rel_self + SOLVER_TUNING.warm_abs_self
             warm_lo = cached_f - margin
             warm_hi = cached_f + margin
             lo = max(lo, warm_lo)
@@ -1434,7 +1490,7 @@ class WeightSolver:
         elif self._fstar_cache:
             # Seed from best known f_star across all subsets
             best_known = max(self._fstar_cache.values())
-            margin = abs(best_known) * 0.3 + 0.05
+            margin = abs(best_known) * SOLVER_TUNING.warm_rel_global + SOLVER_TUNING.warm_abs_global
             lo = max(lo, best_known - margin)
             hi = min(hi, best_known + margin)
             if lo > hi:
@@ -1491,10 +1547,11 @@ class WeightSolver:
         # Bisection
         best_w = eq_w.copy()
         n_lps = 0
-        max_iters = 6 if tol >= 0.005 else 45  # GA: cap at 6; refinement: up to 45
+        max_iters = (SOLVER_TUNING.bisect_iters_ga if tol >= SOLVER_TUNING.bisect_tol_ga / 2
+                     else SOLVER_TUNING.bisect_iters_fine)
 
         # DIAGNOSTIC: if fine tolerance, sanity-check that incumbent weights are feasible
-        if tol < 0.005 and per_stock_bounds is not None:
+        if tol < SOLVER_TUNING.bisect_tol_ga / 2 and per_stock_bounds is not None:
             # Test feasibility at the incumbent's adaptive min (should always pass)
             inc_f = adaptive_eq - 1e-6
             A_test = -M1_sparse + inc_f * M2_sparse
@@ -1633,7 +1690,7 @@ class WeightSolver:
         # Objective: maximize lam_mean * mean(sub_pnl @ w) + lam_carry * mean(sub_pnl[-n_carry:] @ w)
         # = (lam_mean * col_means + lam_carry * col_carry_means) @ w
         col_means = sub_pnl.mean(axis=0)
-        n_carry = min(63, n_days)  # ~3 months for "last_carry"
+        n_carry = min(SOLVER_TUNING.bisect_carry_window, n_days)  # ~3 months for "last_carry"
         col_carry_means = sub_pnl[-n_carry:].mean(axis=0) if n_carry > 0 else col_means
 
         obj_linear = -(lam_mean * col_means + lam_carry * col_carry_means)  # negate for minimize
@@ -1763,8 +1820,8 @@ class WeightSolver:
             sub_pnl = sub_pnl[full_active_days]
             n_full = sub_pnl.shape[0]
             self._log("DEBUG", f"[WEIGHT-SOLVER] min_payoff LP days: full={n_full}/{n_total}")
-            if n_full < 50:
-                self._log("WARNING", f"[WEIGHT-SOLVER] min_payoff LP: insufficient full-active days ({n_full}<50)")
+            if n_full < SOLVER_TUNING.min_lp_days:
+                self._log("WARNING", f"[WEIGHT-SOLVER] min_payoff LP: insufficient full-active days ({n_full}<{SOLVER_TUNING.min_lp_days})")
                 return WeightSolverResult(weights=np.full(n, 1.0 / n), score=-np.inf, feasible=False, n_evals=0)
 
         n_days, n_stocks = sub_pnl.shape
@@ -1885,7 +1942,7 @@ class WeightSolver:
         ws_active = "weighted_strike" in lam.active_names
         lam_a = lam.get("axe_book_cleaned", 0.0)
         lam_b = lam.get("axe_package_recycled", 0.0)
-        reg_strength = 1e-4
+        reg_strength = SOLVER_TUNING.reg_strength
 
         def objective(w: np.ndarray) -> float:
             net_pnl = sub_pnl @ w
@@ -1943,7 +2000,7 @@ class WeightSolver:
 
         # Compute per-stock mean as regularisation direction (breaks plateaus)
         col_means = sub_pnl.mean(axis=0)
-        reg_strength = 1e-4
+        reg_strength = SOLVER_TUNING.reg_strength
 
         lam = self._score_fn.weights
         ws_active = "weighted_strike" in lam.active_names
@@ -2034,7 +2091,7 @@ class WeightSolver:
                     method="SLSQP",
                     bounds=bounds,
                     constraints=constraints,
-                    options={"maxiter": 30, "ftol": 1e-6},
+                    options={"maxiter": SOLVER_TUNING.slsqp_maxiter, "ftol": 1e-6},
                 )
                 if res.success or res.fun < -best_score:
                     score_val = -res.fun
@@ -2085,7 +2142,7 @@ class WeightSolver:
             step = self._score_fn.score(net, ctx_w)
             if math.isnan(step) or math.isinf(step):
                 return None
-            if step < 0.99:
+            if step < SOLVER_TUNING.tiebreak_threshold:
                 return (float(step), float(step))
             raw = self._score_fn.raw_metrics(net, ctx_w)
             scalar = 0.0
@@ -2117,7 +2174,7 @@ class WeightSolver:
         # LP projections are capped: they cost one HiGHS solve each.  The
         # first few group-violating candidates get projected to a feasible
         # neighbour; later ones are simply filtered by _step_eval.
-        _proj_budget = [12]
+        _proj_budget = [SOLVER_TUNING.sweep_projection_budget]
 
         def _add_candidate(w):
             w2 = self._project_to_bounded_simplex(w, lb, ub)
@@ -2131,10 +2188,10 @@ class WeightSolver:
                 if proj2 is not None:
                     cand_ws.append(proj2)
 
-        for _ in range(300):
+        for _ in range(SOLVER_TUNING.sweep_dirichlet):
             _add_candidate(sweep_rng.dirichlet(np.ones(n)))
-        if n <= 4:
-            grid = np.linspace(0.0, 1.0, 5)
+        if n <= SOLVER_TUNING.sweep_grid_max_n:
+            grid = np.linspace(0.0, 1.0, SOLVER_TUNING.sweep_grid_steps)
             for combo in itertools.product(grid, repeat=n):
                 s = float(sum(combo))
                 if s <= 0.0:
