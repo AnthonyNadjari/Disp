@@ -481,6 +481,244 @@ def price(
 # 3. OPTIMIZE
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _prepare_optimization_inputs(
+    long_df: pd.DataFrame,
+    config: DispersionConfig,
+    constraints: OptimizationConstraints,
+    *,
+    short_df: pd.DataFrame,
+    start_date,
+    end_date,
+    filter_zero_hr: bool,
+    forced_set: set,
+    excluded_set: set,
+) -> Dict:
+    """Shared data pipeline for optimize()/optimize_multi(): parse the input
+    DataFrames, load prices, build + slice the P&L matrix, filter the
+    candidate universe (exclusions, 0%-HR filter, forced restoration), run
+    the pre-flight feasibility checks and resolve forced indices.
+
+    Returns {"early_result": OptimizationResult, ...} for the historical
+    early-exit paths (early_result is None on success), plus the prepared
+    inputs the callers need.
+    """
+    from functions.dispersion._backtester import DispersionDataLoader
+
+    # ── Step 1: Parse DataFrames → DispersionLeg objects ──
+    long_legs = _df_to_legs(long_df, config.cross_corridor)
+    if short_df is not None and not short_df.empty:
+        short_df = _normalize_df_columns(short_df)
+        short_legs = _df_to_legs(short_df, config.cross_corridor)
+    else:
+        short_legs = []
+
+    # ── Step 2: Load Bloomberg data ──
+    internal_cfg = _to_swap_config(config, start_date=start_date, end_date=end_date)
+    loader = DispersionDataLoader(internal_cfg)
+    basket = BasketInput(long_candidates=long_legs, short_candidates=short_legs)
+    data = loader.load(basket)
+
+    if data["price_data"].empty:
+        empty_ts = pd.DataFrame({"Long Leg": [], "Short Leg": [], "Result": []})
+        return {"early_result": OptimizationResult(
+            long_basket=[], short_basket=[],
+            long_strike_weighted=0.0, short_strike_weighted=0.0,
+            net_strike=0.0, score=-np.inf,
+            generations_run=0, converged=False,
+            backtest=BacktestResult(timeseries=empty_ts),
+        )}
+
+    # ── Step 3: Build PNL matrix ──
+    price_data_all = data["price_data"]
+    index_data_all = data.get("index_data")
+    legs = data["legs"]
+    long_legs_loaded = data["long_legs"]
+    short_legs_loaded = data["short_legs"]
+
+    # WARM-UP FIX: Build PnL from FULL price history (same as backtester uses),
+    # then slice the resulting matrix to [start_date, end_date].
+    # This ensures the rolling kernel has n_exp warm-up rows BEFORE start_date,
+    # so the optimizer's matrix row 0 matches the backtest curve row 0 exactly.
+    price_data_for_build = price_data_all
+    index_data_for_build = index_data_all
+    if not start_date and not end_date:
+        # No explicit dates: use lookback window including warm-up buffer
+        lookback_days = int(config.lookback_years * 252) + config.n_exp
+        if len(price_data_for_build) > lookback_days:
+            price_data_for_build = price_data_for_build.iloc[-lookback_days:]
+            if index_data_for_build is not None and not index_data_for_build.empty:
+                index_data_for_build = index_data_for_build.iloc[-lookback_days:]
+
+    pnl_matrix_full, col_map = _build_pnl_matrix(price_data_for_build, index_data_for_build, legs, config)
+
+    # Slice to [start_date, end_date] — rows in pnl_matrix_full correspond 1:1 to price_data_for_build.index
+    _build_index = price_data_for_build.index
+    if start_date:
+        _start_idx = _build_index.searchsorted(pd.Timestamp(start_date), side='left')
+    else:
+        _start_idx = 0
+    if end_date:
+        _end_idx = _build_index.searchsorted(pd.Timestamp(end_date), side='right')
+    else:
+        _end_idx = len(_build_index)
+    pnl_matrix = pnl_matrix_full[_start_idx:_end_idx]
+
+    # Also keep the date index for the optimizer window (used later for NUMERIC-CHECK alignment)
+    _optimizer_dates = _build_index[_start_idx:_end_idx]
+    # price_data = sliced prices (used only for candidate filtering, not PnL computation)
+    price_data = price_data_for_build.iloc[_start_idx:_end_idx]
+    index_data = index_data_for_build.iloc[_start_idx:_end_idx] if (index_data_for_build is not None and not index_data_for_build.empty) else index_data_for_build
+
+    # ── Step 4: Filter candidates ──
+    valid_tickers = set(col_map.keys())
+    # For cross-corridor, use index (Corridor Condition Asset) as the key
+    if config.cross_corridor:
+        long_valid = [s for s in long_legs_loaded if s.corridor_condition_asset in valid_tickers]
+        short_valid = [s for s in short_legs_loaded if s.corridor_condition_asset in valid_tickers]
+        missing = [s for s in long_legs_loaded if s.corridor_condition_asset not in valid_tickers]
+    else:
+        long_valid = [s for s in long_legs_loaded if s.variance_asset in valid_tickers]
+        short_valid = [s for s in short_legs_loaded if s.variance_asset in valid_tickers]
+        missing = [s for s in long_legs_loaded if s.variance_asset not in valid_tickers]
+
+    def _leg_keys(s):
+        keys = {str(s.variance_asset).strip().casefold()}
+        if getattr(s, "corridor_condition_asset", None):
+            keys.add(str(s.corridor_condition_asset).strip().casefold())
+        return keys
+
+    # ── Exclusion: drop excluded names from both legs ──
+    if excluded_set:
+        long_valid = [s for s in long_valid if not (_leg_keys(s) & excluded_set)]
+        short_valid = [s for s in short_valid if not (_leg_keys(s) & excluded_set)]
+
+    # Snapshot before the zero-HR filter so forced names can be restored
+    _pre_hr_long = list(long_valid)
+
+    if filter_zero_hr:
+        long_valid, short_valid = _filter_by_hit_ratio(
+            long_valid, short_valid, pnl_matrix, col_map, constraints)
+
+    # ── Forced: never dropped by the zero-HR filter ──
+    if forced_set:
+        _present = set()
+        for s in long_valid:
+            _present |= _leg_keys(s)
+        for s in _pre_hr_long:
+            if (_leg_keys(s) & forced_set) and not (_leg_keys(s) & _present):
+                long_valid.append(s)
+                _present |= _leg_keys(s)
+                warnings.warn(
+                    f"Forced ticker '{s.variance_asset}' was removed by the 0%-HR "
+                    f"filter and has been restored (forced names bypass the filter).",
+                    stacklevel=2,
+                )
+
+    if len(long_valid) < constraints.min_stocks_long:
+        # For cross-corridor, use index as the key
+        if config.cross_corridor:
+            unique_missing = set(s.corridor_condition_asset for s in missing)
+            sample_ticker = missing[0].corridor_condition_asset if missing else ""
+        else:
+            unique_missing = set(s.variance_asset for s in missing)
+            sample_ticker = missing[0].variance_asset if missing else ""
+        
+        empty_ts = pd.DataFrame({"Long Leg": [], "Short Leg": [], "Result": []})
+        result = OptimizationResult(
+            long_basket=[], short_basket=[],
+            long_strike_weighted=0.0, short_strike_weighted=0.0,
+            net_strike=0.0, score=-np.inf,
+            generations_run=0, converged=False,
+            backtest=BacktestResult(timeseries=empty_ts),
+        )
+        # Use correct key for cross-corridor in debug message
+        if config.cross_corridor:
+            missing_keys = [s.corridor_condition_asset for s in missing[:15]]
+            sample_data = "\n".join([f"    {s.corridor_condition_asset}: strike={s.strike_pct:.4f}, min_w={s.min_weight:.4f}, max_w={s.max_weight:.4f}" for s in missing[:3]])
+        else:
+            missing_keys = [s.variance_asset for s in missing[:15]]
+            sample_data = "\n".join([f"    {s.variance_asset}: strike={s.strike_pct:.4f}, min_w={s.min_weight:.4f}, max_w={s.max_weight:.4f}" for s in missing[:3]])
+        
+        debug_msg = f"❌ [DEBUG FAIL] len(long_valid)={len(long_valid)} < min_stocks_long={constraints.min_stocks_long}\n" + \
+                    f"  long_legs_loaded={len(long_legs_loaded)}\n" + \
+                    f"  valid_tickers in matrix={len(valid_tickers)}\n" + \
+                    f"  Missing tickers: {missing_keys}\n"
+        if len(unique_missing) == 1 and len(missing) > 0:
+            debug_msg += f"\n⚠️  WARNING: All {len(missing)} tickers are '{sample_ticker}'\n"
+            debug_msg += "   This suggests you pasted the wrong column (e.g. Index column instead of Tickers column)\n"
+        debug_msg += f"  Sample missing data:\n{sample_data}"
+        result._debug_info = debug_msg
+        return {"early_result": result}
+
+    # ── Step 4b: Pre-flight feasibility check ──
+    # The GA picks subsets of size [min_stocks_long, max_stocks_long].
+    # For weights to sum to 1.0, we need max_stocks * max_weight >= 1.0.
+    max_w_long = max((s.max_weight for s in long_valid), default=0.0)
+    if max_w_long > 0 and constraints.max_stocks_long * max_w_long < 1.0 - 1e-9:
+        needed_stocks = int(np.ceil(1.0 / max_w_long))
+        needed_weight_pct = 100.0 / constraints.max_stocks_long
+        raise ValueError(
+            f"Infeasible long constraints:\n"
+            f"  max_stocks_long = {constraints.max_stocks_long}\n"
+            f"  max_weight = {max_w_long * 100:.1f}%\n"
+            f"  max possible allocation = {constraints.max_stocks_long * max_w_long * 100:.1f}%\n"
+            f"Required: max_stocks_long × max_weight >= 100%\n"
+            f"  → with max_weight = {max_w_long * 100:.1f}%, max_stocks_long must be at least {needed_stocks}\n"
+            f"  → with max_stocks_long = {constraints.max_stocks_long}, max_weight must be at least {needed_weight_pct:.1f}%"
+        )
+
+    # max_stocks_short=0 means explicit long-only — skip short feasibility and clear shorts
+    if constraints.max_stocks_short == 0:
+        short_valid = []
+
+    if short_valid:
+        max_w_short = max((s.max_weight for s in short_valid), default=0.0)
+        if max_w_short > 0 and constraints.max_stocks_short * max_w_short < 1.0 - 1e-9:
+            needed_stocks_s = int(np.ceil(1.0 / max_w_short))
+            needed_weight_pct_s = 100.0 / constraints.max_stocks_short
+            raise ValueError(
+                f"Infeasible short constraints:\n"
+                f"  max_stocks_short = {constraints.max_stocks_short}\n"
+                f"  max_weight = {max_w_short * 100:.1f}%\n"
+                f"  max possible allocation = {constraints.max_stocks_short * max_w_short * 100:.1f}%\n"
+                f"Required: max_stocks_short × max_weight >= 100%\n"
+                f"  → with max_weight = {max_w_short * 100:.1f}%, max_stocks_short must be at least {needed_stocks_s}\n"
+                f"  → with max_stocks_short = {constraints.max_stocks_short}, max_weight must be at least {needed_weight_pct_s:.1f}%"
+            )
+
+    # ── Forced tickers -> indices in the final long_valid ordering ──
+    _forced_indices: List[int] = []
+    if forced_set:
+        _matched = set()
+        for i, s in enumerate(long_valid):
+            hit = _leg_keys(s) & forced_set
+            if hit:
+                _forced_indices.append(i)
+                _matched |= hit
+        _unmatched = forced_set - _matched
+        if _unmatched:
+            _sample = sorted({s.variance_asset for s in long_valid})[:15]
+            raise ValueError(
+                f"Forced ticker(s) not found in the candidate universe after "
+                f"filtering: {sorted(_unmatched)}. "
+                f"Check spelling/exclusions. Available sample: {_sample}"
+            )
+
+    return {
+        "early_result": None,
+        "internal_cfg": internal_cfg,
+        "price_data_all": price_data_all,
+        "index_data_all": index_data_all,
+        "legs": legs,
+        "pnl_matrix": pnl_matrix,
+        "col_map": col_map,
+        "long_valid": long_valid,
+        "short_valid": short_valid,
+        "forced_indices": _forced_indices,
+        "optimizer_dates": _optimizer_dates,
+    }
+
+
 def optimize(
     long_df: pd.DataFrame,
     config: DispersionConfig,
@@ -605,205 +843,24 @@ def optimize(
     from functions.dispersion._optimizer import DispersionOptimizer
     from functions.dispersion.scoring import MetricWeights
 
-    # ── Step 1: Parse DataFrames → DispersionLeg objects ──
-    long_legs = _df_to_legs(long_df, config.cross_corridor)
-    if short_df is not None and not short_df.empty:
-        short_df = _normalize_df_columns(short_df)
-        short_legs = _df_to_legs(short_df, config.cross_corridor)
-    else:
-        short_legs = []
-
-    # ── Step 2: Load Bloomberg data ──
-    internal_cfg = _to_swap_config(config, start_date=start_date, end_date=end_date)
-    loader = DispersionDataLoader(internal_cfg)
-    basket = BasketInput(long_candidates=long_legs, short_candidates=short_legs)
-    data = loader.load(basket)
-
-    if data["price_data"].empty:
-        empty_ts = pd.DataFrame({"Long Leg": [], "Short Leg": [], "Result": []})
-        return OptimizationResult(
-            long_basket=[], short_basket=[],
-            long_strike_weighted=0.0, short_strike_weighted=0.0,
-            net_strike=0.0, score=-np.inf,
-            generations_run=0, converged=False,
-            backtest=BacktestResult(timeseries=empty_ts),
-        )
-
-    # ── Step 3: Build PNL matrix ──
-    price_data_all = data["price_data"]
-    index_data_all = data.get("index_data")
-    legs = data["legs"]
-    long_legs_loaded = data["long_legs"]
-    short_legs_loaded = data["short_legs"]
-
-    # WARM-UP FIX: Build PnL from FULL price history (same as backtester uses),
-    # then slice the resulting matrix to [start_date, end_date].
-    # This ensures the rolling kernel has n_exp warm-up rows BEFORE start_date,
-    # so the optimizer's matrix row 0 matches the backtest curve row 0 exactly.
-    price_data_for_build = price_data_all
-    index_data_for_build = index_data_all
-    if not start_date and not end_date:
-        # No explicit dates: use lookback window including warm-up buffer
-        lookback_days = int(config.lookback_years * 252) + config.n_exp
-        if len(price_data_for_build) > lookback_days:
-            price_data_for_build = price_data_for_build.iloc[-lookback_days:]
-            if index_data_for_build is not None and not index_data_for_build.empty:
-                index_data_for_build = index_data_for_build.iloc[-lookback_days:]
-
-    pnl_matrix_full, col_map = _build_pnl_matrix(price_data_for_build, index_data_for_build, legs, config)
-
-    # Slice to [start_date, end_date] — rows in pnl_matrix_full correspond 1:1 to price_data_for_build.index
-    _build_index = price_data_for_build.index
-    if start_date:
-        _start_idx = _build_index.searchsorted(pd.Timestamp(start_date), side='left')
-    else:
-        _start_idx = 0
-    if end_date:
-        _end_idx = _build_index.searchsorted(pd.Timestamp(end_date), side='right')
-    else:
-        _end_idx = len(_build_index)
-    pnl_matrix = pnl_matrix_full[_start_idx:_end_idx]
-
-    # Also keep the date index for the optimizer window (used later for NUMERIC-CHECK alignment)
-    _optimizer_dates = _build_index[_start_idx:_end_idx]
-    # price_data = sliced prices (used only for candidate filtering, not PnL computation)
-    price_data = price_data_for_build.iloc[_start_idx:_end_idx]
-    index_data = index_data_for_build.iloc[_start_idx:_end_idx] if (index_data_for_build is not None and not index_data_for_build.empty) else index_data_for_build
-
-    # ── Step 4: Filter candidates ──
-    valid_tickers = set(col_map.keys())
-    # For cross-corridor, use index (Corridor Condition Asset) as the key
-    if config.cross_corridor:
-        long_valid = [s for s in long_legs_loaded if s.corridor_condition_asset in valid_tickers]
-        short_valid = [s for s in short_legs_loaded if s.corridor_condition_asset in valid_tickers]
-        missing = [s for s in long_legs_loaded if s.corridor_condition_asset not in valid_tickers]
-    else:
-        long_valid = [s for s in long_legs_loaded if s.variance_asset in valid_tickers]
-        short_valid = [s for s in short_legs_loaded if s.variance_asset in valid_tickers]
-        missing = [s for s in long_legs_loaded if s.variance_asset not in valid_tickers]
-
-    def _leg_keys(s):
-        keys = {str(s.variance_asset).strip().casefold()}
-        if getattr(s, "corridor_condition_asset", None):
-            keys.add(str(s.corridor_condition_asset).strip().casefold())
-        return keys
-
-    # ── Exclusion: drop excluded names from both legs ──
-    if _excluded_set:
-        long_valid = [s for s in long_valid if not (_leg_keys(s) & _excluded_set)]
-        short_valid = [s for s in short_valid if not (_leg_keys(s) & _excluded_set)]
-
-    # Snapshot before the zero-HR filter so forced names can be restored
-    _pre_hr_long = list(long_valid)
-
-    if filter_zero_hr:
-        long_valid, short_valid = _filter_by_hit_ratio(
-            long_valid, short_valid, pnl_matrix, col_map, constraints)
-
-    # ── Forced: never dropped by the zero-HR filter ──
-    if _forced_set:
-        _present = set()
-        for s in long_valid:
-            _present |= _leg_keys(s)
-        for s in _pre_hr_long:
-            if (_leg_keys(s) & _forced_set) and not (_leg_keys(s) & _present):
-                long_valid.append(s)
-                _present |= _leg_keys(s)
-                warnings.warn(
-                    f"Forced ticker '{s.variance_asset}' was removed by the 0%-HR "
-                    f"filter and has been restored (forced names bypass the filter).",
-                    stacklevel=2,
-                )
-
-    if len(long_valid) < constraints.min_stocks_long:
-        # For cross-corridor, use index as the key
-        if config.cross_corridor:
-            unique_missing = set(s.corridor_condition_asset for s in missing)
-            sample_ticker = missing[0].corridor_condition_asset if missing else ""
-        else:
-            unique_missing = set(s.variance_asset for s in missing)
-            sample_ticker = missing[0].variance_asset if missing else ""
-        
-        empty_ts = pd.DataFrame({"Long Leg": [], "Short Leg": [], "Result": []})
-        result = OptimizationResult(
-            long_basket=[], short_basket=[],
-            long_strike_weighted=0.0, short_strike_weighted=0.0,
-            net_strike=0.0, score=-np.inf,
-            generations_run=0, converged=False,
-            backtest=BacktestResult(timeseries=empty_ts),
-        )
-        # Use correct key for cross-corridor in debug message
-        if config.cross_corridor:
-            missing_keys = [s.corridor_condition_asset for s in missing[:15]]
-            sample_data = "\n".join([f"    {s.corridor_condition_asset}: strike={s.strike_pct:.4f}, min_w={s.min_weight:.4f}, max_w={s.max_weight:.4f}" for s in missing[:3]])
-        else:
-            missing_keys = [s.variance_asset for s in missing[:15]]
-            sample_data = "\n".join([f"    {s.variance_asset}: strike={s.strike_pct:.4f}, min_w={s.min_weight:.4f}, max_w={s.max_weight:.4f}" for s in missing[:3]])
-        
-        debug_msg = f"❌ [DEBUG FAIL] len(long_valid)={len(long_valid)} < min_stocks_long={constraints.min_stocks_long}\n" + \
-                    f"  long_legs_loaded={len(long_legs_loaded)}\n" + \
-                    f"  valid_tickers in matrix={len(valid_tickers)}\n" + \
-                    f"  Missing tickers: {missing_keys}\n"
-        if len(unique_missing) == 1 and len(missing) > 0:
-            debug_msg += f"\n⚠️  WARNING: All {len(missing)} tickers are '{sample_ticker}'\n"
-            debug_msg += "   This suggests you pasted the wrong column (e.g. Index column instead of Tickers column)\n"
-        debug_msg += f"  Sample missing data:\n{sample_data}"
-        result._debug_info = debug_msg
-        return result
-
-    # ── Step 4b: Pre-flight feasibility check ──
-    # The GA picks subsets of size [min_stocks_long, max_stocks_long].
-    # For weights to sum to 1.0, we need max_stocks * max_weight >= 1.0.
-    max_w_long = max((s.max_weight for s in long_valid), default=0.0)
-    if max_w_long > 0 and constraints.max_stocks_long * max_w_long < 1.0 - 1e-9:
-        needed_stocks = int(np.ceil(1.0 / max_w_long))
-        needed_weight_pct = 100.0 / constraints.max_stocks_long
-        raise ValueError(
-            f"Infeasible long constraints:\n"
-            f"  max_stocks_long = {constraints.max_stocks_long}\n"
-            f"  max_weight = {max_w_long * 100:.1f}%\n"
-            f"  max possible allocation = {constraints.max_stocks_long * max_w_long * 100:.1f}%\n"
-            f"Required: max_stocks_long × max_weight >= 100%\n"
-            f"  → with max_weight = {max_w_long * 100:.1f}%, max_stocks_long must be at least {needed_stocks}\n"
-            f"  → with max_stocks_long = {constraints.max_stocks_long}, max_weight must be at least {needed_weight_pct:.1f}%"
-        )
-
-    # max_stocks_short=0 means explicit long-only — skip short feasibility and clear shorts
-    if constraints.max_stocks_short == 0:
-        short_valid = []
-
-    if short_valid:
-        max_w_short = max((s.max_weight for s in short_valid), default=0.0)
-        if max_w_short > 0 and constraints.max_stocks_short * max_w_short < 1.0 - 1e-9:
-            needed_stocks_s = int(np.ceil(1.0 / max_w_short))
-            needed_weight_pct_s = 100.0 / constraints.max_stocks_short
-            raise ValueError(
-                f"Infeasible short constraints:\n"
-                f"  max_stocks_short = {constraints.max_stocks_short}\n"
-                f"  max_weight = {max_w_short * 100:.1f}%\n"
-                f"  max possible allocation = {constraints.max_stocks_short * max_w_short * 100:.1f}%\n"
-                f"Required: max_stocks_short × max_weight >= 100%\n"
-                f"  → with max_weight = {max_w_short * 100:.1f}%, max_stocks_short must be at least {needed_stocks_s}\n"
-                f"  → with max_stocks_short = {constraints.max_stocks_short}, max_weight must be at least {needed_weight_pct_s:.1f}%"
-            )
-
-    # ── Forced tickers -> indices in the final long_valid ordering ──
-    _forced_indices: List[int] = []
-    if _forced_set:
-        _matched = set()
-        for i, s in enumerate(long_valid):
-            hit = _leg_keys(s) & _forced_set
-            if hit:
-                _forced_indices.append(i)
-                _matched |= hit
-        _unmatched = _forced_set - _matched
-        if _unmatched:
-            _sample = sorted({s.variance_asset for s in long_valid})[:15]
-            raise ValueError(
-                f"Forced ticker(s) not found in the candidate universe after "
-                f"filtering: {sorted(_unmatched)}. "
-                f"Check spelling/exclusions. Available sample: {_sample}"
-            )
+    prep = _prepare_optimization_inputs(
+        long_df, config, constraints,
+        short_df=short_df, start_date=start_date, end_date=end_date,
+        filter_zero_hr=filter_zero_hr,
+        forced_set=_forced_set, excluded_set=_excluded_set,
+    )
+    if prep["early_result"] is not None:
+        return prep["early_result"]
+    internal_cfg = prep["internal_cfg"]
+    price_data_all = prep["price_data_all"]
+    index_data_all = prep["index_data_all"]
+    legs = prep["legs"]
+    pnl_matrix = prep["pnl_matrix"]
+    col_map = prep["col_map"]
+    long_valid = prep["long_valid"]
+    short_valid = prep["short_valid"]
+    _forced_indices = prep["forced_indices"]
+    _optimizer_dates = prep["optimizer_dates"]
 
     # ── Step 5: Build metric weights ──
     # Legacy scoring was removed from the optimizer, so score_weights=None now
@@ -1011,8 +1068,232 @@ def optimize(
     opt_result._debug_table = getattr(optimizer, '_debug_table', '')
     opt_result._ref_debug_table = getattr(optimizer, '_ref_debug_table', '')
     opt_result._collapse_diagnostic = getattr(optimizer, '_collapse_diagnostic', '')
-    
+
     return opt_result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 3b. OPTIMIZE MULTI (compare several weight configs on ONE data load)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class MultiOptimizeResult:
+    """Result of :func:`optimize_multi`.
+
+    Attributes
+    ----------
+    results:
+        One :class:`OptimizationResult` per config, in input order.
+    comparison:
+        One row per config: score, net strike, basket, per-metric raw values
+        (``raw_<metric>``) and their percentile within THAT run's reference
+        distribution (``pct_<metric>``, higher = better, in [0, 1]).
+    configs:
+        The weight dicts, as passed.
+    """
+
+    def __init__(self, results, comparison, configs):
+        self.results = results
+        self.comparison = comparison
+        self.configs = configs
+
+
+def _winner_raw_and_percentiles(optimizer) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """Raw metric values of the delivered basket + percentile of each ACTIVE
+    metric within the run's fitted reference distribution (higher=better)."""
+    from functions.dispersion._optimizer import _candidate_key
+
+    best = getattr(optimizer, "_last_best", None)
+    sf = optimizer._score_fn
+    if best is None or sf is None or not sf.is_fitted:
+        return {}, {}
+    is_xc = optimizer.is_cross_corridor
+    long_pos = [optimizer._col_pos[_candidate_key(optimizer.long_candidates[i], is_xc)]
+                for i in best.long_indices
+                if _candidate_key(optimizer.long_candidates[i], is_xc) in optimizer._col_pos]
+    short_pos = None
+    short_w = None
+    if best.short_indices:
+        sp = [optimizer._col_pos[_candidate_key(optimizer.short_candidates[i], is_xc)]
+              for i in best.short_indices
+              if _candidate_key(optimizer.short_candidates[i], is_xc) in optimizer._col_pos]
+        if sp:
+            short_pos = sp
+            short_w = best.short_weights
+    net = optimizer._adaptive_net_pnl(long_pos, best.long_weights, short_pos, short_w)
+    ws = (optimizer._net_strike(best.long_indices, best.long_weights,
+                                best.short_indices, best.short_weights)
+          if optimizer._ws_active() else None)
+    ctx = optimizer._make_ctx(ws)
+    raw = sf.raw_metrics(net, ctx)
+    unfitted = getattr(sf, "_unfitted_metrics", set())
+    metric_map = {m.name: m for m in sf.metrics}
+    percentiles: Dict[str, float] = {}
+    for name in sf.weights.active_names:
+        v = raw.get(name)
+        if v is None or not np.isfinite(v) or name in unfitted:
+            continue
+        percentiles[name] = float(sf.normalizer.transform(
+            name, float(v), metric_map[name].higher_is_better))
+    return {k: float(v) for k, v in raw.items() if np.isfinite(v)}, percentiles
+
+
+def optimize_multi(
+    long_df: pd.DataFrame,
+    config: DispersionConfig,
+    constraints: OptimizationConstraints,
+    *,
+    configs: List[Dict[str, float]],
+    short_df: pd.DataFrame = None,
+    start_date: date = None,
+    end_date: date = None,
+    filter_zero_hr: bool = False,
+    seed: int = 0,
+    forced_tickers: List[str] = None,
+    excluded_tickers: List[str] = None,
+    bisect_in_ga: bool = False,
+    n_reference_samples: int = None,
+    bucket_constraints: List = None,
+    run_backtests: bool = True,
+    progress_callback: Callable[[int, int, float], None] = None,
+) -> MultiOptimizeResult:
+    """Run the optimizer for SEVERAL score-weight configs on ONE data load.
+
+    Headless-friendly: Bloomberg prices are loaded once, the P&L matrix is
+    built once, then each config runs a fresh (identically seeded) GA on the
+    same inputs.  With the same seed, each config's result is IDENTICAL to a
+    single :func:`optimize` call with that config.
+
+    Parameters
+    ----------
+    configs:
+        List of score_weights dicts, e.g.
+        ``[{'mean_payoff': 1.0}, {'mean_payoff': 0.5, 'hit_ratio': 0.5}]``.
+    run_backtests:
+        Backtest each winner (True, default) — set False to skip the
+        backtest step (e.g. quick comparisons).
+    (other parameters: same meaning as :func:`optimize`)
+
+    Returns
+    -------
+    MultiOptimizeResult
+        ``.results`` (one OptimizationResult per config, ``.backtest``
+        attached when run_backtests) and ``.comparison`` (one row per
+        config: score, net strike, basket, raw metrics + reference
+        percentiles).
+    """
+    if not configs:
+        raise ValueError("optimize_multi: 'configs' must contain at least one "
+                         "score_weights dict.")
+
+    # ── Same cheap validation prologue as optimize() ──
+    def _norm_ticker_set(lst):
+        return {str(t).strip().casefold() for t in (lst or []) if str(t).strip()}
+
+    _bucket_cons: List[BucketConstraint] = []
+    for _bc in (bucket_constraints or []):
+        if isinstance(_bc, BucketConstraint):
+            _bucket_cons.append(_bc)
+        elif isinstance(_bc, dict):
+            _bucket_cons.append(BucketConstraint(**_bc))
+        else:
+            raise TypeError(
+                f"bucket_constraints entries must be BucketConstraint or dict, "
+                f"got {type(_bc).__name__}")
+
+    _forced_set = _norm_ticker_set(forced_tickers)
+    _excluded_set = _norm_ticker_set(excluded_tickers)
+    _overlap = _forced_set & _excluded_set
+    if _overlap:
+        raise ValueError(f"Tickers cannot be both forced and excluded: {sorted(_overlap)}")
+    if len(_forced_set) > constraints.max_stocks_long:
+        raise ValueError(
+            f"{len(_forced_set)} forced tickers > max_stocks_long="
+            f"{constraints.max_stocks_long}. Raise max_stocks_long or force fewer names.")
+
+    long_df = _normalize_df_columns(long_df)
+    required = ['Variance Asset', 'Strike Mono Var Swap (%)']
+    if config.cross_corridor:
+        required.append('Strike Cross Corridor (%)')
+        required.append('Corridor Condition Asset')
+    _validate_columns(long_df, required, 'optimize_multi')
+    _warn_if_decimal_strikes(long_df, 'Strike Mono Var Swap (%)', 'optimize_multi')
+    if short_df is not None and not short_df.empty:
+        short_df = _normalize_df_columns(short_df)
+
+    from functions.dispersion._backtester import DispersionBacktester
+    from functions.dispersion._optimizer import DispersionOptimizer
+    from functions.dispersion.scoring import MetricWeights
+
+    # ── Load + build + filter ONCE ──
+    prep = _prepare_optimization_inputs(
+        long_df, config, constraints,
+        short_df=short_df, start_date=start_date, end_date=end_date,
+        filter_zero_hr=filter_zero_hr,
+        forced_set=_forced_set, excluded_set=_excluded_set,
+    )
+    if prep["early_result"] is not None:
+        raise RuntimeError(
+            "optimize_multi: the data pipeline produced no usable universe "
+            "(empty prices or too few valid candidates). Run optimize() for "
+            "the detailed debug output.")
+
+    results: List[OptimizationResult] = []
+    rows: List[Dict] = []
+    for k, weights_dict in enumerate(configs):
+        metric_weights = MetricWeights(dict(weights_dict))
+        optimizer = DispersionOptimizer(
+            long_candidates=prep["long_valid"],
+            short_candidates=prep["short_valid"],
+            pnl_matrix=prep["pnl_matrix"],
+            column_map=prep["col_map"],
+            constraints=constraints,
+            missing_data_policy=config.missing_data_policy,
+            reweight_grace_days=3,
+            is_cross_corridor=config.cross_corridor,
+            global_cap=config.global_cap,
+            global_floor=config.global_floor,
+            metric_weights=metric_weights,
+            progress_callback=progress_callback,
+            bisect_in_ga=bisect_in_ga,
+            seed=seed,
+            smooth_weights=False,
+            smooth_eps=0.05,
+            forced_long_indices=prep["forced_indices"] if prep["forced_indices"] else None,
+            n_reference_samples=n_reference_samples,
+            bucket_constraints=_bucket_cons if _bucket_cons else None,
+        )
+        result = optimizer.run()
+
+        if run_backtests and result.long_basket:
+            bt = DispersionBacktester(prep["internal_cfg"])
+            result.backtest = bt.run_from_optimization(
+                price_data=prep["price_data_all"],
+                long_basket=result.long_basket,
+                short_basket=result.short_basket,
+                legs=prep["legs"],
+                index_data=prep["index_data_all"],
+                start_date=start_date,
+            )
+        results.append(result)
+
+        raw, pct = _winner_raw_and_percentiles(optimizer)
+        row = {
+            "config": ", ".join(f"{k2}={v2:g}" for k2, v2 in weights_dict.items()),
+            "score": result.score,
+            "net_strike_pct": result.net_strike * 100.0,
+            "n_names": len(result.long_basket),
+            "basket": " | ".join(f"{t} {w * 100:.1f}%" for t, w in result.long_basket),
+            "scoring_signature": result.scoring_signature,
+        }
+        for name, v in sorted(raw.items()):
+            row[f"raw_{name}"] = v
+        for name, v in sorted(pct.items()):
+            row[f"pct_{name}"] = v
+        rows.append(row)
+
+    comparison = pd.DataFrame(rows)
+    return MultiOptimizeResult(results=results, comparison=comparison,
+                               configs=[dict(c) for c in configs])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

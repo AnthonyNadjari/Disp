@@ -1118,6 +1118,106 @@ with tab1:
                     except Exception as e:
                         st.error(f"Optimization failed: {str(e)}")
                         st.exception(e)
+        # ═══ 🧪 MULTI-CONFIG COMPARISON (one data load, N weight configs) ═══
+        with st.expander("🧪 Compare several weight configs (one data load)"):
+            st.caption(
+                "One config per line, metric=weight pairs comma-separated. "
+                "Same seed and constraints as the single run above — each line "
+                "reproduces exactly what a single run with those weights would return.")
+            _mc_text = st.text_area(
+                "Configs", value="mean_payoff=0.5, hit_ratio=0.5\nmin_payoff=1.0",
+                height=80, key="_mc_configs_text")
+            if st.button("Run comparison", key="_mc_run_btn"):
+                def _parse_ticker_list_mc(raw_text):
+                    out = []
+                    for chunk in (raw_text or "").replace(',', '\n').splitlines():
+                        t = chunk.strip()
+                        if t:
+                            out.append(t)
+                    return out or None
+
+                def _parse_multi_configs(txt):
+                    out = []
+                    for line in txt.splitlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        cfg_d = {}
+                        for part in line.split(','):
+                            if '=' not in part:
+                                raise ValueError(
+                                    f"Bad config entry: '{part.strip()}' (expected metric=weight)")
+                            k, v = part.split('=', 1)
+                            cfg_d[k.strip()] = float(v)
+                        if cfg_d:
+                            out.append(cfg_d)
+                    return out
+                try:
+                    _mc_configs = _parse_multi_configs(_mc_text)
+                    if not _mc_configs:
+                        st.warning("No configs to run.")
+                    else:
+                        from functions.dispersion._api import optimize_multi
+                        # Mirror of the single-run cfg/constraints construction
+                        _is_xc_mc = st.session_state.get('is_cross_corridor', False)
+                        if _is_xc_mc:
+                            _mc_long = st.session_state.get('long_df_cross', pd.DataFrame())
+                            _mc_short = st.session_state.get('short_df_cross', pd.DataFrame())
+                        else:
+                            _mc_long = st.session_state.get('long_df', pd.DataFrame()).copy()
+                            _mc_short = st.session_state.get('short_df', pd.DataFrame()).copy()
+                            if st.session_state.get('is_vol_swap', False):
+                                _vs_rn = {'Underlying': 'Variance Asset',
+                                          'Strike (%)': 'Strike Mono Var Swap (%)'}
+                                if 'Underlying' in _mc_long.columns:
+                                    _mc_long.rename(columns=_vs_rn, inplace=True)
+                                if 'Underlying' in _mc_short.columns:
+                                    _mc_short.rename(columns=_vs_rn, inplace=True)
+                        _mc_cfg = DispersionConfig(
+                            product_type=ProductType.VOL_SWAP if st.session_state.get('is_vol_swap', False)
+                            else ProductType.VAR_SWAP_CORRIDOR,
+                            cross_corridor=_is_xc_mc,
+                            n_exp=st.session_state.get('n_exp', 252),
+                            barrier_up=st.session_state.get('ubar', 1.30),
+                            barrier_down=st.session_state.get('dbar', 0.70),
+                            local_cap=st.session_state.get('local_cap', 2.5),
+                            is_capped=True,
+                            missing_data_policy=_parse_policy(missing_data_policy),
+                            adj_divs=(st.session_state.get('adj_divs', 'No') == "Yes"),
+                            lookback_years=5,
+                            global_cap=st.session_state.get('global_cap', 9999999.0),
+                            global_floor=st.session_state.get('global_floor', -9999999.0),
+                        )
+                        _mc_cons = OptimizationConstraints(
+                            min_stocks_long=min_stocks_long,
+                            max_stocks_long=max_stocks_long,
+                            min_stocks_short=0 if st.session_state.get('is_long_only', False) else min_stocks_short,
+                            max_stocks_short=0 if st.session_state.get('is_long_only', False) else max_stocks_short,
+                            max_net_strike=max_strike / 100.0,
+                            time_limit_seconds=float(time_limit),
+                        )
+                        with st.spinner(f"Running {len(_mc_configs)} configs on one data load..."):
+                            _mc = optimize_multi(
+                                _mc_long, _mc_cfg, _mc_cons,
+                                configs=_mc_configs,
+                                short_df=_mc_short if len(_mc_short) > 0 else None,
+                                start_date=st.session_state.get('_opt_start_date_value'),
+                                filter_zero_hr=filter_zero_hr,
+                                seed=int(seed),
+                                forced_tickers=_parse_ticker_list_mc(forced_tickers_raw),
+                                excluded_tickers=_parse_ticker_list_mc(excluded_tickers_raw),
+                                bucket_constraints=_parse_bucket_constraints(
+                                    st.session_state.get('_bucket_df')),
+                            )
+                        st.session_state['_mc_result'] = _mc
+                except Exception as _mc_e:
+                    st.error(f"Multi-config run failed: {_mc_e}")
+                    st.exception(_mc_e)
+            _mc_prev = st.session_state.get('_mc_result')
+            if _mc_prev is not None:
+                st.dataframe(_mc_prev.comparison, use_container_width=True)
+                st.caption("pct_<metric> = percentile of the winner's raw value in that "
+                           "run's reference distribution (higher = better).")
     # ═══════════════════════════════════════════════════════════════════
     # PERSISTENT RESULT DISPLAY (survives slider reruns)
     # ═══════════════════════════════════════════════════════════════════
