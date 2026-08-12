@@ -114,6 +114,12 @@ class ScoreContext:
     ann_factor: int = 252
     index: Optional[np.ndarray] = field(default=None, compare=False, hash=False)
     weighted_strike: Optional[float] = None
+    #: Absolute-Vega mode (Phase 4c): fraction of the axe book cleaned by the
+    #: basket (criterion A) and fraction of the package in recycling
+    #: (criterion B).  Injected by the caller — like ``weighted_strike``,
+    #: they are functions of the Vega allocation, not of the P&L series.
+    axe_cleaned: Optional[float] = None
+    axe_recycled: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
@@ -557,6 +563,52 @@ class WeightedStrike:
         return float(ws) if ws is not None else math.nan
 
 
+@register_metric()
+class AxeBookCleaned:
+    """Fraction of the desk's axe book cleaned by the basket (criterion A).
+
+    A = Σ_i min(v_i, target_i) / Σ_universe target_i — in [0, 1], where the
+    denominator spans the WHOLE candidate universe so A is comparable across
+    subsets (covering more axes cleans more book).
+
+    Like :class:`WeightedStrike`, the value is not computable from the P&L
+    series: the caller injects it through :attr:`ScoreContext.axe_cleaned`
+    (reference builds pass per-sample values via ``sample_extras``).
+    ``is_linear = False``: the linear LP fast path derives per-stock values
+    from P&L columns, which this metric cannot provide — vega-aware solves
+    route through the dedicated axe LP or the SLSQP path.
+    """
+
+    name: ClassVar[str] = "axe_book_cleaned"
+    higher_is_better: ClassVar[bool] = True
+    is_linear: ClassVar[bool] = False
+    is_tail_metric: ClassVar[bool] = False
+
+    def compute(self, net_pnl: np.ndarray, ctx: ScoreContext) -> float:
+        """Return ``ctx.axe_cleaned`` or ``nan`` when absent."""
+        v = ctx.axe_cleaned
+        return float(v) if v is not None else math.nan
+
+
+@register_metric()
+class AxePackageRecycled:
+    """Fraction of the basket's Vega that recycles axes (criterion B).
+
+    B = Σ_i min(v_i, target_i) / V — in [0, 1].  Caller-injected via
+    :attr:`ScoreContext.axe_recycled` (see :class:`AxeBookCleaned`).
+    """
+
+    name: ClassVar[str] = "axe_package_recycled"
+    higher_is_better: ClassVar[bool] = True
+    is_linear: ClassVar[bool] = False
+    is_tail_metric: ClassVar[bool] = False
+
+    def compute(self, net_pnl: np.ndarray, ctx: ScoreContext) -> float:
+        """Return ``ctx.axe_recycled`` or ``nan`` when absent."""
+        v = ctx.axe_recycled
+        return float(v) if v is not None else math.nan
+
+
 # ---------------------------------------------------------------------------
 # Convenience re-export of all default metric instances
 # ---------------------------------------------------------------------------
@@ -595,6 +647,8 @@ __all__ = [
     "MaxDrawdown",
     "SharpePayoff",
     "WeightedStrike",
+    "AxeBookCleaned",
+    "AxePackageRecycled",
     # Pre-built defaults
     "DEFAULT_METRICS",
     # Differentiable surrogate

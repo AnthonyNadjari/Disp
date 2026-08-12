@@ -471,6 +471,8 @@ def make_default_score_function(
         Ready to be fitted via :meth:`~ScoreFunction.build_reference`.
     """
     from .metrics import (
+        AxeBookCleaned,
+        AxePackageRecycled,
         CVaR5,
         HitRatio,
         LastCarry,
@@ -493,6 +495,8 @@ def make_default_score_function(
         CVaR5(),
         SharpePayoff(),
         WeightedStrike(),
+        AxeBookCleaned(),
+        AxePackageRecycled(),
     ]
 
     if weights is None:

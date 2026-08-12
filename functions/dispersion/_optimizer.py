@@ -77,6 +77,7 @@ from functions.dispersion.models import (
     OptimizationResult,
     ProductType,
     SwapConfig,
+    VegaConfig,
 )
 from functions.dispersion._backtester import (
     DispersionDataLoader,
@@ -89,7 +90,7 @@ from functions.dispersion.scoring import (
     MetricWeights, ScoreFunction, ScoreContext, WeightSolver,
     WeightConstraints, make_default_score_function,
 )
-from functions.dispersion.scoring.weight_solver import adaptive_pnl
+from functions.dispersion.scoring.weight_solver import VegaSpec, adaptive_pnl
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Internal representation
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -207,6 +208,7 @@ class DispersionOptimizer:
         forced_long_indices: Optional[List[int]] = None,
         n_reference_samples: Optional[int] = None,
         bucket_constraints: Optional[List[BucketConstraint]] = None,
+        vega_config: Optional[VegaConfig] = None,
     ):
         self.long_candidates = long_candidates
         self.short_candidates = short_candidates
@@ -275,6 +277,7 @@ class DispersionOptimizer:
             "len_valid_lt_50": 0,
             "bucket_counts": 0,
             "bucket_weights": 0,
+            "vega_infeasible": 0,
         }
         self._strike_logged = False
         self._lp_infeasible_streak = 0
@@ -298,6 +301,45 @@ class DispersionOptimizer:
                     f"Infeasible forced set: sum of min weights of forced names = "
                     f"{forced_min_sum:.4f} > 1.0 ({names}). Lower their Min Weight inputs."
                 )
+        # ── Absolute-Vega mode (Phase 4c) ──
+        self._vega: Optional[VegaConfig] = (
+            vega_config if (vega_config is not None and vega_config.enabled) else None)
+        if self._vega is not None:
+            targets = []
+            caps = []
+            for s in self.long_candidates:
+                t = float(s.axe_target) if s.axe_target is not None else 0.0
+                if t < 0:
+                    raise ValueError(
+                        f"Vega mode: '{s.variance_asset}' has a negative Axe Target "
+                        f"({t}). Axes are one-directional — targets must be >= 0.")
+                cp = float(s.axe_cap) if s.axe_cap is not None else float("inf")
+                if cp < 0:
+                    raise ValueError(
+                        f"Vega mode: '{s.variance_asset}' has a negative Axe Cap ({cp}).")
+                # Symbiosis check: a selected name needs v_i >= min_weight·V_min,
+                # which must fit under its hard cap.
+                if s.min_weight * self._vega.v_min > cp + 1e-9:
+                    raise ValueError(
+                        f"Vega mode: '{s.variance_asset}' cannot be selected — its "
+                        f"Min Weight ({s.min_weight:.4f} of V) at V_min="
+                        f"{self._vega.v_min:g} needs {s.min_weight * self._vega.v_min:g} "
+                        f"Vega but Axe Cap is {cp:g}. Lower Min Weight / V_min or "
+                        f"raise the cap.")
+                targets.append(t)
+                caps.append(cp)
+            self._vega_targets = np.asarray(targets, dtype=np.float64)
+            self._vega_caps = np.asarray(caps, dtype=np.float64)
+            self._vega_t_total = float(self._vega_targets.sum())
+            capacity = float(np.minimum(
+                np.array([s.max_weight for s in self.long_candidates]) * self._vega.v_min,
+                self._vega_caps).sum())
+            if capacity < self._vega.v_min - 1e-9:
+                raise ValueError(
+                    f"Vega mode: even the FULL candidate universe can only hold "
+                    f"{capacity:g} Vega at V_min={self._vega.v_min:g} "
+                    f"(per-name caps × Max Weights too tight). Lower V_min or "
+                    f"relax caps/Max Weights.")
         # ── Regional/sector bucket constraints (long leg) ──
         self._bucket_constraints: List[BucketConstraint] = list(bucket_constraints or [])
         self._bucket_of: List[Optional[str]] = [
@@ -438,6 +480,69 @@ class DispersionOptimizer:
                            bc.max_weight))
         return groups or None
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # ABSOLUTE-VEGA MODE (Phase 4c)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _vega_spec_for(self, indices) -> Optional[VegaSpec]:
+        """Per-subset VegaSpec for the inner solver (None when OFF)."""
+        if self._vega is None:
+            return None
+        idx = list(indices)
+        return VegaSpec(
+            targets=self._vega_targets[idx],
+            caps=self._vega_caps[idx],
+            v_min=self._vega.v_min,
+            v_max=self._vega.v_max,
+            t_total=self._vega_t_total,
+        )
+
+    def _axe_grid(self, indices, w) -> Optional[Tuple[float, float, float]]:
+        """(V, A, B) for arbitrary weights via the deterministic V-grid rule
+        (same rule the solver uses per evaluation).  None = caps leave no
+        feasible V for these weights, or vega mode is OFF."""
+        if self._vega is None or self._weight_solver is None:
+            return None
+        lam_a = self._metric_weights.get("axe_book_cleaned", 0.0)
+        lam_b = self._metric_weights.get("axe_package_recycled", 0.0)
+        # P&L-only configs: the max-clean rule (lam_a=1) picks the largest
+        # feasible V — most book cleaned at zero cost to the active metrics.
+        if lam_a <= 0 and lam_b <= 0:
+            lam_a = 1.0
+        return self._weight_solver._vega_choose_V(
+            np.asarray(w, dtype=np.float64), self._vega_spec_for(indices), lam_a, lam_b)
+
+    def _axe_ctx_values(self, indices, w, extra: Optional[Dict]) -> Tuple[Optional[float], Optional[float]]:
+        """(axe_cleaned, axe_recycled) for scoring context: exact solver
+        extras when available, else the deterministic grid rule."""
+        if self._vega is None:
+            return None, None
+        if extra and extra.get("axe_cleaned") is not None:
+            return extra.get("axe_cleaned"), extra.get("axe_recycled")
+        picked = self._axe_grid(indices, w)
+        if picked is None:
+            return None, None
+        return picked[1], picked[2]
+
+    def _reference_axe_extras(self, long_indices, long_w) -> Dict[str, float]:
+        """Per-sample extras for the reference build: A/B of the sampled
+        basket at a uniformly drawn V (spans the [v_min, v_max] range so the
+        normalizer sees the whole criterion distribution).  Empty when OFF."""
+        if self._vega is None:
+            return {}
+        v_total = self._rng.uniform(self._vega.v_min, self._vega.v_max)
+        idx = list(long_indices)
+        v_abs = np.minimum(np.asarray(long_w, dtype=np.float64) * v_total,
+                           self._vega_caps[idx])
+        cleaned = float(np.minimum(v_abs, self._vega_targets[idx]).sum())
+        out = {}
+        if self._vega_t_total > 0:
+            out["axe_book_cleaned"] = cleaned / self._vega_t_total
+        s = float(v_abs.sum())
+        if s > 0:
+            out["axe_package_recycled"] = cleaned / s
+        return out
+
     def _print_candidate_table(self):
         """Print a visible table of long/short candidates with PnL data quality."""
         lines = []
@@ -485,6 +590,20 @@ class DispersionOptimizer:
             return self._empty_result()
         # ── Setup new scoring system (bilevel) if metric_weights provided ──
         if self._use_new_scoring:
+            # Vega-mode / axe-criteria coherence (checked BEFORE the reference
+            # build so the error is the actionable one, not a fit failure)
+            _axe_names = (set(self._metric_weights.active_names)
+                          & {"axe_book_cleaned", "axe_package_recycled"})
+            if _axe_names and self._vega is None:
+                raise RuntimeError(
+                    f"Metric(s) {sorted(_axe_names)} are weighted but the absolute-"
+                    f"Vega toggle is OFF. Pass vega=VegaConfig(v_min=..., v_max=...) "
+                    f"(optimize(vega=...)) to activate axe recycling.")
+            if _axe_names and self._vega_t_total <= 0:
+                raise RuntimeError(
+                    f"Metric(s) {sorted(_axe_names)} are weighted but no candidate "
+                    f"carries an Axe Target — add the 'Axe Target' column to the "
+                    f"long input (absolute Vega units).")
             self._score_fn = make_default_score_function(weights=self._metric_weights)
             ctx = ScoreContext(n_days=self._n_rows)
             # Weight bounds from stock objects (already decimal: 0.015 = 1.5%)
@@ -538,12 +657,17 @@ class DispersionOptimizer:
                 n_restarts=3, seed=self.seed,
                 missing_data_policy=_ws_policy,
             )
+            _active_names = set(self._metric_weights.active_names)
             # Genome = subset only: fitness derives weights deterministically.
             # Exact-path configs solve the exact inner problem per subset
             # (memoised — fitness is a pure function of the subset); all
             # other configs use the bounded equal-weight projection during
             # the GA, with SLSQP reserved for the post-GA refinement.
-            self._exact_fitness = self._weight_solver.has_exact_path()
+            # In vega mode, the pure axe_book_cleaned objective is ALSO an
+            # exact path (dedicated LP in absolute-Vega space).
+            self._exact_fitness = (self._weight_solver.has_exact_path()
+                                   or (self._vega is not None
+                                       and _active_names == {"axe_book_cleaned"}))
         # Create initial population
         population = []
         attempts = 0
@@ -673,7 +797,8 @@ class DispersionOptimizer:
         # single-stock swaps around the incumbent, each neighbour evaluated at
         # its EXACT optimal weights (LP, cached) — the returned basket is at
         # least a 1-swap local optimum of the true bilevel objective.
-        if self._use_new_scoring and self._weight_solver is not None and self._weight_solver.has_exact_path():
+        if (self._use_new_scoring and self._weight_solver is not None
+                and getattr(self, "_exact_fitness", False)):
             pre_ls = best_score
             _ls_pool = sorted(population, key=lambda x: x.fitness, reverse=True)[:30]
             best_individual, best_score = self._exact_swap_local_search(
@@ -703,12 +828,16 @@ class DispersionOptimizer:
         ctx = self._make_ctx()  # ws-agnostic fallback; per-basket ctx built below
         _pass_strikes = (self.c.max_net_strike > 0) or self._ws_active()
 
-        def _ctx_for(ind_obj, long_w) -> ScoreContext:
-            if not self._ws_active():
-                return ctx
-            return self._make_ctx(self._net_strike(
+        def _ctx_for(ind_obj, long_w, solve_extra=None) -> ScoreContext:
+            _ws_v = (self._net_strike(
                 ind_obj.long_indices[:len(long_w)], long_w,
-                ind_obj.short_indices, ind_obj.short_weights))
+                ind_obj.short_indices, ind_obj.short_weights)
+                if self._ws_active() else None)
+            _ac, _ar = self._axe_ctx_values(
+                ind_obj.long_indices[:len(long_w)], long_w, solve_extra)
+            if _ws_v is None and _ac is None and _ar is None:
+                return ctx
+            return self._make_ctx(_ws_v, _ac, _ar)
         # Ensure weight solver uses the SAME fitted score function (not a stale ref)
         self._weight_solver._score_fn = self._score_fn
         n_infeasible = 0
@@ -786,6 +915,7 @@ class DispersionOptimizer:
                 per_stock_bounds=per_stock_bounds,
                 active_mask=self._valid_mask,
                 group_bounds=self._bucket_groups_for(ind.long_indices[:n_long]),
+                vega=self._vega_spec_for(ind.long_indices[:n_long]),
             )
             if not result.feasible:
                 n_infeasible += 1
@@ -803,7 +933,7 @@ class DispersionOptimizer:
             n_nz = int(np.count_nonzero(net_pnl))
             if n_nz < 50:
                 continue
-            _cand_ctx = _ctx_for(ind, result.weights)
+            _cand_ctx = _ctx_for(ind, result.weights, solve_extra=result.extra)
             score = self._score_fn.score(net_pnl, _cand_ctx)
 
             # CHANGE 8b: Acceptance test based on config type
@@ -919,6 +1049,7 @@ class DispersionOptimizer:
                 strikes=strikes if _pass_strikes else None,
                 per_stock_bounds=bounds, active_mask=self._valid_mask,
                 group_bounds=self._bucket_groups_for(indices),
+                vega=self._vega_spec_for(indices),
             )
             if not res.feasible:
                 return None
@@ -931,7 +1062,8 @@ class DispersionOptimizer:
             ws = (self._net_strike(indices, res.weights,
                                    best.short_indices, best.short_weights)
                   if self._ws_active() else None)
-            ctx = self._make_ctx(ws)
+            _ac, _ar = self._axe_ctx_values(indices, res.weights, res.extra)
+            ctx = self._make_ctx(ws, _ac, _ar)
             return _raw_scalar(net, ctx), self._score_fn.score(net, ctx), res.weights
 
         inc = _eval_subset(list(best.long_indices))
@@ -1167,6 +1299,7 @@ class DispersionOptimizer:
             self._rejection_reasons["bucket_counts"] += 1
             return 0.0
         _groups = self._bucket_groups_for(individual.long_indices)
+        _vega_sp = self._vega_spec_for(individual.long_indices)
 
         # ── Long weights: deterministic function of the subset ──
         if self._exact_fitness and self._weight_solver is not None:
@@ -1187,6 +1320,7 @@ class DispersionOptimizer:
                 per_stock_bounds=per_stock_bounds,
                 active_mask=self._valid_mask,
                 group_bounds=_groups,
+                vega=_vega_sp,
             )
             if not result.feasible:
                 self._lp_infeasible_streak += 1
@@ -1199,7 +1333,9 @@ class DispersionOptimizer:
                 return 0.0
             self._lp_infeasible_streak = 0
             long_w = result.weights
+            _solve_extra = result.extra
         else:
+            _solve_extra = None
             long_w = self._equal_projected_weights(individual.long_indices, self.long_candidates)
             if long_w is None:
                 self._rejection_reasons["no_weights"] += 1
@@ -1250,7 +1386,14 @@ class DispersionOptimizer:
         _ws = (self._net_strike(individual.long_indices, long_w,
                                 individual.short_indices, short_w)
                if self._ws_active() else None)
-        ctx = self._make_ctx(_ws)
+        _ax_c, _ax_r = (None, None)
+        if self._vega is not None:
+            _ax_c, _ax_r = self._axe_ctx_values(individual.long_indices, long_w, _solve_extra)
+            if _ax_c is None and _ax_r is None:
+                # caps leave no feasible V for this subset's weights
+                self._rejection_reasons["vega_infeasible"] += 1
+                return 0.0
+        ctx = self._make_ctx(_ws, _ax_c, _ax_r)
         fit = self._fitness_from_net(net_pnl_raw, ctx)
         if fit is None:
             self._rejection_reasons["invalid_score"] += 1
@@ -1493,10 +1636,12 @@ class DispersionOptimizer:
                 rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
             else:
                 sample_pnls.append(net_pnl)
-                sample_extras.append({
+                _extra = {
                     "weighted_strike": self._net_strike(
                         long_indices, long_w, short_indices, short_w)
-                })
+                }
+                _extra.update(self._reference_axe_extras(long_indices, long_w))
+                sample_extras.append(_extra)
 
         # --- ELITE SEEDING: inject baskets from top-ranked stocks so normalizer ceiling is realistic ---
         all_col_means = []
@@ -1543,10 +1688,12 @@ class DispersionOptimizer:
             elite_pnl = self._compute_net_pnl(long_indices_e, long_w_e, short_indices_e, short_w_e)
             if elite_pnl is not None and len(elite_pnl) >= 50:
                 sample_pnls.append(elite_pnl)
-                sample_extras.append({
+                _extra_e = {
                     "weighted_strike": self._net_strike(
                         long_indices_e, long_w_e, short_indices_e, short_w_e)
-                })
+                }
+                _extra_e.update(self._reference_axe_extras(long_indices_e, long_w_e))
+                sample_extras.append(_extra_e)
 
         if len(sample_pnls) < 100:
             self.log("WARN", f"⚠️ Reference sample too small ({len(sample_pnls)}/{n_samples} after {attempts} attempts), falling back to legacy scoring")
@@ -1591,9 +1738,13 @@ class DispersionOptimizer:
         return (self._metric_weights is not None
                 and "weighted_strike" in self._metric_weights.active_names)
 
-    def _make_ctx(self, weighted_strike: Optional[float] = None) -> ScoreContext:
-        """Run-level ScoreContext, optionally carrying the basket's net strike."""
-        return ScoreContext(n_days=self._n_rows, weighted_strike=weighted_strike)
+    def _make_ctx(self, weighted_strike: Optional[float] = None,
+                  axe_cleaned: Optional[float] = None,
+                  axe_recycled: Optional[float] = None) -> ScoreContext:
+        """Run-level ScoreContext, optionally carrying the basket's net strike
+        and (vega mode) the axe recycling criteria."""
+        return ScoreContext(n_days=self._n_rows, weighted_strike=weighted_strike,
+                            axe_cleaned=axe_cleaned, axe_recycled=axe_recycled)
 
     # ══════════════════════════════════════════════════════════════════════════
     # WEIGHT PROJECTION (single deterministic helper used by fitness + safety-net)
@@ -1914,8 +2065,11 @@ class DispersionOptimizer:
         is_xcorr = self.is_cross_corridor
         
         # ═══ SAFETY NET (runs BEFORE any weight extraction) ═══
-        # NEVER DOWNGRADE: keep GA weights if they score better on the full adaptive curve.
-        if self._weight_solver.has_exact_path():
+        # NEVER DOWNGRADE: keep GA weights if they score better on the full
+        # adaptive curve.  Skipped in vega mode: the safety-net's fine
+        # bisection is V-blind (the vega paths already deliver exact or
+        # refined weights; the step rescore below stays vega-aware).
+        if self._weight_solver.has_exact_path() and self._vega is None:
             try:
                 long_pos_final = [self._col_pos[_candidate_key(self.long_candidates[i], is_xcorr)]
                                   for i in best.long_indices
@@ -2034,7 +2188,10 @@ class DispersionOptimizer:
                 _fin_ws = (self._net_strike(best.long_indices, best.long_weights,
                                             best.short_indices, best.short_weights)
                            if self._ws_active() else None)
-                best.fitness = self._score_fn.score(_final_pnl, self._make_ctx(_fin_ws))
+                _fin_ac, _fin_ar = self._axe_ctx_values(
+                    best.long_indices, best.long_weights, None)
+                best.fitness = self._score_fn.score(
+                    _final_pnl, self._make_ctx(_fin_ws, _fin_ac, _fin_ar))
             except Exception as e:
                 self.log("WARN", f"[FINAL-SCORE] step rescore failed: {e}")
 
@@ -2201,6 +2358,22 @@ class DispersionOptimizer:
         )
 
 
+        # ═══ ABSOLUTE-VEGA OUTPUTS (deterministic grid rule on final weights) ═══
+        _vega_total = None
+        _vega_basket = None
+        _axe_cleaned = None
+        _axe_recycled = None
+        if self._vega is not None:
+            _picked = self._axe_grid(best.long_indices, best.long_weights)
+            if _picked is not None:
+                _vega_total, _axe_cleaned, _axe_recycled = _picked
+                _vega_basket = [(k, float(w) * _vega_total) for k, w in long_basket]
+                print(f"[VEGA] V={_vega_total:.2f} | axe_cleaned={_axe_cleaned:.4f} | "
+                      f"axe_recycled={_axe_recycled:.4f}", flush=True)
+            else:
+                self.log("WARN", "[VEGA] no feasible V for the delivered basket "
+                                 "(caps vs V_min) — vega fields left empty")
+
         return OptimizationResult(
             long_basket=long_basket, short_basket=short_basket,
             long_strikes=long_strikes, short_strikes=short_strikes,
@@ -2214,6 +2387,12 @@ class DispersionOptimizer:
             scoring_signature=getattr(self, "_scoring_signature", None),
             seed=self.seed,
             reference_size=getattr(self, "_reference_size", None),
+            total_vega=_vega_total,
+            vega_basket=_vega_basket,
+            axe_cleaned=(float(_axe_cleaned) if _axe_cleaned is not None
+                         and np.isfinite(_axe_cleaned) else None),
+            axe_recycled=(float(_axe_recycled) if _axe_recycled is not None
+                          and np.isfinite(_axe_recycled) else None),
         )
 
     @property

@@ -170,6 +170,17 @@ def _df_to_legs(df: pd.DataFrame, is_cross_corridor: bool) -> List[DispersionLeg
         max_w = float(row.get('Max Weight', 60.0)) / 100.0
         sector = row.get('Sector', None)
 
+        # Absolute-Vega mode inputs (optional columns, absolute Vega units)
+        def _opt_float(v):
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                return None
+            return None if pd.isna(f) else f
+
+        axe_target = _opt_float(row.get('Axe Target', None))
+        axe_cap = _opt_float(row.get('Axe Cap', None))
+
         legs.append(DispersionLeg(
             variance_asset=var_asset,
             strike_mono_var_swap=strike,
@@ -178,6 +189,8 @@ def _df_to_legs(df: pd.DataFrame, is_cross_corridor: bool) -> List[DispersionLeg
             sector=str(sector) if sector and str(sector).strip() else None,
             min_weight=min_w,
             max_weight=max_w,
+            axe_target=axe_target,
+            axe_cap=axe_cap,
         ))
     return legs
 
@@ -481,6 +494,26 @@ def price(
 # 3. OPTIMIZE
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _normalize_vega_arg(vega):
+    """None | dict | VegaConfig → Optional[VegaConfig] (validates)."""
+    from functions.dispersion.models import VegaConfig
+    if vega is None:
+        return None
+    if isinstance(vega, VegaConfig):
+        return vega if vega.enabled else None
+    if isinstance(vega, dict):
+        d = dict(vega)
+        if not d.pop("enabled", True):
+            return None
+        try:
+            return VegaConfig(**d)
+        except TypeError as te:
+            raise ValueError(
+                f"vega dict {vega!r} is invalid: {te}. Expected keys: v_min, "
+                f"v_max (absolute Vega units) and optionally enabled.")
+    raise TypeError(f"vega must be a VegaConfig or dict, got {type(vega).__name__}")
+
+
 def _prepare_optimization_inputs(
     long_df: pd.DataFrame,
     config: DispersionConfig,
@@ -738,6 +771,7 @@ def optimize(
     save_bundle_path: str = None,
     n_reference_samples: int = None,
     bucket_constraints: List = None,
+    vega=None,
 ) -> OptimizationResult:
     """
     Find optimal basket via genetic algorithm.
@@ -788,6 +822,16 @@ def optimize(
         with the same fields ({'bucket': 'US', 'min_names': 1, 'max_names': 3,
         'min_weight': 0.2, 'max_weight': 0.6}; weights DECIMAL).  Buckets
         match the input DataFrame's 'Sector' column.  None/empty = inactive.
+    vega : VegaConfig or dict, optional
+        Absolute-Vega mode toggle (None = OFF, historical behaviour).  Pass
+        :class:`~functions.dispersion.models.VegaConfig` or
+        ``{'v_min': 50, 'v_max': 200}``.  When ON: per-name Vega v_i with
+        V = Σv_i free in [v_min, v_max]; Min/Max Weight become concentration
+        bounds on v_i/V; the optional 'Axe Target' / 'Axe Cap' columns of
+        long_df feed the recycling objectives ('axe_book_cleaned',
+        'axe_package_recycled' in score_weights) and the hard caps
+        v_i <= cap.  Basket P&L stays Σ(v_i·pnl_i)/V — the weight series —
+        so scores/backtests remain comparable with the toggle OFF.
 
     Returns
     -------
@@ -827,6 +871,9 @@ def optimize(
             f"{len(_forced_set)} forced tickers > max_stocks_long="
             f"{constraints.max_stocks_long}. Raise max_stocks_long or force fewer names."
         )
+
+    # ── Vega toggle: normalize dict → VegaConfig (validates) ──
+    _vega_cfg = _normalize_vega_arg(vega)
 
     long_df = _normalize_df_columns(long_df)
     required = ['Variance Asset', 'Strike Mono Var Swap (%)']
@@ -916,6 +963,7 @@ def optimize(
         forced_long_indices=_forced_indices if _forced_indices else None,
         n_reference_samples=n_reference_samples,
         bucket_constraints=_bucket_cons if _bucket_cons else None,
+        vega_config=_vega_cfg,
     )
     opt_result = optimizer.run()
     opt_result._final_raw_min = getattr(optimizer, '_final_raw_min', None)
@@ -943,6 +991,7 @@ def optimize(
             forced_long_indices=_forced_indices if _forced_indices else None,
             n_reference_samples=n_reference_samples,
             bucket_constraints=_bucket_cons if _bucket_cons else None,
+            vega_config=_vega_cfg,
             dates=list(_optimizer_dates),
             config=_dc.asdict(config),
             provenance={

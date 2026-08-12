@@ -253,6 +253,19 @@ def _render_optimization_result(result, is_cross, debug_info=None):
     col_s3.metric("Long Weight", f"{long_total:.1f}%")
     col_s4.metric("Short Weight", f"{short_total:.1f}%")
     st.caption(f"Generations: {result.generations_run} | Converged: {result.converged}")
+    # ⚡ Absolute-Vega outputs (only present when the toggle was ON)
+    if getattr(result, 'total_vega', None) is not None:
+        col_v1, col_v2, col_v3 = st.columns(3)
+        col_v1.metric("Total Vega (V)", f"{result.total_vega:,.0f}")
+        if result.axe_cleaned is not None:
+            col_v2.metric("Axe book cleaned", f"{result.axe_cleaned * 100:.1f}%")
+        if result.axe_recycled is not None:
+            col_v3.metric("Package recycled", f"{result.axe_recycled * 100:.1f}%")
+        if result.vega_basket:
+            with st.expander("⚡ Vega allocation (absolute)", expanded=False):
+                st.dataframe(pd.DataFrame(
+                    [{"Stock": t, "Vega": v, "Weight %": v / result.total_vega * 100}
+                     for t, v in result.vega_basket]), use_container_width=True)
     # Scoring signature — reproducibility fingerprint of the run
     if getattr(result, 'scoring_signature', None):
         with st.expander("🧾 Scoring signature (debug)", expanded=False):
@@ -839,6 +852,20 @@ with tab1:
                     })
                 return out or None
 
+            vega_on = st.toggle(
+                "⚡ Absolute Vega mode (axe recycling)", value=False, key="_vega_toggle",
+                help="OFF = historical percentage weights (sum=1). ON = absolute Vega "
+                     "per name with free total V in [V min, V max]; Min/Max Weight "
+                     "become concentration bounds on v_i/V; add 'Axe Target' and "
+                     "'Axe Cap' columns to the long table for per-name axes. Basket "
+                     "P&L stays Σ(v_i·pnl_i)/V — comparable with the toggle OFF.")
+            if vega_on:
+                _vg_c1, _vg_c2 = st.columns(2)
+                vega_v_min = _vg_c1.number_input("V min (Vega)", value=50.0, min_value=0.01)
+                vega_v_max = _vg_c2.number_input("V max (Vega)", value=200.0, min_value=0.01)
+            else:
+                vega_v_min = None
+                vega_v_max = None
             run_milp = st.checkbox("🔬 Certify vs exact optimum (MILP, slow)", value=False)
             st.session_state['_run_milp'] = run_milp
             bisect_in_ga = st.checkbox("🎯 Exact solver in GA (slow, certification runs)", value=False)
@@ -877,6 +904,24 @@ with tab1:
                                                         max_value=1.00, value=0.00,
                                                         help="Minimize the basket's weighted net strike. "
                                                              "The Max net strike hard limit stays active independently.")
+                if st.session_state.get('_vega_toggle', False):
+                    st.markdown("**⚡ Axe recycling criteria (Vega mode)**")
+                    col19d, col19e = st.columns(2)
+                    with col19d:
+                        axe_cleaned_weight = st.number_input(
+                            "Axe book cleaned weight", step=0.01, min_value=0.00,
+                            max_value=1.00, value=0.30,
+                            help="Criterion A: fraction of the desk's axe book cleaned "
+                                 "= Σ min(v_i, target_i) / Σ targets. Default-active in Vega mode.")
+                    with col19e:
+                        axe_recycled_weight = st.number_input(
+                            "Package recycled weight", step=0.01, min_value=0.00,
+                            max_value=1.00, value=0.00,
+                            help="Criterion B: fraction of the package in recycling "
+                                 "= Σ min(v_i, target_i) / V.")
+                else:
+                    axe_cleaned_weight = 0.0
+                    axe_recycled_weight = 0.0
         # Validation
         score_weights = {
             'last_carry': last_carry_weight,
@@ -885,7 +930,9 @@ with tab1:
             'min_payoff': min_payoff_weight,
         }
         for _opt_name, _opt_w in [('max_drawdown', max_dd_weight), ('cvar_5', cvar_weight),
-                                  ('sharpe_payoff', sharpe_weight), ('weighted_strike', strike_obj_weight)]:
+                                  ('sharpe_payoff', sharpe_weight), ('weighted_strike', strike_obj_weight),
+                                  ('axe_book_cleaned', axe_cleaned_weight),
+                                  ('axe_package_recycled', axe_recycled_weight)]:
             if _opt_w > 0:
                 score_weights[_opt_name] = _opt_w
         total_weight = sum(score_weights.values())
@@ -1031,6 +1078,8 @@ with tab1:
                                     excluded_tickers=_parse_ticker_list(excluded_tickers_raw),
                                     bucket_constraints=_parse_bucket_constraints(
                                         st.session_state.get('_bucket_df')),
+                                    vega=({"v_min": float(vega_v_min), "v_max": float(vega_v_max)}
+                                          if vega_on else None),
                                 )
                             except Exception as _e:
                                 _opt_error = _e

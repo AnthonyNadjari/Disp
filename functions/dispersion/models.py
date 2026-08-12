@@ -302,6 +302,9 @@ class DispersionLeg:
     strike_cross_corridor: Optional[float] = None    # Cross-corridor strike (decimal)
     sector: Optional[str] = None
     metrics: Dict[str, float] = field(default_factory=dict)
+    # ── Absolute-Vega mode (Phase 4c) — axe inventory per name ──
+    axe_target: Optional[float] = None   # axe Vega to clean (absolute units); None/0 = no axe
+    axe_cap: Optional[float] = None      # hard Vega cap v_i <= cap (absolute units); None = uncapped
 
     @property
     def is_long(self) -> bool:
@@ -516,6 +519,40 @@ class OptimizationConstraints:
     tournament_size: int = 3     # Number of individuals in tournament selection
 
 @dataclass
+class VegaConfig:
+    """Absolute-Vega mode (Phase 4c toggle).
+
+    OFF (``optimize(vega=None)``, the default) keeps the historical
+    percentage-weight behaviour untouched.
+
+    ON: each name gets an ABSOLUTE Vega v_i >= 0; the basket total
+    V = Σ v_i is FREE within [v_min, v_max]; the existing per-name Min/Max
+    Weight inputs are reinterpreted as concentration bounds on v_i/V; the
+    per-name axe inventory (:attr:`DispersionLeg.axe_target` /
+    :attr:`DispersionLeg.axe_cap`) bounds v_i <= cap and feeds the
+    recycling objectives:
+
+    - ``axe_book_cleaned``  (A) = Σ min(v_i, target_i) / Σ_universe target_i
+    - ``axe_package_recycled`` (B) = Σ min(v_i, target_i) / V
+
+    The basket P&L stays Σ(v_i · pnl_i) / V — i.e. the percentage-weight
+    series with w_i = v_i / V — so scores and the backtest curve remain
+    directly comparable with vega OFF.  ``max_net_strike`` also stays on
+    the w_i scale.
+    """
+    v_min: float
+    v_max: float
+    enabled: bool = True
+
+    def __post_init__(self):
+        if self.v_min <= 0:
+            raise ValueError(f"VegaConfig.v_min must be > 0, got {self.v_min}")
+        if self.v_max < self.v_min:
+            raise ValueError(
+                f"VegaConfig.v_max ({self.v_max}) must be >= v_min ({self.v_min})")
+
+
+@dataclass
 class BucketConstraint:
     """Per-bucket (region/sector) constraints for the LONG leg.
 
@@ -645,6 +682,11 @@ class OptimizationResult:
     scoring_signature: Optional[str] = None  # sha256[:16] of (active metrics+weights, seed, n_samples, reference size)
     seed: Optional[int] = None               # RNG seed the optimizer ran with
     reference_size: Optional[int] = None     # number of baskets in the fitted normalizer reference
+    # ── Absolute-Vega mode outputs (None when the toggle is OFF) ──
+    total_vega: Optional[float] = None       # V = Σ v_i (absolute units)
+    vega_basket: list = None                 # [(ticker, v_i absolute), ...] aligned with long_basket
+    axe_cleaned: Optional[float] = None      # criterion A of the delivered basket (fraction of the axe book)
+    axe_recycled: Optional[float] = None     # criterion B of the delivered basket (fraction of the package)
 
     @property
     def is_long_only(self) -> bool:

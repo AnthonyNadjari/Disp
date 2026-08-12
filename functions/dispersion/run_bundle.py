@@ -57,6 +57,7 @@ from functions.dispersion.models import (
     MissingDataPolicy,
     OptimizationConstraints,
     OptimizationResult,
+    VegaConfig,
 )
 
 __all__ = [
@@ -87,6 +88,8 @@ def _leg_to_dict(leg: DispersionLeg) -> Dict:
                                   else float(leg.strike_cross_corridor)),
         "sector": leg.sector,
         "metrics": {k: float(v) for k, v in (leg.metrics or {}).items()},
+        "axe_target": (None if leg.axe_target is None else float(leg.axe_target)),
+        "axe_cap": (None if leg.axe_cap is None else float(leg.axe_cap)),
     }
 
 
@@ -102,6 +105,8 @@ def _leg_from_dict(d: Dict) -> DispersionLeg:
                                else float(d["strike_cross_corridor"])),
         sector=d.get("sector"),
         metrics=dict(d.get("metrics") or {}),
+        axe_target=(None if d.get("axe_target") is None else float(d["axe_target"])),
+        axe_cap=(None if d.get("axe_cap") is None else float(d["axe_cap"])),
     )
 
 
@@ -176,6 +181,7 @@ class RunBundle:
     forced_long_indices: Optional[List[int]] = None
     n_reference_samples: Optional[int] = None  # None = adaptive default (300/800)
     bucket_constraints: Optional[List[BucketConstraint]] = None
+    vega_config: Optional[VegaConfig] = None   # absolute-Vega toggle (None = OFF)
     dates: Optional[List] = None            # optional row index of pnl_matrix
     config: Optional[Dict] = None           # DispersionConfig snapshot (informational)
     provenance: Dict = field(default_factory=dict)  # forced/excluded tickers, dates, ...
@@ -224,6 +230,8 @@ class RunBundle:
             n_reference_samples=self.n_reference_samples,
             bucket_constraints=([dataclasses.replace(bc) for bc in self.bucket_constraints]
                                 if self.bucket_constraints else None),
+            vega_config=(dataclasses.replace(self.vega_config)
+                         if self.vega_config is not None else None),
         )
         return optimizer.run()
 
@@ -253,6 +261,7 @@ def save_run_bundle(
     forced_long_indices: Optional[List[int]] = None,
     n_reference_samples: Optional[int] = None,
     bucket_constraints: Optional[List[BucketConstraint]] = None,
+    vega_config: Optional[VegaConfig] = None,
     dates=None,
     config: Optional[Dict] = None,
     provenance: Optional[Dict] = None,
@@ -304,6 +313,8 @@ def save_run_bundle(
                                     if n_reference_samples is not None else None),
             "bucket_constraints": ([dataclasses.asdict(bc) for bc in bucket_constraints]
                                    if bucket_constraints else None),
+            "vega_config": (dataclasses.asdict(vega_config)
+                            if vega_config is not None else None),
         },
         "long_candidates": [_leg_to_dict(l) for l in long_candidates],
         "short_candidates": [_leg_to_dict(l) for l in short_candidates],
@@ -364,6 +375,8 @@ def load_run_bundle(path: str) -> RunBundle:
         n_reference_samples=opt.get("n_reference_samples"),
         bucket_constraints=([BucketConstraint(**d) for d in opt["bucket_constraints"]]
                             if opt.get("bucket_constraints") else None),
+        vega_config=(VegaConfig(**opt["vega_config"])
+                     if opt.get("vega_config") else None),
         dates=dates,
         config=payload.get("config"),
         provenance=dict(payload.get("provenance") or {}),

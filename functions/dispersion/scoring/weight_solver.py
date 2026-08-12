@@ -81,6 +81,7 @@ __all__ = [
     "WeightConstraints",
     "WeightSolverResult",
     "WeightSolver",
+    "VegaSpec",
 ]
 
 
@@ -128,6 +129,31 @@ class WeightConstraints:
                 f"Need max_weight*max_stocks >= 1. "
                 f"Raise max_weight to >= {1.0/self.max_stocks:.4f}."
             )
+
+
+@dataclass(frozen=True)
+class VegaSpec:
+    """Per-solve absolute-Vega data (aligned with the caller's stock_indices).
+
+    Attributes
+    ----------
+    targets:
+        Axe target per name (absolute Vega units; 0 = no axe on the name).
+    caps:
+        Hard Vega cap per name (v_i <= cap; ``np.inf`` = uncapped).
+    v_min / v_max:
+        Bounds for the FREE basket total V = Σ v_i.
+    t_total:
+        Σ targets over the WHOLE candidate universe (denominator of the
+        ``axe_book_cleaned`` criterion — constant per run so the criterion
+        is comparable across subsets).
+    """
+
+    targets: np.ndarray
+    caps: np.ndarray
+    v_min: float
+    v_max: float
+    t_total: float
 
 
 @dataclass(frozen=True)
@@ -338,6 +364,172 @@ class WeightSolver:
             return None
         return res.x[:n]
 
+    # --- Absolute-Vega helpers (Phase 4c) ---
+
+    @staticmethod
+    def _axe_fracs(v_abs: np.ndarray, targets: np.ndarray, t_total: float) -> Tuple[float, float]:
+        """(A, B) of an absolute allocation: A = Σmin(v,t)/T_universe,
+        B = Σmin(v,t)/V.  NaN where the denominator is empty."""
+        cleaned = float(np.minimum(v_abs, targets).sum())
+        a = cleaned / t_total if t_total > 0 else float("nan")
+        v_tot = float(v_abs.sum())
+        b = cleaned / v_tot if v_tot > 0 else float("nan")
+        return a, b
+
+    def _vega_choose_V(self, w: np.ndarray, vega: VegaSpec,
+                       lam_a: float, lam_b: float) -> Optional[Tuple[float, float, float]]:
+        """Deterministic 1-D choice of the basket total V for given weights w.
+
+        V ranges over a fixed 33-point grid on [v_min, min(v_max, cap-bound)]
+        where cap-bound = min_i cap_i / w_i guarantees v_i = w_i·V <= cap_i by
+        construction.  Picks the V maximising lam_a·A + lam_b·B (first/lowest
+        V wins ties — deterministic).  Returns (V, A, B), or None when caps
+        make every V < v_min (the subset cannot hold the minimum package).
+        """
+        w = np.asarray(w, dtype=np.float64)
+        with np.errstate(divide="ignore"):
+            ratios = np.where(w > 1e-12, vega.caps / np.maximum(w, 1e-12), np.inf)
+        v_cap = float(np.min(ratios)) if ratios.size else float("inf")
+        v_hi = min(float(vega.v_max), v_cap)
+        if v_hi < float(vega.v_min) - 1e-9:
+            return None
+        grid = np.linspace(float(vega.v_min), v_hi, 33)
+        # Tie preference: with B active, ties break toward the LOWEST V
+        # (recycled fraction favours small packages); otherwise toward the
+        # LARGEST V (max-clean spirit: A is nondecreasing in V, and a basket
+        # with no axes takes the largest feasible package).
+        prefer_low = lam_b > 0.0
+        best = None
+        for V in grid:
+            a, b = self._axe_fracs(w * V, vega.targets, vega.t_total)
+            val = (lam_a * (a if np.isfinite(a) else 0.0)
+                   + lam_b * (b if np.isfinite(b) else 0.0))
+            if best is None:
+                best = (val, float(V), a, b)
+            elif val > best[0] + 1e-12:
+                best = (val, float(V), a, b)
+            elif not prefer_low and val > best[0] - 1e-12:
+                best = (val, float(V), a, b)  # tie → larger V
+        return best[1], best[2], best[3]
+
+    def _solve_axe_lp(
+        self,
+        sub_pnl: np.ndarray,
+        strikes: Optional[np.ndarray],
+        n: int,
+        per_stock_bounds: Optional[np.ndarray],
+        vega: VegaSpec,
+        group_bounds=None,
+    ) -> WeightSolverResult:
+        """Exact LP for the PURE axe_book_cleaned objective (vega mode).
+
+        Variables x = [v (n), r (n), V]:
+            max Σ r_i                       (A = Σr / T_universe, T constant)
+            r_i <= v_i ; r_i <= target_i    (r = recycled Vega per name)
+            v_i <= cap_i                    (hard axe caps, via bounds)
+            Σ v_i = V ;  v_min <= V <= v_max
+            b_min_i·V <= v_i <= b_max_i·V   (concentration, from Min/Max Weight)
+            Σ strike_i·v_i <= max_net_strike·V   (net strike on w = v/V)
+            bucket weight bounds scaled by V
+
+        Returns weights w = v/V; extras carry (vega_total, axe_cleaned,
+        axe_recycled).
+        """
+        c_ = self._constraints
+        nv = 2 * n + 1
+        i_V = 2 * n
+        obj = np.zeros(nv)
+        obj[n:2 * n] = -1.0  # maximise Σ r
+
+        caps = np.asarray(vega.caps, dtype=np.float64)
+        targets = np.maximum(np.asarray(vega.targets, dtype=np.float64), 0.0)
+        bounds = []
+        for i in range(n):  # v_i ∈ [0, cap_i]
+            bounds.append((0.0, float(caps[i]) if np.isfinite(caps[i]) else None))
+        for i in range(n):  # r_i ∈ [0, target_i]
+            bounds.append((0.0, float(targets[i])))
+        bounds.append((float(vega.v_min), float(vega.v_max)))  # V
+
+        if per_stock_bounds is not None:
+            bmin = per_stock_bounds[:, 0]
+            bmax = per_stock_bounds[:, 1]
+        else:
+            bmin = np.full(n, c_.min_weight)
+            bmax = np.full(n, c_.max_weight)
+
+        rows = []
+        rhs = []
+        eye = np.eye(n)
+        # r_i - v_i <= 0
+        blk = np.zeros((n, nv))
+        blk[:, :n] = -eye
+        blk[:, n:2 * n] = eye
+        rows.append(blk)
+        rhs.append(np.zeros(n))
+        # v_i - b_max_i·V <= 0
+        blk = np.zeros((n, nv))
+        blk[:, :n] = eye
+        blk[:, i_V] = -bmax
+        rows.append(blk)
+        rhs.append(np.zeros(n))
+        # b_min_i·V - v_i <= 0
+        blk = np.zeros((n, nv))
+        blk[:, :n] = -eye
+        blk[:, i_V] = bmin
+        rows.append(blk)
+        rhs.append(np.zeros(n))
+        # Net strike on w: Σ s_i·v_i - max_net_strike·V <= 0
+        if strikes is not None and c_.max_net_strike is not None:
+            row = np.zeros((1, nv))
+            row[0, :n] = strikes
+            row[0, i_V] = -float(c_.max_net_strike)
+            rows.append(row)
+            rhs.append(np.zeros(1))
+        # Bucket weight bounds on w, scaled by V
+        if group_bounds:
+            for pos, lo_g, hi_g in group_bounds:
+                pos = np.asarray(pos, dtype=int)
+                if pos.size == 0:
+                    continue
+                if hi_g is not None:
+                    row = np.zeros((1, nv))
+                    row[0, pos] = 1.0
+                    row[0, i_V] = -float(hi_g)
+                    rows.append(row)
+                    rhs.append(np.zeros(1))
+                if lo_g is not None and lo_g > 0.0:
+                    row = np.zeros((1, nv))
+                    row[0, pos] = -1.0
+                    row[0, i_V] = float(lo_g)
+                    rows.append(row)
+                    rhs.append(np.zeros(1))
+        A_ub = csr_matrix(np.vstack(rows))
+        b_ub = np.concatenate(rhs)
+        A_eq = np.zeros((1, nv))
+        A_eq[0, :n] = 1.0
+        A_eq[0, i_V] = -1.0
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            res = linprog(c=obj, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=[0.0],
+                          bounds=bounds, method="highs")
+        if not res.success:
+            return WeightSolverResult(weights=np.full(n, 1.0 / n), score=-np.inf,
+                                      feasible=False, n_evals=1)
+        v = res.x[:n]
+        V = float(res.x[i_V])
+        if V <= 0:
+            return WeightSolverResult(weights=np.full(n, 1.0 / n), score=-np.inf,
+                                      feasible=False, n_evals=1)
+        w = v / V
+        a, b = self._axe_fracs(v, targets, vega.t_total)
+        net = sub_pnl @ w
+        ctx = dataclasses.replace(self._ctx, axe_cleaned=a, axe_recycled=b)
+        score = self._score_fn.score(net, ctx)
+        return WeightSolverResult(
+            weights=w, score=score, feasible=True, n_evals=1,
+            extra={"vega_total": V, "axe_cleaned": a, "axe_recycled": b},
+        )
+
     def solve(
         self,
         pnl_matrix: np.ndarray,
@@ -347,6 +539,7 @@ class WeightSolver:
         active_mask: Optional[np.ndarray] = None,
         tol: str = "ga",
         group_bounds=None,
+        vega: Optional[VegaSpec] = None,
     ) -> WeightSolverResult:
         """Find optimal weights for the given stock subset.
 
@@ -399,6 +592,7 @@ class WeightSolver:
                     score=cached.score,
                     feasible=cached.feasible,
                     n_evals=0,
+                    extra=cached.extra,
                 )
             return cached
 
@@ -458,10 +652,33 @@ class WeightSolver:
             else:
                 active_mask_sub = active_mask[:, stock_indices]
 
+        # Remap vega arrays (caller order) into the sorted order
+        vega_sorted = vega
+        if vega is not None and sort_perm is not None:
+            vega_sorted = dataclasses.replace(
+                vega,
+                targets=np.asarray(vega.targets, dtype=np.float64)[sort_perm],
+                caps=np.asarray(vega.caps, dtype=np.float64)[sort_perm],
+            )
+
         # Route by policy and metric blend
         use_bisection = (self._missing_data_policy == "adaptive_reweight" and active_mask_sub is not None)
+        _active_set = set(self._score_fn.weights.active_names)
+        _axe_active = bool(_active_set & {"axe_book_cleaned", "axe_package_recycled"})
 
-        if self._all_linear():
+        if vega_sorted is not None and _active_set == {"axe_book_cleaned"}:
+            # Pure criterion A: exact LP in absolute-Vega space
+            result = self._solve_axe_lp(sub_pnl_sorted, strikes_sorted, n, bounds_sorted,
+                                        vega_sorted, group_bounds=groups_sorted)
+            self.log_solver_path("AXE_LP")
+        elif vega_sorted is not None and _axe_active:
+            # Axe criteria blended with P&L metrics: SLSQP in w-space with a
+            # deterministic per-evaluation 1-D choice of V (see _vega_choose_V)
+            result = self._solve_nonlinear(sub_pnl_sorted, strikes_sorted, n, bounds_sorted,
+                                           sweep_key=sorted_indices, group_bounds=groups_sorted,
+                                           vega=vega_sorted)
+            self.log_solver_path("SLSQP_VEGA")
+        elif self._all_linear():
             result = self._solve_linear(sub_pnl_sorted, strikes_sorted, n, bounds_sorted,
                                         group_bounds=groups_sorted)
             self.log_solver_path("LP")
@@ -492,6 +709,22 @@ class WeightSolver:
                                            sweep_key=sorted_indices, group_bounds=groups_sorted)
             self.log_solver_path("SLSQP")
 
+        # P&L-only configs with vega ON: the weights come from the standard
+        # paths (V does not enter the P&L series); attach the deterministic V
+        # via the max-clean rule (largest feasible V — cleans the most book
+        # at zero cost to the active metrics).
+        if (vega_sorted is not None and not _axe_active
+                and _active_set != {"axe_book_cleaned"} and result.feasible):
+            picked = self._vega_choose_V(result.weights, vega_sorted, 1.0, 0.0)
+            if picked is None:
+                result = WeightSolverResult(weights=np.full(n, 1.0 / n), score=-np.inf,
+                                            feasible=False, n_evals=result.n_evals)
+            else:
+                _V, _A, _B = picked
+                _extra = dict(result.extra or {})
+                _extra.update({"vega_total": _V, "axe_cleaned": _A, "axe_recycled": _B})
+                result = dataclasses.replace(result, extra=_extra)
+
         # Cache in sorted order
         self._cache[sorted_indices] = result
 
@@ -503,6 +736,7 @@ class WeightSolver:
                 score=result.score,
                 feasible=result.feasible,
                 n_evals=result.n_evals,
+                extra=result.extra,
             )
         return result
 
@@ -1605,12 +1839,14 @@ class WeightSolver:
 
     def _smooth_surrogate_objective(self, sub_pnl: np.ndarray,
                                     strikes: Optional[np.ndarray],
-                                    col_means: np.ndarray):
+                                    col_means: np.ndarray,
+                                    vega: Optional[VegaSpec] = None):
         """Build the differentiable inner objective shared by the SLSQP solve
         and the 2-start convergence diagnostic.
 
         Raw values are made smooth first (``soft_hit_ratio`` surrogate,
-        ``dot(w, strikes)`` for weighted_strike), then normalised through the
+        ``dot(w, strikes)`` for weighted_strike, the deterministic V-grid
+        pick for the axe criteria in vega mode), then normalised through the
         interpolated CDF so every metric contributes on the same [0, 1] scale
         with the user's weights.  Returns ``objective(w) -> float`` to
         MINIMISE (negated score + tiny linear regularisation).
@@ -1618,11 +1854,14 @@ class WeightSolver:
         lam = self._score_fn.weights
         metric_map = {m.name: m for m in self._score_fn.metrics}
         ws_active = "weighted_strike" in lam.active_names
+        lam_a = lam.get("axe_book_cleaned", 0.0)
+        lam_b = lam.get("axe_package_recycled", 0.0)
         reg_strength = 1e-4
 
         def objective(w: np.ndarray) -> float:
             net_pnl = sub_pnl @ w
             raw = {}
+            axe_pair = None
             for name in lam.active_names:
                 if name == "hit_ratio":
                     raw[name] = soft_hit_ratio(net_pnl)
@@ -1630,6 +1869,16 @@ class WeightSolver:
                     if strikes is not None:
                         raw[name] = float(np.dot(w, strikes))
                     continue
+                elif name in ("axe_book_cleaned", "axe_package_recycled"):
+                    if vega is None:
+                        continue
+                    if axe_pair is None:
+                        picked = self._vega_choose_V(w, vega, lam_a, lam_b)
+                        if picked is None:
+                            return 1e10  # caps make every V < v_min for this w
+                        axe_pair = picked
+                    raw[name] = (axe_pair[1] if name == "axe_book_cleaned"
+                                 else axe_pair[2])
                 else:
                     raw[name] = metric_map[name].compute(net_pnl, self._ctx)
                 if math.isnan(raw[name]):
@@ -1648,6 +1897,7 @@ class WeightSolver:
         per_stock_bounds: Optional[np.ndarray] = None,
         sweep_key: Optional[Tuple[int, ...]] = None,
         group_bounds=None,
+        vega: Optional[VegaSpec] = None,
     ) -> WeightSolverResult:
         """Solve via scipy SLSQP with multi-start + a deterministic step sweep.
 
@@ -1677,7 +1927,11 @@ class WeightSolver:
         # Objective: MINIMISE negative smooth-normalised score + tiny linear
         # regularisation (shared with diagnose_convergence — see
         # _smooth_surrogate_objective for the units rationale).
-        _base_objective = self._smooth_surrogate_objective(sub_pnl, strikes, col_means)
+        _base_objective = self._smooth_surrogate_objective(sub_pnl, strikes, col_means,
+                                                           vega=vega)
+        _lam_a = lam.get("axe_book_cleaned", 0.0)
+        _lam_b = lam.get("axe_package_recycled", 0.0)
+        _axe_active_nl = (vega is not None and (_lam_a > 0 or _lam_b > 0))
 
         def objective(w: np.ndarray) -> float:
             nonlocal n_evals
@@ -1788,9 +2042,17 @@ class WeightSolver:
                 return None
             if not self._groups_satisfied(w, group_bounds):
                 return None
+            _repl = {}
+            if ws_active and strikes is not None:
+                _repl["weighted_strike"] = float(np.dot(w, strikes))
+            if _axe_active_nl:
+                _picked = self._vega_choose_V(w, vega, _lam_a, _lam_b)
+                if _picked is None:
+                    return None  # caps leave no feasible V for this w
+                _repl["axe_cleaned"] = _picked[1]
+                _repl["axe_recycled"] = _picked[2]
             net = sub_pnl @ w
-            ctx_w = (dataclasses.replace(self._ctx, weighted_strike=float(np.dot(w, strikes)))
-                     if (ws_active and strikes is not None) else self._ctx)
+            ctx_w = dataclasses.replace(self._ctx, **_repl) if _repl else self._ctx
             step = self._score_fn.score(net, ctx_w)
             if math.isnan(step) or math.isinf(step):
                 return None
@@ -1863,6 +2125,16 @@ class WeightSolver:
         if best_step_w is not None:
             best_w = best_step_w
             final_score = float(best_step)
+            if _axe_active_nl or vega is not None:
+                _picked = self._vega_choose_V(best_w, vega, _lam_a, _lam_b) if vega is not None else None
+                if _picked is None and vega is not None:
+                    return WeightSolverResult(weights=np.full(n, 1.0 / n), score=-np.inf,
+                                              feasible=False, n_evals=n_evals)
+                if _picked is not None:
+                    return WeightSolverResult(
+                        weights=best_w, score=final_score, feasible=True, n_evals=n_evals,
+                        extra={"vega_total": _picked[0], "axe_cleaned": _picked[1],
+                               "axe_recycled": _picked[2]})
         elif group_bounds:
             # No candidate satisfies the bucket bounds for this subset —
             # surface infeasibility instead of returning violating weights.

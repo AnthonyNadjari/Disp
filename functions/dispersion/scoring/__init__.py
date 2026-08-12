@@ -24,6 +24,8 @@ Plus:
 from .aggregators import Aggregator, ChebyshevAggregator, WeightedSum
 from .metrics import (
     DEFAULT_METRICS,
+    AxeBookCleaned,
+    AxePackageRecycled,
     CVaR5,
     HitRatio,
     LastCarry,
@@ -65,6 +67,8 @@ __all__ = [
     "CVaR5",
     "SharpePayoff",
     "WeightedStrike",
+    "AxeBookCleaned",
+    "AxePackageRecycled",
     # Normalizers
     "QuantileNormalizer",
     "ZScoreNormalizer",
