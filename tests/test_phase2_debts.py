@@ -237,47 +237,75 @@ def test_n_reference_samples_too_small_raises():
 
 
 # ---------------------------------------------------------------------------
-# _calculate_stock_quality: decoupled from legacy ScoreWeights
+# Phase 3 — genome is subset-only: weights are a pure function of the subset
 # ---------------------------------------------------------------------------
 
 
-def _opt_for_quality(weights):
-    names = [f"Q{i}" for i in range(4)]
-    legs = _mk_legs(names)
-    # Give one leg precomputed backtest metrics (production shape)
-    legs[0].metrics = {"last_value": 2.0, "avg_5y": 0.05, "avg_3y": 0.06,
-                       "hit_ratio": 80.0, "max_drawdown": -0.30}
-    pnl = _mk_pnl(4, seed=29)
-    return DispersionOptimizer(
-        long_candidates=legs,
+def _opt_subset_only(weights, seed=0):
+    names = [f"Q{i}" for i in range(6)]
+    pnl = _mk_pnl(6, seed=29)
+    opt = DispersionOptimizer(
+        long_candidates=_mk_legs(names),
         short_candidates=[],
         pnl_matrix=pnl,
         column_map={n: i for i, n in enumerate(names)},
         constraints=_cons(),
         missing_data_policy=MissingDataPolicy.FILL_ZERO,
         metric_weights=MetricWeights(weights),
-        seed=0,
+        seed=seed,
     )
+    opt.run()
+    return opt
 
 
-def test_quality_neutral_without_leg_metrics():
-    opt = _opt_for_quality({"mean_payoff": 1.0})
-    # legs[1..3] have no metrics dict -> neutral bias
-    assert opt._quality_long[1] == 0.0
-    assert opt._quality_long[2] == 0.0
+def test_fitness_is_pure_function_of_subset():
+    """Two individuals with the same subset must get identical fitness AND
+    identical derived weights, whatever path constructed them."""
+    from functions.dispersion._optimizer import _Individual
+    for weights in ({"mean_payoff": 1.0},                       # exact path (LP)
+                    {"min_payoff": 1.0},                        # exact path (maximin)
+                    {"mean_payoff": 0.5, "hit_ratio": 0.5}):    # non-exact (projection)
+        opt = _opt_subset_only(weights)
+        a = _Individual([0, 2, 4], [])
+        b = _Individual([0, 2, 4], [])
+        fa = opt._fitness(a)
+        fb = opt._fitness(b)
+        assert fa == fb, f"fitness not subset-pure for {weights}"
+        assert np.array_equal(a.long_weights, b.long_weights), (
+            f"derived weights differ for identical subsets ({weights})")
 
 
-def test_quality_follows_active_metric_weights():
-    q_carry = _opt_for_quality({"last_carry": 1.0})._quality_long[0]
-    q_hit = _opt_for_quality({"hit_ratio": 1.0})._quality_long[0]
-    q_risk = _opt_for_quality({"min_payoff": 1.0})._quality_long[0]
-    # last_value=2.0/3 vs hit=(0.8-0.5)*2 -> both positive but different
-    assert q_carry == pytest.approx(2.0 / 3.0)
-    assert q_hit == pytest.approx(0.6)
-    # pure risk objective penalizes the drawdown proxy -> negative bias
-    assert q_risk == pytest.approx(-0.30 / 1.5)
-    # sharpe has no per-leg proxy -> neutral
-    assert _opt_for_quality({"sharpe_payoff": 1.0})._quality_long[0] == 0.0
+def test_operators_never_carry_weights():
+    """Crossover/mutation children owe their weights entirely to _fitness."""
+    opt = _opt_subset_only({"mean_payoff": 0.5, "hit_ratio": 0.5})
+    from functions.dispersion._optimizer import _Individual
+    p1 = _Individual([0, 1, 2], [])
+    p1.fitness = opt._fitness(p1)
+    p2 = _Individual([2, 3, 4], [])
+    p2.fitness = opt._fitness(p2)
+    child = opt._crossover(p1, p2)
+    assert child is not None
+    ref = _Individual(list(child.long_indices), [])
+    opt._fitness(ref)
+    assert np.array_equal(child.long_weights, ref.long_weights)
+    mut = opt._mutate(child)
+    if mut is not None:
+        ref2 = _Individual(list(mut.long_indices), [])
+        opt._fitness(ref2)
+        assert np.array_equal(mut.long_weights, ref2.long_weights)
+
+
+def test_exact_config_fitness_hits_solver_cache():
+    """Re-evaluating a subset must hit the memoised solver (pure-subset
+    fitness => cache effectiveness cannot regress)."""
+    from functions.dispersion._optimizer import _Individual
+    opt = _opt_subset_only({"min_payoff": 1.0})
+    ws = opt._weight_solver
+    ind = _Individual([1, 3, 5], [])
+    opt._fitness(ind)
+    hits_before = ws._cache_hits
+    opt._fitness(_Individual([1, 3, 5], []))
+    assert ws._cache_hits == hits_before + 1
 
 
 def test_legacy_score_weights_param_removed():

@@ -27,6 +27,7 @@ weights are returned in the canonical sorted order.
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import math
 import warnings
 from dataclasses import dataclass
@@ -191,6 +192,7 @@ class WeightSolver:
         self._ctx = ctx
         self._constraints = constraints
         self._n_restarts = n_restarts
+        self._seed = int(seed)
         self._rng = np.random.default_rng(seed)
         self._log = logger or (lambda l, m: None)
         self._missing_data_policy = missing_data_policy  # "adaptive_reweight", "fill_zero", "drop_incomplete"
@@ -369,7 +371,8 @@ class WeightSolver:
                 result = self._solve_concave_blend(sub_pnl_sorted, strikes_sorted, n, bounds_sorted, full_active_days)
                 self.log_solver_path("concave_blend_LP")
         else:
-            result = self._solve_nonlinear(sub_pnl_sorted, strikes_sorted, n, bounds_sorted)
+            result = self._solve_nonlinear(sub_pnl_sorted, strikes_sorted, n, bounds_sorted,
+                                           sweep_key=sorted_indices)
             self.log_solver_path("SLSQP")
 
         # Cache in sorted order
@@ -1450,11 +1453,17 @@ class WeightSolver:
         strikes: Optional[np.ndarray],
         n: int,
         per_stock_bounds: Optional[np.ndarray] = None,
+        sweep_key: Optional[Tuple[int, ...]] = None,
     ) -> WeightSolverResult:
-        """Solve via scipy SLSQP with multi-start.
+        """Solve via scipy SLSQP with multi-start + a deterministic step sweep.
 
-        Uses score_smooth (interpolated CDF) during optimisation for gradient,
-        then evaluates final score with step-function normalisation.
+        SLSQP optimises the smooth surrogate (interpolated CDF, soft hit
+        ratio); the final selection then compares the SLSQP optimum against a
+        deterministic Dirichlet sweep (plus a coarse simplex grid for small
+        n) evaluated on the STEP score — step-dominated objectives such as
+        hit_ratio live on plateaus the surrogate's gradient cannot see.  The
+        sweep RNG is seeded from (solver seed, subset key) so results are
+        reproducible and independent of call order.
         """
         c = self._constraints
         n_evals = 0
@@ -1548,14 +1557,84 @@ class WeightSolver:
         best_w = np.clip(best_w, c.min_weight, c.max_weight)
         best_w = best_w / best_w.sum()
 
-        # Final score with STEP-function normalisation
-        net_pnl = sub_pnl @ best_w
-        final_ctx = self._ctx
-        if ws_active and strikes is not None:
-            final_ctx = dataclasses.replace(
-                self._ctx, weighted_strike=float(np.dot(best_w, strikes))
-            )
-        final_score = self._score_fn.score(net_pnl, final_ctx)
+        # ── Per-stock bound vectors (for projection of sweep candidates) ──
+        if per_stock_bounds is not None:
+            lb = per_stock_bounds[:, 0]
+            ub = per_stock_bounds[:, 1]
+        else:
+            lb = np.full(n, c.min_weight)
+            ub = np.full(n, c.max_weight)
+
+        metric_map_all = {m.name: m for m in self._score_fn.metrics}
+
+        def _step_eval(w: np.ndarray) -> Optional[Tuple[float, float]]:
+            """(rank_value, step_score) of w, or None if strike-infeasible.
+
+            The quantile step score saturates at 1.0 once a candidate beats
+            the whole reference — ranking must then fall back to the
+            scalarised raw objective (same tie-break as the GA fitness) or
+            the sweep cannot distinguish top-plateau candidates.
+            """
+            if (strikes is not None and c.max_net_strike is not None
+                    and float(np.dot(w, strikes)) > c.max_net_strike + 1e-9):
+                return None
+            net = sub_pnl @ w
+            ctx_w = (dataclasses.replace(self._ctx, weighted_strike=float(np.dot(w, strikes)))
+                     if (ws_active and strikes is not None) else self._ctx)
+            step = self._score_fn.score(net, ctx_w)
+            if math.isnan(step) or math.isinf(step):
+                return None
+            if step < 0.99:
+                return (float(step), float(step))
+            raw = self._score_fn.raw_metrics(net, ctx_w)
+            scalar = 0.0
+            for name in lam.active_names:
+                v = raw.get(name, float("nan"))
+                if not np.isfinite(v):
+                    return None
+                scalar += lam[name] * (1.0 if metric_map_all[name].higher_is_better else -1.0) * v
+            return (float(2.0 + math.tanh(scalar)), float(step))
+
+        # ── Deterministic sweep on the STEP score ──
+        cand_ws = [self._project_to_bounded_simplex(best_w.copy(), lb, ub)]
+        sweep_entropy = [self._seed] + ([int(i) for i in sweep_key]
+                                        if sweep_key is not None else [n])
+        sweep_rng = np.random.default_rng(sweep_entropy)
+        for _ in range(300):
+            w = sweep_rng.dirichlet(np.ones(n))
+            cand_ws.append(self._project_to_bounded_simplex(w, lb, ub))
+        if n <= 4:
+            grid = np.linspace(0.0, 1.0, 5)
+            for combo in itertools.product(grid, repeat=n):
+                s = float(sum(combo))
+                if s <= 0.0:
+                    continue
+                w = np.asarray(combo, dtype=np.float64) / s
+                cand_ws.append(self._project_to_bounded_simplex(w, lb, ub))
+
+        best_rank = -np.inf
+        best_step = -np.inf
+        best_step_w = None
+        for w in cand_ws:
+            out = _step_eval(w)
+            n_evals += 1
+            if out is not None and out[0] > best_rank:
+                best_rank, best_step = out
+                best_step_w = w
+
+        if best_step_w is not None:
+            best_w = best_step_w
+            final_score = float(best_step)
+        else:
+            # All candidates strike-infeasible (should not happen: the SLSQP
+            # optimum honoured the constraint) — keep SLSQP weights, step score.
+            net_pnl = sub_pnl @ best_w
+            final_ctx = self._ctx
+            if ws_active and strikes is not None:
+                final_ctx = dataclasses.replace(
+                    self._ctx, weighted_strike=float(np.dot(best_w, strikes))
+                )
+            final_score = self._score_fn.score(net_pnl, final_ctx)
 
         return WeightSolverResult(
             weights=best_w,

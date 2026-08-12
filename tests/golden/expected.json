@@ -36,22 +36,22 @@
     "scoring_signature": "86ce0a84bf0d73b2"
   },
   "bundle_c_mixed": {
-    "generations_run": 63,
+    "generations_run": 27,
     "long_basket": [
       [
         "G7",
-        0.23211382238383066
+        0.23306896274218863
       ],
       [
         "G8",
-        0.3588769575401925
+        0.36219166908569816
       ],
       [
         "G9",
-        0.4090092200759768
+        0.4047393681721132
       ]
     ],
-    "net_strike": 0.14906137238615288,
+    "net_strike": 0.14903002243257957,
     "score": 0.9721176470588235,
     "scoring_signature": "a7bbf0a6dcbf20fb"
   }

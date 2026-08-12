@@ -94,14 +94,22 @@ from functions.dispersion.scoring.weight_solver import adaptive_pnl
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class _Individual:
-    """Internal GA solution representation."""
+    """Internal GA solution representation.
+
+    The GENOME is the two index lists only.  The weight arrays are a CACHE
+    of the deterministic per-subset weights derived in ``_fitness`` (exact
+    inner solver for exact-path configs, bounded equal-weight projection
+    otherwise) — they are never evolved by the GA operators.
+    """
     __slots__ = ("long_indices", "short_indices", "long_weights", "short_weights", "fitness")
 
-    def __init__(self, long_indices, short_indices, long_weights, short_weights):
+    def __init__(self, long_indices, short_indices, long_weights=None, short_weights=None):
         self.long_indices = list(long_indices)
         self.short_indices = list(short_indices)
-        self.long_weights = np.asarray(long_weights, dtype=np.float64)
-        self.short_weights = np.asarray(short_weights, dtype=np.float64)
+        self.long_weights = (np.asarray(long_weights, dtype=np.float64)
+                             if long_weights is not None else np.zeros(0, dtype=np.float64))
+        self.short_weights = (np.asarray(short_weights, dtype=np.float64)
+                              if short_weights is not None else np.zeros(0, dtype=np.float64))
         self.fitness = -np.inf
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Weight optimization helpers
@@ -228,7 +236,6 @@ class DispersionOptimizer:
         self._score_fn: Optional[ScoreFunction] = None
         self._weight_solver: Optional[WeightSolver] = None
         self._scoring_mode: str = "legacy"  # tracks which scorer actually ran
-        self._all_metrics_linear: bool = False  # P2: adaptive dispatch
         # _use_exact_in_ga already set at L176 from bisect_in_ga param
         self._solver_cumulative_time: float = 0.0  # track solver overhead
         _bt_config = SwapConfig(
@@ -255,13 +262,6 @@ class DispersionOptimizer:
         # Use row count as proxy: 252 trading days/year
         self._n_3y = min(self._n_rows, 252 * 3)
         self._n_5y = min(self._n_rows, 252 * 5)
-        # Pre-compute per-stock quality for weight allocation
-        self._quality_long = np.array([
-            self._calculate_stock_quality(s) for s in self.long_candidates
-        ], dtype=np.float64)
-        self._quality_short = np.array([
-            self._calculate_stock_quality(s) for s in self.short_candidates
-        ], dtype=np.float64) if self.short_candidates else np.array([])
         self._long_only = len(self.short_candidates) == 0
         # Rejection tracking
         self._rejection_reasons = {
@@ -300,44 +300,6 @@ class DispersionOptimizer:
         if long_candidates:
             s = long_candidates[0]
             _dlog(f"🔬 [OPTIM-INIT] bounds sample: min_w={s.min_weight:.4f} max_w={s.max_weight:.4f}")
-    # ══════════════════════════════════════════════════════════════════════════
-    # STOCK QUALITY (used by weight allocator)
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _calculate_stock_quality(self, leg: DispersionLeg) -> float:
-        """Per-stock quality bias for the initial weight allocator.
-
-        Built from the ACTIVE metric weights of THIS run (the legacy
-        ScoreWeights path is gone): each v2 metric maps to its per-leg
-        backtest proxy in ``leg.metrics`` with the historical linear
-        scalings.  Metrics without a per-leg proxy (sharpe_payoff,
-        weighted_strike) contribute nothing.  Neutral (0.0) when the leg
-        carries no precomputed metrics — the allocator then starts from
-        range midpoints, exactly as before.
-        """
-        m = leg.metrics if leg.metrics else {}
-        if not m or self._metric_weights is None:
-            return 0.0
-        w = self._metric_weights
-        # Historical linear scalings (unchanged)
-        last_val = m.get('last_value', 0.0) / 3.0
-        avg_5y = m.get('avg_5y', 0.0) / 0.06
-        avg_3y = m.get('avg_3y', 0.0) / 0.08
-        # hit_ratio from backtest is in [0, 100] range → center to [-1, 1]
-        hit_ratio = (m.get('hit_ratio', 50.0) / 100.0 - 0.5) * 2.0
-        # max_drawdown from backtest is negative (e.g., -0.15) — magnitude, scaled
-        max_dd = abs(m.get('max_drawdown', 0.0)) / 1.5
-        quality = (
-            w.get('last_carry', 0.0) * last_val
-            + w.get('mean_payoff', 0.0) * 0.5 * (avg_5y + avg_3y)
-            + w.get('hit_ratio', 0.0) * hit_ratio
-        )
-        # Risk-side objectives share the drawdown proxy as a penalty
-        risk_w = (w.get('min_payoff', 0.0) + w.get('max_drawdown', 0.0)
-                  + w.get('cvar_5', 0.0))
-        quality -= risk_w * max_dd
-        return quality
-
     def _print_candidate_table(self):
         """Print a visible table of long/short candidates with PnL data quality."""
         lines = []
@@ -399,10 +361,8 @@ class DispersionOptimizer:
                 max_stocks=self.c.max_stocks_long,
             )
             self._wc = wc
-            # P2: Check if all active metrics are linear (enables inline LP during GA)
             active_metrics = [m for m in self._score_fn._metrics
                              if m.name in self._metric_weights.active_names]
-            self._all_metrics_linear = all(m.is_linear for m in active_metrics)
             # P5: Adaptive n_samples — reduced for speed; tail metrics get more.
             # An explicit n_reference_samples overrides the adaptive default.
             has_tail = any(getattr(m, 'is_tail_metric', False) for m in active_metrics)
@@ -440,6 +400,12 @@ class DispersionOptimizer:
                 n_restarts=3, seed=self.seed,
                 missing_data_policy=_ws_policy,
             )
+            # Genome = subset only: fitness derives weights deterministically.
+            # Exact-path configs solve the exact inner problem per subset
+            # (memoised — fitness is a pure function of the subset); all
+            # other configs use the bounded equal-weight projection during
+            # the GA, with SLSQP reserved for the post-GA refinement.
+            self._exact_fitness = self._weight_solver.has_exact_path()
         # Create initial population
         population = []
         attempts = 0
@@ -546,14 +512,12 @@ class DispersionOptimizer:
         if best_score == -np.inf:
             return self._empty_result()
         # ── Post-GA refinement ──
-        _active_now = (set(self._score_fn.weights.active_names)
-                       if (self._use_new_scoring and self._score_fn is not None) else set())
-        if (self._use_new_scoring and self._weight_solver is not None
-                and _active_now != {"hit_ratio"}):
-            # Refine top elites for every config except hit_ratio-only (zero
-            # gradient).  Exact-path configs get the LP/bisection optimum;
-            # non-linear blends (max_drawdown, cvar_5, weighted_strike, ...)
-            # go through the smooth-normalised SLSQP inner solver.
+        if self._use_new_scoring and self._weight_solver is not None:
+            # Refine top elites for EVERY config (subset-only genome: this is
+            # the only place non-exact configs get weight optimisation).
+            # Exact-path configs get the LP/bisection optimum; non-linear
+            # blends — including hit_ratio-only via its soft surrogate — go
+            # through the smooth-normalised SLSQP inner solver.
             pre_score = best_score
             population.sort(key=lambda x: x.fitness, reverse=True)
             top_k = min(30, len(population))
@@ -595,12 +559,7 @@ class DispersionOptimizer:
         best subsets found by the GA, not on every individual in every gen.
         Typically K=10, and each solve takes ~60-120ms → total ~1s.
         """
-        # CHANGE 8a: Early exit for hit_ratio-only — SLSQP has zero gradient on step function
         active = self._score_fn.weights.active_names
-        if active == ["hit_ratio"] or set(active) == {"hit_ratio"}:
-            self.log("DEBUG", "Refinement skipped: hit_ratio-only (no gradient for SLSQP)")
-            return (current_best, current_best_score)
-
         best = current_best
         best_score = current_best_score
         ctx = self._make_ctx()  # ws-agnostic fallback; per-basket ctx built below
@@ -738,12 +697,14 @@ class DispersionOptimizer:
                 else:
                     n_no_improve += 1
             else:
-                # Any config containing hit_ratio with other metrics: keep step-score behavior
-                if score > best_score:
+                # Configs containing hit_ratio: accept on the SAME tie-broken
+                # scale the GA ranks on (step score saturates at the top).
+                cand_fit = self._fitness_from_net(net_pnl, _cand_ctx)
+                if cand_fit is not None and cand_fit > best_score:
                     n_improved += 1
-                    best_score = score
+                    best_score = cand_fit
                     ind.long_weights = result.weights
-                    ind.fitness = score
+                    ind.fitness = cand_fit
                     best = self._copy(ind)
                 else:
                     n_no_improve += 1
@@ -1007,103 +968,157 @@ class DispersionOptimizer:
             net = np.clip(net, self.global_floor, self.global_cap)
         return net
 
-    def _fitness(self, individual: _Individual) -> float:
-        """
-        Validate every individual before scoring, regardless of whether it came
-        from random generation, crossover, mutation or a solver.
-        """
-
-        long_w = np.asarray(individual.long_weights, dtype=np.float64)
-
-        if len(long_w) != len(individual.long_indices):
-            return 0.0
-
-        long_min = np.array(
-            [self.long_candidates[i].min_weight for i in individual.long_indices],
-            dtype=np.float64,
-        )
-        long_max = np.array(
-            [self.long_candidates[i].max_weight for i in individual.long_indices],
-            dtype=np.float64,
-        )
-
-        # Try to repair onto the bounded simplex.
-        if long_min.sum() > 1.0 + 1e-10 or long_max.sum() < 1.0 - 1e-10:
-            return 0.0
-
-        long_w = self._project_to_simplex_bounded(
-            long_w,
-            long_min,
-            long_max,
-        )
-
+    def _equal_projected_weights(self, indices, candidates) -> Optional[np.ndarray]:
+        """Deterministic GA weights for non-exact configs (and the short leg):
+        equal-weight projected onto the bounded simplex (sum=1, per-name
+        Min/Max).  Returns None when the subset's bounds are infeasible."""
+        n = len(indices)
+        if n == 0:
+            return np.zeros(0, dtype=np.float64)
+        min_w = np.array([candidates[i].min_weight for i in indices], dtype=np.float64)
+        max_w = np.array([candidates[i].max_weight for i in indices], dtype=np.float64)
+        if min_w.sum() > 1.0 + 1e-10 or max_w.sum() < 1.0 - 1e-10:
+            return None
+        w = self._project_to_simplex_bounded(np.full(n, 1.0 / n), min_w, max_w)
         if (
-                long_w is None
-                or not np.all(np.isfinite(long_w))
-                or not np.isclose(long_w.sum(), 1.0, atol=1e-8)
-                or np.any(long_w < long_min - 1e-8)
-                or np.any(long_w > long_max + 1e-8)
+                w is None
+                or not np.all(np.isfinite(w))
+                or not np.isclose(w.sum(), 1.0, atol=1e-8)
+                or np.any(w < min_w - 1e-8)
+                or np.any(w > max_w + 1e-8)
         ):
+            return None
+        return w
+
+    def _fitness(self, individual: _Individual) -> float:
+        """Bilevel fitness — the genome carries ONLY the stock subsets.
+
+        Weights are ALWAYS derived here, from one deterministic rule per
+        config (single source of truth, cached on the individual):
+          - exact-path configs (all-linear, min_payoff-only, concave blend):
+            the exact inner solver (LP / bisection, memoised per subset) —
+            fitness is a pure function of the subset;
+          - any other config: bounded equal-weight projection — cheap and
+            deterministic.  SLSQP runs only post-GA (_refine_top_individuals,
+            local search, safety-net).
+        The short leg always uses the equal-weight projection (it never had a
+        solver-driven inner optimisation).
+        """
+        if not (self._use_new_scoring and self._score_fn is not None
+                and self._score_fn.is_fitted):
+            raise RuntimeError(
+                "ScoreFunction not fitted — reference sample failed; cannot optimize. "
+                f"use_new_scoring={self._use_new_scoring}, "
+                f"score_fn={'None' if self._score_fn is None else 'present'}, "
+                f"is_fitted={self._score_fn.is_fitted if self._score_fn is not None else 'N/A'}"
+            )
+
+        # ── Long leg: resolve matrix columns (all must be present) ──
+        long_ids = [_candidate_key(self.long_candidates[i], self.is_cross_corridor)
+                    for i in individual.long_indices]
+        long_pos = np.array([self._col_pos[c] for c in long_ids if c in self._col_pos])
+        if len(long_pos) == 0 or len(long_pos) != len(individual.long_indices):
             return 0.0
 
+        # ── Long weights: deterministic function of the subset ──
+        if self._exact_fitness and self._weight_solver is not None:
+            strikes = self._solver_strikes(individual.long_indices, self.long_candidates)
+            _pass_strikes = (self.c.max_net_strike > 0) or self._ws_active()
+            per_stock_bounds = np.array([
+                [self.long_candidates[i].min_weight, self.long_candidates[i].max_weight]
+                for i in individual.long_indices
+            ], dtype=np.float64)
+            # Strike visibility log — first call only
+            if not self._strike_logged:
+                self._strike_logged = True
+                self.log("INFO", f"[STRIKE-CHECK] strikes.min={strikes.min():.4f}, strikes.max={strikes.max():.4f}, max_net_strike={self.c.max_net_strike}")
+            result = self._weight_solver.solve(
+                pnl_matrix=self._ts_mat,
+                stock_indices=long_pos,
+                strikes=strikes if _pass_strikes else None,
+                per_stock_bounds=per_stock_bounds,
+                active_mask=self._valid_mask,
+            )
+            if not result.feasible:
+                self._lp_infeasible_streak += 1
+                if self._lp_infeasible_streak >= 20:
+                    raise RuntimeError(
+                        f"First 20 exact inner solves all infeasible — likely units mismatch. "
+                        f"strikes.min={strikes.min():.4f}, strikes.max={strikes.max():.4f}, "
+                        f"max_net_strike={self.c.max_net_strike}"
+                    )
+                return 0.0
+            self._lp_infeasible_streak = 0
+            long_w = result.weights
+        else:
+            long_w = self._equal_projected_weights(individual.long_indices, self.long_candidates)
+            if long_w is None:
+                self._rejection_reasons["no_weights"] += 1
+                return 0.0
         individual.long_weights = long_w
 
+        # ── Short leg: bounded equal-weight projection ──
+        short_pos_arr = None
+        short_w = np.zeros(0, dtype=np.float64)
         if individual.short_indices:
-            short_w = np.asarray(individual.short_weights, dtype=np.float64)
-
-            if len(short_w) != len(individual.short_indices):
+            short_ids = [_candidate_key(self.short_candidates[i], self.is_cross_corridor)
+                         for i in individual.short_indices]
+            spos = np.array([self._col_pos[c] for c in short_ids if c in self._col_pos])
+            if len(spos) != len(individual.short_indices):
                 return 0.0
-
-            short_min = np.array(
-                [self.short_candidates[i].min_weight for i in individual.short_indices],
-                dtype=np.float64,
-            )
-            short_max = np.array(
-                [self.short_candidates[i].max_weight for i in individual.short_indices],
-                dtype=np.float64,
-            )
-
-            if short_min.sum() > 1.0 + 1e-10 or short_max.sum() < 1.0 - 1e-10:
+            short_w = self._equal_projected_weights(individual.short_indices, self.short_candidates)
+            if short_w is None:
+                self._rejection_reasons["no_weights"] += 1
                 return 0.0
+            short_pos_arr = spos
+        individual.short_weights = short_w
 
-            short_w = self._project_to_simplex_bounded(
-                short_w,
-                short_min,
-                short_max,
-            )
-
-            if (
-                    short_w is None
-                    or not np.all(np.isfinite(short_w))
-                    or not np.isclose(short_w.sum(), 1.0, atol=1e-8)
-                    or np.any(short_w < short_min - 1e-8)
-                    or np.any(short_w > short_max + 1e-8)
-            ):
-                return 0.0
-
-            individual.short_weights = short_w
-
-        if not self._is_strike_valid(
-                individual.long_indices,
-                individual.long_weights,
-                individual.short_indices,
-                individual.short_weights,
-        ):
+        # ── Hard strike constraint on the derived weights ──
+        if not self._is_strike_valid(individual.long_indices, long_w,
+                                     individual.short_indices, short_w):
+            self._rejection_reasons["strike_invalid"] += 1
             return 0.0
 
-        if (
-                self._use_new_scoring
-                and self._score_fn is not None
-                and self._score_fn.is_fitted
-        ):
-            return self._calculate_fitness_v2(individual)
+        # ── Score the net P&L (adaptive formula mirrors the backtester) ──
+        net_pnl_raw = self._adaptive_net_pnl(
+            long_pos, long_w, short_pos_arr,
+            short_w if short_pos_arr is not None else None)
+        n_nonzero = int(np.count_nonzero(net_pnl_raw))
+        if n_nonzero < 50:
+            self._rejection_reasons["len_valid_lt_50"] += 1
+            return 0.0
+        _ws = (self._net_strike(individual.long_indices, long_w,
+                                individual.short_indices, short_w)
+               if self._ws_active() else None)
+        ctx = self._make_ctx(_ws)
+        fit = self._fitness_from_net(net_pnl_raw, ctx)
+        if fit is None:
+            self._rejection_reasons["invalid_score"] += 1
+            return 0.0
+        return fit
 
-        raise RuntimeError(
-            "ScoreFunction not fitted — reference sample failed; cannot optimize. "
-            f"use_new_scoring={self._use_new_scoring}, "
-            f"score_fn={'None' if self._score_fn is None else 'present'}, "
-            f"is_fitted={self._score_fn.is_fitted if self._score_fn is not None else 'N/A'}"
-        )
+    def _fitness_from_net(self, net_pnl_raw: np.ndarray, ctx: ScoreContext) -> Optional[float]:
+        """Step-quantile score with the top-saturation tie-break.
+
+        Shared by the GA fitness and the refinement acceptance so both rank
+        candidates on the SAME scale.  Tie-break: when the quantile score
+        saturates at the top (>= 0.99), rank by the scalarised raw objective
+        mapped into (1.0, 3.0) — beats any quantile score, monotone in the
+        raw blend.  Returns None for an invalid (NaN/inf) score.
+        """
+        score = self._score_fn.score(net_pnl_raw, ctx)
+        if np.isnan(score) or np.isinf(score):
+            return None
+        if score >= 0.99:
+            raw = self._score_fn.raw_metrics(net_pnl_raw, ctx)
+            lam = self._score_fn.weights
+            metric_map = {m.name: m for m in self._score_fn.metrics}
+            scalar = sum(
+                lam.get(name, 0.0) * raw[name] * (1.0 if metric_map[name].higher_is_better else -1.0)
+                for name in lam.active_names
+            )
+            return float(2.0 + math.tanh(scalar))
+        return float(score)
 
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1420,166 +1435,10 @@ class DispersionOptimizer:
         """Run-level ScoreContext, optionally carrying the basket's net strike."""
         return ScoreContext(n_days=self._n_rows, weighted_strike=weighted_strike)
 
-    def _calculate_fitness_v2(self, individual: _Individual) -> float:
-        """Bilevel fitness — adaptive path for the GA loop.
-        - If ALL active metrics are linear: use full WeightSolver (LP path, ~0.01ms
-          with cache hits). This gives exact optimal weights during GA.
-        - If any metric is non-linear: use the INDIVIDUAL's OWN weights for scoring.
-          The GA evolves both stock selection AND weights through crossover/mutation.
-        Full SLSQP refinement on top elites happens post-GA (see _refine_top_individuals).
-        """
-        self.log("DEBUG", f"[FITNESS-v2] all_linear={self._all_metrics_linear} | path={'LP' if self._all_metrics_linear else 'OWN-WEIGHTS'}")
-        # ── Use _candidate_key for cross-corridor vs mono ──
-        long_ids = [_candidate_key(self.long_candidates[i], self.is_cross_corridor) for i in individual.long_indices]
-        long_pos = np.array([self._col_pos[c] for c in long_ids if c in self._col_pos])
-        if len(long_pos) == 0:
-            return 0.0
-        n_long = len(long_pos)
-        # P2: Adaptive dispatch — inline exact solve when all active metrics are
-        # linear (LP is microseconds + cached), or when the user forces exact-in-GA.
-        if ((self._all_metrics_linear or self._use_exact_in_ga)
-                and self._weight_solver is not None and self._weight_solver.has_exact_path()):
-            strikes = self._solver_strikes(individual.long_indices[:n_long], self.long_candidates)
-            _pass_strikes = (self.c.max_net_strike > 0) or self._ws_active()
-            # Per-stock bounds from Stock objects
-            per_stock_bounds = np.array([
-                [self.long_candidates[i].min_weight, self.long_candidates[i].max_weight]
-                for i in individual.long_indices[:n_long]
-            ], dtype=np.float64)
-            # Strike visibility log — first call only
-            if not self._strike_logged:
-                self._strike_logged = True
-                self.log("INFO", f"[STRIKE-CHECK] strikes.min={strikes.min():.4f}, strikes.max={strikes.max():.4f}, max_net_strike={self.c.max_net_strike}")
-            result = self._weight_solver.solve(
-                pnl_matrix=self._ts_mat,
-                stock_indices=long_pos,
-                strikes=strikes if _pass_strikes else None,
-                per_stock_bounds=per_stock_bounds,
-                active_mask=self._valid_mask,
-            )
-            if not result.feasible:
-                self._lp_infeasible_streak += 1
-                if self._lp_infeasible_streak >= 20:
-                    raise RuntimeError(
-                        f"First 20 LP solves all infeasible — likely units mismatch. "
-                        f"strikes.min={strikes.min():.4f}, strikes.max={strikes.max():.4f}, "
-                        f"max_net_strike={self.c.max_net_strike}"
-                    )
-                        # LP infeasible
-                return 0.0
-            self._lp_infeasible_streak = 0
-            w = result.weights
-            # LP path: update individual's weights since LP gives optimal solution
-            individual.long_weights = w
-        else:
-            # Use individual's OWN weights (evolved by GA operators)
-            w = individual.long_weights
-            _dlog(f"  GA weights: {w} (len={len(w) if w is not None else 0})")
-            if w is None or len(w) != n_long:
-                # Fallback: if weights missing or mismatched, generate fresh ones
-                _dlog("  GA weights missing/mismatch - calling _optimize_weights_for_basket")
-                w = self._optimize_weights_for_basket(
-                    individual.long_indices[:n_long], self.long_candidates, self._quality_long)
-                individual.long_weights = w
-                _dlog(f"  GA weights after opt: {w}")
-        # Compute net P&L using adaptive formula (mirrors backtester exactly)
-        short_indices = individual.short_indices
-        short_pos_arr = None
-        short_w = None
-        if len(short_indices) > 0:
-            short_ids = [_candidate_key(self.short_candidates[i], self.is_cross_corridor) for i in short_indices]
-            short_pos_arr = np.array([self._col_pos[c] for c in short_ids if c in self._col_pos])
-            short_w = individual.short_weights
-            if len(short_pos_arr) == 0:
-                short_pos_arr = None
-                short_w = None
-        net_pnl_raw = self._adaptive_net_pnl(long_pos, w, short_pos_arr, short_w)
-        _ws = (self._net_strike(individual.long_indices[:n_long], w,
-                                short_indices, short_w)
-               if self._ws_active() else None)
-        ctx = self._make_ctx(_ws)
-        # ── ALIGNED WITH BACKTESTER: adaptive reweight handles NaN, no strip ──
-        _dlog(f"  net_pnl_raw shape={net_pnl_raw.shape}, mean={net_pnl_raw.mean():.6f}, std={net_pnl_raw.std():.6f}")
-        n_nonzero = int(np.count_nonzero(net_pnl_raw))
-        _dlog(f"  nonzero={n_nonzero} / {len(net_pnl_raw)}")
-        if n_nonzero < 50:
-            self._rejection_reasons["len_valid_lt_50"] += 1
-            return 0.0
-        score = self._score_fn.score(net_pnl_raw, ctx)
-        if np.isnan(score) or np.isinf(score):
-            tickers = [self.long_candidates[i].variance_asset for i in individual.long_indices[:n_long]]
-            _dlog(f"❌ [SCORE-REJECT] tickers={tickers}, reason='invalid score ({score})'")
-            self._rejection_reasons["invalid_score"] += 1
-            return 0.0
-        # Tie-break: when quantile score saturates at top, use raw-based rank
-        # so tournament selection distinguishes between top-percentile baskets.
-        if score >= 0.99:
-            raw = self._score_fn.raw_metrics(net_pnl_raw, ctx)
-            lam = self._score_fn.weights
-            metric_map = {m.name: m for m in self._score_fn.metrics}
-            scalar = sum(
-                lam.get(name, 0.0) * raw[name] * (1.0 if metric_map[name].higher_is_better else -1.0)
-                for name in lam.active_names
-            )
-            return float(2.0 + math.tanh(scalar))   # always in (1.0, 3.0): beats any quantile score, monotone in scalar
-        return float(score)
     # ══════════════════════════════════════════════════════════════════════════
-    # WEIGHT ALLOCATION (original quality-biased bounded allocator)
+    # WEIGHT PROJECTION (single deterministic helper used by fitness + safety-net)
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _optimize_weights_for_basket(self, indices, candidates, quality_arr):
-        """
-        Generate quality-biased weights satisfying:
-          - sum(weights) == 1
-          - min_weight <= weight <= max_weight
-        Returns None when the selected basket is infeasible.
-        """
-        n = len(indices)
-        if n == 0:
-            return np.array([], dtype=np.float64)
-
-        min_w = np.array(
-            [candidates[i].min_weight for i in indices],
-            dtype=np.float64,
-        )
-        max_w = np.array(
-            [candidates[i].max_weight for i in indices],
-            dtype=np.float64,
-        )
-
-        # The selected basket cannot reach 100% within its individual bounds.
-        if (
-                min_w.sum() > 1.0 + 1e-10
-                or max_w.sum() < 1.0 - 1e-10
-        ):
-            return None
-
-        q = quality_arr[indices]
-
-        # Start from the midpoint of each permitted range.
-        w = (min_w + max_w) / 2.0
-
-        # Apply the existing quality bias.
-        q_range = float(q.max() - q.min())
-        if q_range > 1e-12:
-            q_norm = (q - q.mean()) / q_range
-            w = w + q_norm * (max_w - min_w) * 0.4
-
-        # Project onto sum=1 while respecting individual bounds.
-        w = self._project_to_simplex_bounded(w, min_w, max_w)
-
-        # Never allow an invalid basket into the GA.
-        if (
-                w is None
-                or len(w) != n
-                or not np.all(np.isfinite(w))
-                or not np.isclose(w.sum(), 1.0, atol=1e-8)
-                or np.any(w < min_w - 1e-8)
-                or np.any(w > max_w + 1e-8)
-        ):
-            return None
-
-        return w
     def _project_to_simplex_bounded(self, weights: np.ndarray, min_weights: np.ndarray, max_weights: np.ndarray) -> np.ndarray:
         """Project weights onto the bounded simplex {w: sum=1, min<=w<=max}.
         Uses iterative proportional fitting instead of clip-normalize cycles
@@ -1623,52 +1482,6 @@ class DispersionOptimizer:
         _dlog(f"  final w={w}, sum={w.sum():.6f}")
         return w
 
-    def _perturb_weights(self, weights: np.ndarray, min_weights: np.ndarray, max_weights: np.ndarray) -> np.ndarray:
-        """Add random noise to weights and project back onto bounded simplex.
-        Uses proportional redistribution instead of clip-normalize cycles
-        to preserve intermediate weight values.
-        """
-        range_w = max_weights - min_weights
-        base_sigma = 0.08  # stronger perturbation to explore mid-range
-        noise = self._np_rng.normal(0, base_sigma, size=len(weights)) * range_w
-        w = weights + noise
-        result = self._project_to_simplex_bounded(w, min_weights, max_weights)
-        return result
-
-    def _random_weights_for_basket(self, indices, candidates) -> Optional[np.ndarray]:
-        """Generate random weights within bounds, normalized to sum=1.
-        Unlike _optimize_weights_for_basket, this ignores quality scores
-        to give the GA freedom to explore the weight landscape.
-        Uses Dirichlet-based sampling projected onto bounded simplex to
-        produce genuinely intermediate weights (not just min/max)."""
-        n = len(indices)
-        if n == 0:
-            return np.array([], dtype=np.float64)
-        min_w = np.array([candidates[i].min_weight for i in indices], dtype=np.float64)
-        max_w = np.array([candidates[i].max_weight for i in indices], dtype=np.float64)
-        # Scale mins if infeasible
-        sum_min = float(min_w.sum())
-        if sum_min > 1.0 + 1e-12:
-            min_w = min_w / sum_min
-            max_w = np.maximum(max_w, min_w)
-        # Check feasibility: can the bounded simplex even exist?
-        sum_max = float(max_w.sum())
-        if sum_max < 1.0 - 1e-12:
-            _dlog(f"⚠️ [RANDOM-W] INFEASIBLE: sum_max={sum_max:.4f} < 1.0 for n={n} stocks! "
-                  f"min_w={min_w[:5]} max_w={max_w[:5]}")
-            # Fallback: equal weights
-            w = np.full(n, 1.0 / n)
-            return np.clip(w, min_w, max_w)
-        # Dirichlet sampling with alpha>1 biases toward center of simplex
-        # alpha=2 gives bell-shaped distribution away from boundaries
-        alpha = np.full(n, 2.0)
-        w = self._np_rng.dirichlet(alpha)
-        # Scale from unit simplex into [min_w, max_w] range
-        range_w = max_w - min_w
-        w = min_w + w * range_w * n  # scale up since dirichlet sums to 1
-        # Project onto bounded simplex (sum=1, within bounds)
-        w = self._project_to_simplex_bounded(w, min_w, max_w)
-        return w
     # ══════════════════════════════════════════════════════════════════════════
     # CONSTRAINTS
     # ══════════════════════════════════════════════════════════════════════════
@@ -1744,64 +1557,28 @@ class DispersionOptimizer:
         return lo, max(lo, hi)
 
     def _create_random_individual(self) -> Optional[_Individual]:
-        """Create individual with optimized weights (original logic)."""
+        """Create an individual — the genome is ONLY the stock subsets;
+        weights are derived deterministically inside _fitness."""
         max_attempts = 20
         _free_pool = [i for i in range(len(self.long_candidates)) if i not in self._forced_long]
-        for attempt in range(max_attempts):
+        for _ in range(max_attempts):
             _lo, _hi = self._long_size_bounds(len(_free_pool))
             n_long = self._rng.randint(_lo, _hi)
+            long_indices = self._pick_long_subset(_free_pool, n_long)
             if self._long_only:
-                long_indices = self._pick_long_subset(_free_pool, n_long)
-                # 50% quality-biased, 50% random weights for diversity
-                if self._rng.random() < 0.5:
-                    long_w = self._optimize_weights_for_basket(
-                        long_indices, self.long_candidates, self._quality_long)
-                else:
-                    long_w = self._random_weights_for_basket(long_indices, self.long_candidates)
-                if long_w is not None and len(long_w) > 0:
-                    ind = _Individual(long_indices, [], long_w, np.array([]))
-                    ind.fitness = self._fitness(ind)
-                    # DEBUG: Log first 10 candidates with full hit_ratio details
-                    if attempt < 10:
-                        tickers = [self.long_candidates[i].variance_asset for i in long_indices]
-                        _dlog(f"🔍 [CANDIDATE-{attempt}] tickers={tickers}")
-                        _dlog(f"  weights={ind.long_weights}, sum={ind.long_weights.sum():.4f}, "
-                              f"min={ind.long_weights.min():.4f}, max={ind.long_weights.max():.4f}")
-                        _dlog(f"  fitness={ind.fitness:.4f}")
-                        # ── VISIBLE DEBUG: print to stdout ──
-                    # Track rejection reasons
-                    if ind.fitness < 0:
-                        self._rejection_reasons["fitness<=0"] += 1
-                        continue
-                    return ind
-                else:
-                    self._rejection_reasons["no_weights"] += 1
+                short_indices = []
             else:
                 n_short = self._rng.randint(
                     self.c.min_stocks_short,
                     min(self.c.max_stocks_short, len(self.short_candidates))
                 )
-                long_indices = self._pick_long_subset(_free_pool, n_long)
                 short_indices = self._rng.sample(range(len(self.short_candidates)), n_short)
-                # 50% quality-biased, 50% random weights for diversity
-                if self._rng.random() < 0.5:
-                    long_w = self._optimize_weights_for_basket(
-                        long_indices, self.long_candidates, self._quality_long)
-                    short_w = self._optimize_weights_for_basket(
-                        short_indices, self.short_candidates, self._quality_short)
-                else:
-                    long_w = self._random_weights_for_basket(long_indices, self.long_candidates)
-                    short_w = self._random_weights_for_basket(short_indices, self.short_candidates)
-                if long_w is not None and short_w is not None and len(long_w) > 0:
-                    # Check strike constraint
-                    if self._is_strike_valid(long_indices, long_w, short_indices, short_w):
-                        ind = _Individual(long_indices, short_indices, long_w, short_w)
-                        ind.fitness = self._fitness(ind)
-                        return ind
-                    else:
-                        self._rejection_reasons["strike_invalid"] += 1
-                else:
-                    self._rejection_reasons["no_weights"] += 1
+            ind = _Individual(long_indices, short_indices)
+            ind.fitness = self._fitness(ind)
+            if ind.fitness <= 0.0:
+                self._rejection_reasons["fitness<=0"] += 1
+                continue
+            return ind
         return None
 
     def _tournament_select(self, population: List[_Individual]) -> _Individual:
@@ -1809,13 +1586,9 @@ class DispersionOptimizer:
         return max(tournament, key=lambda x: x.fitness)
 
     def _crossover(self, parent1: _Individual, parent2: _Individual) -> Optional[_Individual]:
-        """
-        Crossover: union of parent indices, then random subset.
-        IMPROVED: Inherit parent weights for shared stocks instead of recomputing from scratch.
-        """
-        # Union of parent long indices, then pick random subset.
-        # Forced names are always included (parents already contain them, but
-        # the random subset draw must never drop them).
+        """Crossover on SUBSETS only: union of parent indices, then a random
+        subset draw (forced names always kept).  Weights are not inherited —
+        they are a deterministic function of the child's subset (_fitness)."""
         l_union_free = list((set(parent1.long_indices) | set(parent2.long_indices))
                             - set(self._forced_long))
         _lo, _hi = self._long_size_bounds(len(l_union_free))
@@ -1839,91 +1612,15 @@ class DispersionOptimizer:
                 min(self.c.max_stocks_short, len(s_union))
             )
             short_indices = sorted(self._rng.sample(s_union, min(n_short, len(s_union))))
-        # ── INHERIT WEIGHTS from parents for shared stocks ──
-        # Build index→weight maps from both parents
-        p1_long_map = dict(zip(parent1.long_indices, parent1.long_weights))
-        p2_long_map = dict(zip(parent2.long_indices, parent2.long_weights))
-        long_min = np.array([self.long_candidates[i].min_weight for i in long_indices])
-        long_max = np.array([self.long_candidates[i].max_weight for i in long_indices])
-        # For each child stock: inherit from parent (avg if in both), else random
-        long_w = np.zeros(len(long_indices), dtype=np.float64)
-        for k, idx in enumerate(long_indices):
-            w1 = p1_long_map.get(idx)
-            w2 = p2_long_map.get(idx)
-            if w1 is not None and w2 is not None:
-                long_w[k] = (w1 + w2) / 2.0  # average of both parents
-            elif w1 is not None:
-                long_w[k] = w1
-            elif w2 is not None:
-                long_w[k] = w2
-            else:
-                long_w[k] = long_min[k] + self._rng.random() * (long_max[k] - long_min[k])
-        # Project onto bounded simplex (sum=1, within bounds) without clip-normalize collapse
-        long_w = self._project_to_simplex_bounded(long_w, long_min, long_max)
-        if len(long_w) == 0:
-            return None
-        # Perturb long weights — occasionally fully randomize for diversity
-        if self._rng.random() < 0.3:
-            long_w = self._random_weights_for_basket(long_indices, self.long_candidates)
-            if long_w is None:
-                return None
-        else:
-            long_w = self._perturb_weights(long_w, long_min, long_max)
-        if short_indices:
-            p1_short_map = dict(zip(parent1.short_indices, parent1.short_weights))
-            p2_short_map = dict(zip(parent2.short_indices, parent2.short_weights))
-            short_min = np.array([self.short_candidates[i].min_weight for i in short_indices])
-            short_max = np.array([self.short_candidates[i].max_weight for i in short_indices])
-            short_w = np.zeros(len(short_indices), dtype=np.float64)
-            for k, idx in enumerate(short_indices):
-                w1 = p1_short_map.get(idx)
-                w2 = p2_short_map.get(idx)
-                if w1 is not None and w2 is not None:
-                    short_w[k] = (w1 + w2) / 2.0
-                elif w1 is not None:
-                    short_w[k] = w1
-                elif w2 is not None:
-                    short_w[k] = w2
-                else:
-                    short_w[k] = short_min[k] + self._rng.random() * (short_max[k] - short_min[k])
-            short_w = self._project_to_simplex_bounded(short_w, short_min, short_max)
-            # Perturb short weights — occasionally fully randomize for diversity
-            if self._rng.random() < 0.3:
-                short_w = self._random_weights_for_basket(short_indices, self.short_candidates)
-                if short_w is None:
-                    return None
-            else:
-                short_w = self._perturb_weights(short_w, short_min, short_max)
-        else:
-            short_w = np.zeros(0, dtype=np.float64)
-        # Hard strike constraint
-        if not self._is_strike_valid(long_indices, long_w, short_indices, short_w):
-            return None
-        child = _Individual(long_indices, short_indices, long_w, short_w)
+        child = _Individual(long_indices, short_indices)
         child.fitness = self._fitness(child)
         return child
 
     def _mutate(self, individual: _Individual) -> Optional[_Individual]:
-        """Mutate: either swap 1 stock OR re-randomize weights only."""
+        """Mutation = stock swap.  Weight-only mutations no longer exist:
+        weights are a deterministic function of the subset (_fitness)."""
         long_indices = individual.long_indices.copy()
         short_indices = individual.short_indices.copy()
-        # 40% chance: weight-only mutation (keep same stocks, randomize weights)
-        if self._rng.random() < 0.4:
-            long_w = self._random_weights_for_basket(long_indices, self.long_candidates)
-            if long_w is None or len(long_w) == 0:
-                return None
-            if short_indices:
-                short_w = self._random_weights_for_basket(short_indices, self.short_candidates)
-                if short_w is None or len(short_w) == 0:
-                    return None
-            else:
-                short_w = np.zeros(0, dtype=np.float64)
-            if not self._is_strike_valid(long_indices, long_w, short_indices, short_w):
-                return None
-            mutated = _Individual(long_indices, short_indices, long_w, short_w)
-            mutated.fitness = self._fitness(mutated)
-            return mutated
-        # 60% chance: stock swap mutation (original behavior)
         if self._long_only or self._rng.random() < 0.5:
             # Swap one stock in long leg — forced names are never swapped out
             avail = sorted(set(range(len(self.long_candidates))) - set(long_indices))
@@ -1941,32 +1638,10 @@ class DispersionOptimizer:
         # Ensure uniqueness
         long_indices = list(dict.fromkeys(long_indices))
         short_indices = list(dict.fromkeys(short_indices))
-        # Recompute bounded weights
-        long_w = self._optimize_weights_for_basket(
-            long_indices, self.long_candidates, self._quality_long)
-        if long_w is None or len(long_w) == 0:
-            return None
-        # Perturb long weights
-        long_min = np.array([self.long_candidates[i].min_weight for i in long_indices])
-        long_max = np.array([self.long_candidates[i].max_weight for i in long_indices])
-        long_w = self._perturb_weights(long_w, long_min, long_max)
-        if short_indices:
-            short_w = self._optimize_weights_for_basket(
-                short_indices, self.short_candidates, self._quality_short)
-            if short_w is None or len(short_w) == 0:
-                return None
-            # Perturb short weights
-            short_min = np.array([self.short_candidates[i].min_weight for i in short_indices])
-            short_max = np.array([self.short_candidates[i].max_weight for i in short_indices])
-            short_w = self._perturb_weights(short_w, short_min, short_max)
-        else:
-            short_w = np.zeros(0, dtype=np.float64)
-        # Hard strike constraint
-        if not self._is_strike_valid(long_indices, long_w, short_indices, short_w):
-            return None
-        mutated = _Individual(long_indices, short_indices, long_w, short_w)
+        mutated = _Individual(long_indices, short_indices)
         mutated.fitness = self._fitness(mutated)
         return mutated
+
     # ══════════════════════════════════════════════════════════════════════════
     # UTILITIES
     # ══════════════════════════════════════════════════════════════════════════
@@ -2100,6 +1775,33 @@ class DispersionOptimizer:
                     print(f"[SAFETY-NET] bisection infeasible — kept GA weights", flush=True)
             except Exception as e:
                 print(f"[SAFETY-NET] failed: {e}", flush=True)
+        else:
+            # ═══ NON-EXACT CONFIGS: report the STEP score ═══
+            # The GA and the refinement rank on the tie-broken scale (which
+            # can exceed 1.0 when the quantile score saturates); the
+            # user-facing result must carry the step-quantile score of the
+            # delivered basket, exactly like the exact-path safety net does.
+            try:
+                long_pos_final = [self._col_pos[_candidate_key(self.long_candidates[i], is_xcorr)]
+                                  for i in best.long_indices
+                                  if _candidate_key(self.long_candidates[i], is_xcorr) in self._col_pos]
+                _sp_final = None
+                _sw_final = None
+                if not self._long_only and len(best.short_indices) > 0:
+                    _sids_f = [self._col_pos[_candidate_key(self.short_candidates[i], is_xcorr)]
+                               for i in best.short_indices
+                               if _candidate_key(self.short_candidates[i], is_xcorr) in self._col_pos]
+                    if _sids_f:
+                        _sp_final = _sids_f
+                        _sw_final = best.short_weights
+                _final_pnl = self._adaptive_net_pnl(long_pos_final, best.long_weights,
+                                                    _sp_final, _sw_final)
+                _fin_ws = (self._net_strike(best.long_indices, best.long_weights,
+                                            best.short_indices, best.short_weights)
+                           if self._ws_active() else None)
+                best.fitness = self._score_fn.score(_final_pnl, self._make_ctx(_fin_ws))
+            except Exception as e:
+                self.log("WARN", f"[FINAL-SCORE] step rescore failed: {e}")
 
         # ═══ POST-SMOOTHING — DISABLED (smooth_weights always False from _api.py) ═══
         # Interactive smoothing is handled in the UI via _smooth_state, not here.
@@ -2290,7 +1992,7 @@ class DispersionOptimizer:
 
         is_xcorr = self.is_cross_corridor
 
-        # ── Use EXACTLY self._ts_mat — ALL columns, same object as _calculate_fitness_v2 ──
+        # ── Use EXACTLY self._ts_mat — ALL columns, same object as _fitness ──
         P = self._ts_mat.copy()
         n_stocks = P.shape[1]  # ALL columns = full candidate universe
 
@@ -2298,13 +2000,13 @@ class DispersionOptimizer:
             print("[MILP] No valid candidates.", flush=True)
             return None
 
-        # Apply same cap/floor as GA evaluation (line ~1183 of _calculate_fitness_v2)
+        # Apply same cap/floor as GA evaluation in _fitness
         if self.global_cap < 9999998 or self.global_floor > -9999998:
             P = np.clip(P, self.global_floor, self.global_cap)
 
         # DO NOT drop all-zero rows — GA keeps them (zeros count as non-positive days
         # in hit_ratio, and removing them changes the denominator for all metrics).
-        # The GA's _calculate_fitness_v2 only strips zeros AFTER computing net_pnl
+        # The GA's _fitness only strips zeros AFTER computing net_pnl
         # for a specific basket selection, not at the matrix level.
         n_days = P.shape[0]
 
