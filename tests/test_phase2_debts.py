@@ -234,3 +234,53 @@ def test_n_reference_samples_changes_reference_and_signature():
 def test_n_reference_samples_too_small_raises():
     with pytest.raises(ValueError, match="n_reference_samples"):
         _quick_opt(n_ref=50)
+
+
+# ---------------------------------------------------------------------------
+# _calculate_stock_quality: decoupled from legacy ScoreWeights
+# ---------------------------------------------------------------------------
+
+
+def _opt_for_quality(weights):
+    names = [f"Q{i}" for i in range(4)]
+    legs = _mk_legs(names)
+    # Give one leg precomputed backtest metrics (production shape)
+    legs[0].metrics = {"last_value": 2.0, "avg_5y": 0.05, "avg_3y": 0.06,
+                       "hit_ratio": 80.0, "max_drawdown": -0.30}
+    pnl = _mk_pnl(4, seed=29)
+    return DispersionOptimizer(
+        long_candidates=legs,
+        short_candidates=[],
+        pnl_matrix=pnl,
+        column_map={n: i for i, n in enumerate(names)},
+        constraints=_cons(),
+        missing_data_policy=MissingDataPolicy.FILL_ZERO,
+        metric_weights=MetricWeights(weights),
+        seed=0,
+    )
+
+
+def test_quality_neutral_without_leg_metrics():
+    opt = _opt_for_quality({"mean_payoff": 1.0})
+    # legs[1..3] have no metrics dict -> neutral bias
+    assert opt._quality_long[1] == 0.0
+    assert opt._quality_long[2] == 0.0
+
+
+def test_quality_follows_active_metric_weights():
+    q_carry = _opt_for_quality({"last_carry": 1.0})._quality_long[0]
+    q_hit = _opt_for_quality({"hit_ratio": 1.0})._quality_long[0]
+    q_risk = _opt_for_quality({"min_payoff": 1.0})._quality_long[0]
+    # last_value=2.0/3 vs hit=(0.8-0.5)*2 -> both positive but different
+    assert q_carry == pytest.approx(2.0 / 3.0)
+    assert q_hit == pytest.approx(0.6)
+    # pure risk objective penalizes the drawdown proxy -> negative bias
+    assert q_risk == pytest.approx(-0.30 / 1.5)
+    # sharpe has no per-leg proxy -> neutral
+    assert _opt_for_quality({"sharpe_payoff": 1.0})._quality_long[0] == 0.0
+
+
+def test_legacy_score_weights_param_removed():
+    import inspect
+    sig = inspect.signature(DispersionOptimizer.__init__)
+    assert "score_weights" not in sig.parameters

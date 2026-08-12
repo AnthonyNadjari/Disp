@@ -9,8 +9,10 @@ The optimizer uses fillna(0) on the P&L matrix (penalizes missing data).
 The backtester separately handles adaptive reweight for reported results.
 Usage:
     from functions.dispersion._optimizer import DispersionOptimizer
-    optimizer = DispersionOptimizer(config, constraints, score_weights)
-    result = optimizer.run(pnl_matrix)
+    optimizer = DispersionOptimizer(long_candidates, short_candidates,
+                                    pnl_matrix, column_map, constraints,
+                                    metric_weights=MetricWeights({...}))
+    result = optimizer.run()
 """
 from __future__ import annotations
 import itertools
@@ -73,7 +75,6 @@ from functions.dispersion.models import (
     OptimizationConstraints,
     OptimizationResult,
     ProductType,
-    ScoreWeights,
     SwapConfig,
 )
 from functions.dispersion._backtester import (
@@ -181,7 +182,6 @@ class DispersionOptimizer:
         pnl_matrix: np.ndarray,
         column_map: Dict[str, int],
         constraints: Optional[OptimizationConstraints] = None,
-        score_weights: Optional[ScoreWeights] = None,
         logger: Optional[Callable[[str, str], None]] = None,
         missing_data_policy=None,
         adj_divs: bool = False,
@@ -243,9 +243,6 @@ class DispersionOptimizer:
         self.seed = int(seed)
         self._rng = random.Random(self.seed)
         self._np_rng = np.random.default_rng(self.seed)
-        # Normalize score weights (original behavior)
-        sw = score_weights or ScoreWeights()
-        self._score_weights_arr = sw.as_array()  # [last_value, avg_5y, avg_3y, max_drawdown, hit_ratio]
         # Store original P&L matrix (with NaN) for adaptive reweighting in fitness
         self._orig_ts_mat = pnl_matrix.astype(np.float64).copy()
         # Also store filled version for backward compatibility (e.g., GA initialization)
@@ -308,24 +305,38 @@ class DispersionOptimizer:
     # ══════════════════════════════════════════════════════════════════════════
 
     def _calculate_stock_quality(self, leg: DispersionLeg) -> float:
-        """Per-stock quality metric for weight allocation bias (original Gaia_PP logic)."""
+        """Per-stock quality bias for the initial weight allocator.
+
+        Built from the ACTIVE metric weights of THIS run (the legacy
+        ScoreWeights path is gone): each v2 metric maps to its per-leg
+        backtest proxy in ``leg.metrics`` with the historical linear
+        scalings.  Metrics without a per-leg proxy (sharpe_payoff,
+        weighted_strike) contribute nothing.  Neutral (0.0) when the leg
+        carries no precomputed metrics — the allocator then starts from
+        range midpoints, exactly as before.
+        """
         m = leg.metrics if leg.metrics else {}
-        sw = self._score_weights_arr  # [last_value, avg_5y, avg_3y, max_drawdown, hit_ratio]
-        # Apply same linear scaling as _calculate_fitness for consistent weighting
+        if not m or self._metric_weights is None:
+            return 0.0
+        w = self._metric_weights
+        # Historical linear scalings (unchanged)
         last_val = m.get('last_value', 0.0) / 3.0
         avg_5y = m.get('avg_5y', 0.0) / 0.06
         avg_3y = m.get('avg_3y', 0.0) / 0.08
         # hit_ratio from backtest is in [0, 100] range → center to [-1, 1]
         hit_ratio = (m.get('hit_ratio', 50.0) / 100.0 - 0.5) * 2.0
-        # max_drawdown from backtest is negative (e.g., -0.15) — use absolute value, scale
+        # max_drawdown from backtest is negative (e.g., -0.15) — magnitude, scaled
         max_dd = abs(m.get('max_drawdown', 0.0)) / 1.5
-        return (
-            last_val * sw[0] +
-            avg_5y * sw[1] +
-            avg_3y * sw[2] +
-            hit_ratio * sw[4] -
-            max_dd * sw[3]
+        quality = (
+            w.get('last_carry', 0.0) * last_val
+            + w.get('mean_payoff', 0.0) * 0.5 * (avg_5y + avg_3y)
+            + w.get('hit_ratio', 0.0) * hit_ratio
         )
+        # Risk-side objectives share the drawdown proxy as a penalty
+        risk_w = (w.get('min_payoff', 0.0) + w.get('max_drawdown', 0.0)
+                  + w.get('cvar_5', 0.0))
+        quality -= risk_w * max_dd
+        return quality
 
     def _print_candidate_table(self):
         """Print a visible table of long/short candidates with PnL data quality."""
