@@ -126,3 +126,57 @@ def test_multi_empty_configs_raises(api_offline_counted):
     cfg = DispersionConfig(missing_data_policy=MissingDataPolicy.FILL_ZERO)
     with pytest.raises(ValueError, match="configs"):
         api.optimize_multi(long_df, cfg, _cons(), configs=[])
+
+
+# ---------------------------------------------------------------------------
+# Phase 4d — bootstrap robustness diagnostic
+# ---------------------------------------------------------------------------
+
+
+def test_robustness_check_attaches_deterministic_diagnostic(api_offline_counted):
+    tickers, pnl, col_map, long_df = _universe()
+    api, _ = api_offline_counted(pnl, col_map, tickers)
+    cfg = DispersionConfig(missing_data_policy=MissingDataPolicy.FILL_ZERO)
+
+    r1 = api.optimize(long_df, cfg, _cons(), score_weights={"mean_payoff": 0.6, "hit_ratio": 0.4},
+                      seed=0, robustness_check=True)
+    rb = r1.robustness
+    assert rb is not None
+    assert rb["n_draws"] == 300
+    assert 0.0 <= rb["top1_freq"] <= rb["top3_freq"] <= 1.0
+    assert rb["n_challengers"] >= 1
+    assert set(rb["winner_raw_ci"]) == {"mean_payoff", "hit_ratio"}
+    for ci in rb["winner_raw_ci"].values():
+        assert ci["lo"] <= ci["mean"] <= ci["hi"]
+
+    # Deterministic: identical re-run reproduces the diagnostic exactly
+    r2 = api.optimize(long_df, cfg, _cons(), score_weights={"mean_payoff": 0.6, "hit_ratio": 0.4},
+                      seed=0, robustness_check=True)
+    assert r2.robustness == rb
+
+    # Default OFF
+    r3 = api.optimize(long_df, cfg, _cons(), score_weights={"mean_payoff": 0.6, "hit_ratio": 0.4},
+                      seed=0)
+    assert r3.robustness is None
+
+
+def test_robustness_dominant_winner_is_stable(api_offline_counted):
+    """A clearly dominant name should keep the winner on top in most draws."""
+    rng = np.random.default_rng(60)
+    tickers = [f"D{i}" for i in range(6)]
+    pnl = np.column_stack([rng.normal(0.1, 1.0, N_DAYS) for _ in range(5)]
+                          + [rng.normal(3.0, 0.3, N_DAYS)])  # D5 dominates
+    col_map = {t: i for i, t in enumerate(tickers)}
+    long_df = pd.DataFrame({
+        "Variance Asset": tickers,
+        "Strike Mono Var Swap (%)": 12.0,
+        "Min Weight": 5.0,
+        "Max Weight": 60.0,
+    })
+    api, _ = api_offline_counted(pnl, col_map, tickers)
+    cfg = DispersionConfig(missing_data_policy=MissingDataPolicy.FILL_ZERO)
+    res = api.optimize(long_df, cfg, _cons(), score_weights={"mean_payoff": 1.0},
+                       seed=0, robustness_check=True)
+    assert "D5" in [k for k, _ in res.long_basket]
+    assert res.robustness["top1_freq"] >= 0.5, (
+        f"dominant winner unstable: top1_freq={res.robustness['top1_freq']:.2f}")

@@ -809,6 +809,14 @@ class DispersionOptimizer:
         tickers = [self.long_candidates[i].variance_asset for i in best_individual.long_indices]
         self.log("SUCCESS", f"Score: {best_score:.4f} | {generations_run + 1} gens | {elapsed:.1f}s (GA={elapsed_ga:.1f}s)")
         self._last_best = best_individual
+        # Snapshot the final population (best-first) — challenger source for
+        # the bootstrap diagnostic when the refinement pool lacks distinct subsets
+        self._final_population = [
+            (list(ind.long_indices), np.array(ind.long_weights, dtype=np.float64),
+             list(ind.short_indices), np.array(ind.short_weights, dtype=np.float64),
+             float(ind.fitness))
+            for ind in sorted(population, key=lambda x: x.fitness, reverse=True)[:60]
+        ]
         return self._to_result(best_individual, generations_run + 1)
 
     def _refine_top_individuals(
@@ -843,6 +851,9 @@ class DispersionOptimizer:
         n_infeasible = 0
         n_no_improve = 0
         n_improved = 0
+        # Challenger pool for the bootstrap diagnostic (subset, solved weights,
+        # short side, step score) — every feasible refinement candidate lands here
+        self._refine_candidates: List[Tuple[list, np.ndarray, list, np.ndarray, float]] = []
 
         # CHANGE 8b: Determine acceptance mode
         active_set = set(active)
@@ -935,6 +946,10 @@ class DispersionOptimizer:
                 continue
             _cand_ctx = _ctx_for(ind, result.weights, solve_extra=result.extra)
             score = self._score_fn.score(net_pnl, _cand_ctx)
+            self._refine_candidates.append((
+                list(ind.long_indices[:n_long]), np.array(result.weights, dtype=np.float64),
+                list(ind.short_indices), np.array(ind.short_weights, dtype=np.float64),
+                float(score)))
 
             # CHANGE 8b: Acceptance test based on config type
             if is_single_metric and not has_hit_ratio:
@@ -2403,6 +2418,113 @@ class DispersionOptimizer:
     def get_unsmoothed_basket(self) -> list:
         """Return basket with pre-smooth weights, or None."""
         return self._last_unsmoothed_basket
+
+    # ── Bootstrap robustness diagnostic (called externally if robustness_check=True) ──
+
+    def bootstrap_robustness(self, n_draws: int = 300, top_k: int = 10,
+                             seed: Optional[int] = None) -> Optional[Dict]:
+        """Day-resampling robustness of the delivered basket.
+
+        Resamples the trading days with replacement ``n_draws`` times and, on
+        each draw, re-scores the winner against its ``top_k`` best DISTINCT
+        refinement challengers (each at its own solved weights, against the
+        run's fixed reference).  Returns::
+
+            {"n_draws", "n_challengers",
+             "top1_freq", "top3_freq",          # winner's rank frequencies
+             "winner_raw_ci": {metric: {"lo": p2.5, "mean", "hi": p97.5}}}
+
+        Deterministic: the resampling RNG derives from the run seed.
+        Returns None when no refinement pool is available (empty result).
+        """
+        best = getattr(self, "_last_best", None)
+        if best is None or self._score_fn is None or not self._score_fn.is_fitted:
+            return None
+
+        def _contender_net_and_ctx(long_idx, long_w, short_idx, short_w):
+            ids = [_candidate_key(self.long_candidates[i], self.is_cross_corridor)
+                   for i in long_idx]
+            pos = np.array([self._col_pos[c] for c in ids if c in self._col_pos])
+            if len(pos) != len(long_idx):
+                return None
+            spos = None
+            sw = None
+            if short_idx:
+                sids = [_candidate_key(self.short_candidates[i], self.is_cross_corridor)
+                        for i in short_idx]
+                sp = np.array([self._col_pos[c] for c in sids if c in self._col_pos])
+                if len(sp):
+                    spos = sp
+                    sw = short_w
+            net = self._adaptive_net_pnl(pos, long_w, spos, sw)
+            ws = (self._net_strike(long_idx, long_w, short_idx, short_w)
+                  if self._ws_active() else None)
+            ac, ar = self._axe_ctx_values(long_idx, long_w, None)
+            return net, self._make_ctx(ws, ac, ar)
+
+        winner = _contender_net_and_ctx(best.long_indices, best.long_weights,
+                                        best.short_indices, best.short_weights)
+        if winner is None:
+            return None
+        winner_key = tuple(sorted(best.long_indices))
+
+        # Top-k distinct challengers: refinement pool first (solver-refined
+        # weights), then the final population (a converged GA's refinement
+        # pool can collapse to the winner's subset alone)
+        challengers = []
+        seen = {winner_key}
+        _pool = (sorted(getattr(self, "_refine_candidates", []), key=lambda t: -t[4])
+                 + list(getattr(self, "_final_population", [])))
+        for long_idx, long_w, short_idx, short_w, sc in _pool:
+            key = tuple(sorted(long_idx))
+            if key in seen:
+                continue
+            seen.add(key)
+            out = _contender_net_and_ctx(long_idx, long_w, short_idx, short_w)
+            if out is not None:
+                challengers.append(out)
+            if len(challengers) >= top_k:
+                break
+
+        contenders = [winner] + challengers
+        rng = np.random.default_rng([self.seed, 0xB007])
+        n_rows = len(winner[0])
+        active = list(self._score_fn.weights.active_names)
+        top1 = 0
+        top3 = 0
+        raw_draws: Dict[str, List[float]] = {m: [] for m in active}
+        for _ in range(int(n_draws)):
+            idx = rng.integers(0, n_rows, n_rows)
+            scores = []
+            for net, ctx in contenders:
+                fit = self._fitness_from_net(net[idx], ctx)
+                scores.append(-np.inf if fit is None else fit)
+            rank = 1 + sum(1 for s in scores[1:] if s > scores[0])
+            if rank == 1:
+                top1 += 1
+            if rank <= 3:
+                top3 += 1
+            raw = self._score_fn.raw_metrics(winner[0][idx], winner[1])
+            for m in active:
+                v = raw.get(m)
+                if v is not None and np.isfinite(v):
+                    raw_draws[m].append(float(v))
+
+        ci = {}
+        for m in active:
+            vals = np.asarray(raw_draws[m], dtype=np.float64)
+            if vals.size == 0:
+                continue
+            ci[m] = {"lo": float(np.percentile(vals, 2.5)),
+                     "mean": float(vals.mean()),
+                     "hi": float(np.percentile(vals, 97.5))}
+        return {
+            "n_draws": int(n_draws),
+            "n_challengers": len(challengers),
+            "top1_freq": top1 / float(n_draws),
+            "top3_freq": top3 / float(n_draws),
+            "winner_raw_ci": ci,
+        }
 
     # ── MILP benchmark (called externally if run_milp=True) ──
 

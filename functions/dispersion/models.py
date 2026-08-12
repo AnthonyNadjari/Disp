@@ -687,6 +687,8 @@ class OptimizationResult:
     vega_basket: list = None                 # [(ticker, v_i absolute), ...] aligned with long_basket
     axe_cleaned: Optional[float] = None      # criterion A of the delivered basket (fraction of the axe book)
     axe_recycled: Optional[float] = None     # criterion B of the delivered basket (fraction of the package)
+    # ── Bootstrap robustness diagnostic (None unless robustness_check=True) ──
+    robustness: Optional[Dict] = None        # {n_draws, n_challengers, top1_freq, top3_freq, winner_raw_ci}
 
     @property
     def is_long_only(self) -> bool:

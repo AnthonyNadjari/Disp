@@ -266,6 +266,21 @@ def _render_optimization_result(result, is_cross, debug_info=None):
                 st.dataframe(pd.DataFrame(
                     [{"Stock": t, "Vega": v, "Weight %": v / result.total_vega * 100}
                      for t, v in result.vega_basket]), use_container_width=True)
+    # 🧪 Bootstrap robustness diagnostic (only present when requested)
+    _rb = getattr(result, 'robustness', None)
+    if _rb:
+        with st.expander("🧪 Robustness (bootstrap)", expanded=False):
+            _rb_c1, _rb_c2, _rb_c3 = st.columns(3)
+            _rb_c1.metric("Winner stays #1", f"{_rb['top1_freq'] * 100:.0f}%")
+            _rb_c2.metric("Winner in top 3", f"{_rb['top3_freq'] * 100:.0f}%")
+            _rb_c3.metric("Challengers", f"{_rb['n_challengers']}")
+            st.caption(f"{_rb['n_draws']} day-resampled draws (with replacement), "
+                       f"winner vs its best distinct refinement challengers.")
+            if _rb.get('winner_raw_ci'):
+                st.dataframe(pd.DataFrame([
+                    {"Metric": m, "2.5%": c["lo"], "Mean": c["mean"], "97.5%": c["hi"]}
+                    for m, c in _rb['winner_raw_ci'].items()
+                ]), use_container_width=True)
     # Scoring signature — reproducibility fingerprint of the run
     if getattr(result, 'scoring_signature', None):
         with st.expander("🧾 Scoring signature (debug)", expanded=False):
@@ -866,6 +881,11 @@ with tab1:
             else:
                 vega_v_min = None
                 vega_v_max = None
+            robustness_check = st.checkbox(
+                "🧪 Robustness check (bootstrap)", value=False,
+                help="Resample the days 300× with replacement and re-rank the winner "
+                     "against its 10 best refinement challengers: how often does it "
+                     "stay #1? Adds a few seconds.")
             run_milp = st.checkbox("🔬 Certify vs exact optimum (MILP, slow)", value=False)
             st.session_state['_run_milp'] = run_milp
             bisect_in_ga = st.checkbox("🎯 Exact solver in GA (slow, certification runs)", value=False)
@@ -1080,6 +1100,7 @@ with tab1:
                                         st.session_state.get('_bucket_df')),
                                     vega=({"v_min": float(vega_v_min), "v_max": float(vega_v_max)}
                                           if vega_on else None),
+                                    robustness_check=robustness_check,
                                 )
                             except Exception as _e:
                                 _opt_error = _e

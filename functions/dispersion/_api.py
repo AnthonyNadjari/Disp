@@ -772,6 +772,7 @@ def optimize(
     n_reference_samples: int = None,
     bucket_constraints: List = None,
     vega=None,
+    robustness_check: bool = False,
 ) -> OptimizationResult:
     """
     Find optimal basket via genetic algorithm.
@@ -832,6 +833,11 @@ def optimize(
         'axe_package_recycled' in score_weights) and the hard caps
         v_i <= cap.  Basket P&L stays Σ(v_i·pnl_i)/V — the weight series —
         so scores/backtests remain comparable with the toggle OFF.
+    robustness_check : bool
+        When True, run the day-resampling bootstrap diagnostic (300 draws
+        with replacement; winner vs its 10 best refinement challengers) and
+        attach it as ``result.robustness`` — {top1_freq, top3_freq,
+        winner_raw_ci}.  Deterministic (derived from the run seed).
 
     Returns
     -------
@@ -967,6 +973,10 @@ def optimize(
     )
     opt_result = optimizer.run()
     opt_result._final_raw_min = getattr(optimizer, '_final_raw_min', None)
+
+    # ── Optional: bootstrap robustness diagnostic ──
+    if robustness_check:
+        opt_result.robustness = optimizer.bootstrap_robustness()
 
     # ── Optional: persist a replayable run bundle (offline reproduction) ──
     if save_bundle_path:
