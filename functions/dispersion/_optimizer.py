@@ -13,6 +13,7 @@ Usage:
     result = optimizer.run(pnl_matrix)
 """
 from __future__ import annotations
+import itertools
 import math
 import random
 import time
@@ -521,7 +522,9 @@ class DispersionOptimizer:
         # least a 1-swap local optimum of the true bilevel objective.
         if self._use_new_scoring and self._weight_solver is not None and self._weight_solver.has_exact_path():
             pre_ls = best_score
-            best_individual, best_score = self._exact_swap_local_search(best_individual, best_score)
+            _ls_pool = sorted(population, key=lambda x: x.fitness, reverse=True)[:30]
+            best_individual, best_score = self._exact_swap_local_search(
+                best_individual, best_score, start_pool=_ls_pool)
             if best_score > pre_ls + 1e-12:
                 self.log("INFO", f"Local search: {best_score:.4f} (was {pre_ls:.4f})")
         elapsed = time.time() - start_time
@@ -701,13 +704,22 @@ class DispersionOptimizer:
     # ══════════════════════════════════════════════════════════════════════════
 
     def _exact_swap_local_search(self, best: "_Individual", best_score: float,
-                                 time_budget: Optional[float] = None) -> tuple:
-        """Best-improvement hill-climb on single-stock swaps of the long leg.
+                                 time_budget: Optional[float] = None,
+                                 start_pool: Optional[list] = None) -> tuple:
+        """Best-improvement hill-climb on stock swaps of the long leg.
 
         Only runs for exact-path configs (all-linear, min_payoff-only,
         concave blend), where the inner solve is an exact LP: acceptance
         compares the scalarised RAW objective (currency units, sign-adjusted)
         so it cannot be fooled by quantile-score saturation at the top.
+        Robustness against GA basin misses (homogeneous universes):
+          1. multi-start — descents also start from the best DISTINCT
+             subsets of ``start_pool`` (refinement elite), not just the
+             incumbent;
+          2. 2-swap escape — when the 1-swap descent stalls with budget
+             left, the pair-swap neighbourhood of the best-known subset is
+             scanned in deterministic order; any improvement restarts the
+             1-swap descent.
         Forced names are never swapped out; the short leg is kept fixed
         (mirrors _refine_top_individuals).  Wall-time bounded.
         """
@@ -772,45 +784,108 @@ class DispersionOptimizer:
         if inc is None:
             return best, best_score
         inc_scalar, inc_score, inc_w = inc
-        cur_indices = list(best.long_indices)
         forced = set(self._forced_long)
         n_evals = 0
         improved_any = False
 
-        for _sweep in range(6):
-            if time.time() - t0 > time_budget:
-                break
-            best_move = None  # (scalar, score, weights, indices)
-            outside = [j for j in range(len(self.long_candidates)) if j not in cur_indices]
-            for p in range(len(cur_indices)):
-                if cur_indices[p] in forced:
-                    continue
-                for j in outside:
+        def _descend_1swap(indices, scalar, score, w):
+            """Best-improvement 1-swap descent to a local optimum (or budget)."""
+            nonlocal n_evals
+            for _sweep in range(6):
+                if time.time() - t0 > time_budget:
+                    break
+                best_move = None  # (scalar, score, weights, indices)
+                outside = [j for j in range(len(self.long_candidates)) if j not in indices]
+                for p in range(len(indices)):
+                    if indices[p] in forced:
+                        continue
+                    for j in outside:
+                        if time.time() - t0 > time_budget:
+                            break
+                        trial = list(indices)
+                        trial[p] = j
+                        out = _eval_subset(sorted(trial))
+                        n_evals += 1
+                        if out is None:
+                            continue
+                        sc, st, ww = out
+                        if sc > scalar + 1e-12 and (best_move is None or sc > best_move[0]):
+                            best_move = (sc, st, ww, sorted(trial))
+                if best_move is None:
+                    break
+                scalar, score, w, indices = best_move
+            return scalar, score, w, list(indices)
+
+        def _best_2swap(indices, scalar):
+            """Deterministic scan of the pair-swap neighbourhood of ``indices``.
+            Returns the best improving (scalar, score, weights, indices) found
+            before the time budget runs out, or None."""
+            nonlocal n_evals
+            free_pos = [p for p in range(len(indices)) if indices[p] not in forced]
+            outside = [j for j in range(len(self.long_candidates)) if j not in indices]
+            best_move = None
+            for p, q in itertools.combinations(free_pos, 2):
+                for j1, j2 in itertools.combinations(outside, 2):
                     if time.time() - t0 > time_budget:
-                        break
-                    trial = list(cur_indices)
-                    trial[p] = j
+                        return best_move
+                    trial = list(indices)
+                    trial[p] = j1
+                    trial[q] = j2
                     out = _eval_subset(sorted(trial))
                     n_evals += 1
                     if out is None:
                         continue
-                    sc, st, w = out
-                    if sc > inc_scalar + 1e-12 and (best_move is None or sc > best_move[0]):
-                        best_move = (sc, st, w, sorted(trial))
-                else:
-                    continue  # inner loop not broken by time
-            if best_move is None:
-                break
-            inc_scalar, inc_score, inc_w, cur_indices = best_move
-            improved_any = True
+                    sc, st, ww = out
+                    if sc > scalar + 1e-12 and (best_move is None or sc > best_move[0]):
+                        best_move = (sc, st, ww, sorted(trial))
+            return best_move
 
-        _dlog(f"[LOCAL-SEARCH] evals={n_evals} improved={improved_any} scalar={inc_scalar:.6f}")
+        # Best-known solution starts at the incumbent's exact evaluation
+        best_scalar, best_step, best_w = inc_scalar, inc_score, inc_w
+        best_ind_list = list(best.long_indices)
+
+        # Multi-start queue: incumbent first, then distinct elite subsets
+        queue = [(inc_scalar, inc_score, inc_w, list(best.long_indices))]
+        seen = {tuple(sorted(best.long_indices))}
+        for cand in (start_pool or []):
+            if len(queue) >= 4:  # incumbent + up to 3 elite seeds
+                break
+            key = tuple(sorted(cand.long_indices))
+            if key in seen:
+                continue
+            seen.add(key)
+            out = _eval_subset(list(key))
+            n_evals += 1
+            if out is not None:
+                queue.append((out[0], out[1], out[2], list(key)))
+
+        for scalar, score, w, ind_list in queue:
+            if time.time() - t0 > time_budget:
+                break
+            r_scalar, r_score, r_w, r_ind = _descend_1swap(ind_list, scalar, score, w)
+            if r_scalar > best_scalar + 1e-12:
+                best_scalar, best_step, best_w, best_ind_list = r_scalar, r_score, r_w, r_ind
+                improved_any = True
+
+        # 2-swap escape loop: escape, re-descend, until stalled or budget out
+        while time.time() - t0 <= time_budget:
+            move = _best_2swap(best_ind_list, best_scalar)
+            if move is None:
+                break
+            best_scalar, best_step, best_w, best_ind_list = move
+            improved_any = True
+            r_scalar, r_score, r_w, r_ind = _descend_1swap(
+                best_ind_list, best_scalar, best_step, best_w)
+            if r_scalar > best_scalar + 1e-12:
+                best_scalar, best_step, best_w, best_ind_list = r_scalar, r_score, r_w, r_ind
+
+        _dlog(f"[LOCAL-SEARCH] evals={n_evals} improved={improved_any} scalar={best_scalar:.6f}")
         if improved_any:
             best = self._copy(best)
-            best.long_indices = list(cur_indices)
-            best.long_weights = inc_w
-            best.fitness = inc_score
-            return best, max(best_score, inc_score)
+            best.long_indices = list(best_ind_list)
+            best.long_weights = best_w
+            best.fitness = best_step
+            return best, max(best_score, best_step)
         # No subset move — still adopt the exact weights for the incumbent subset
         if inc_score >= best_score - 1e-12:
             best.long_weights = inc_w
