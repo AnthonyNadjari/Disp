@@ -1108,6 +1108,7 @@ with tab1:
                 from functions.dispersion._backtester import DispersionBacktester
                 from functions.dispersion.models import MissingDataPolicy
                 from functions.dispersion.scoring.weight_solver import adaptive_pnl as _adaptive_pnl_fn
+                from functions.dispersion._optimizer import _candidate_key as _cand_key_fn
                 # Source w_star from pure optimum (unsmoothed_basket is None when pipeline smoothing=off → use long_basket)
                 _unsm = _last_run.unsmoothed_basket if _last_run.unsmoothed_basket else _last_run.long_basket
                 _w_star = _np.array([w for _, w in _unsm], dtype=_np.float64)
@@ -1131,6 +1132,26 @@ with tab1:
                         )
                         st.session_state.pop('gaia_smooth_result', None)
                     else:
+                        # Per-stock strikes (solver convention: mono − cross in
+                        # XC mode) and bounds, so the smoothed weights honour
+                        # the strike cap, the weighted_strike objective (when
+                        # active) and each name's Min/Max Weight inputs.
+                        _legs_by_key = {_cand_key_fn(_lg, _is_xc): _lg
+                                        for _lg in _ss.get("long_candidates", [])}
+                        _legs_sel = [_legs_by_key.get(k) for k in _basket_keys]
+                        if any(_lg is None for _lg in _legs_sel):
+                            _strikes_vec = None
+                            _bounds_vec = None
+                        else:
+                            _strikes_vec = _np.array([
+                                (l.strike_mono_var_swap - (l.strike_cross_corridor
+                                 if l.strike_cross_corridor is not None
+                                 else l.strike_mono_var_swap))
+                                if _is_xc else l.strike_mono_var_swap
+                                for l in _legs_sel], dtype=_np.float64)
+                            _bounds_vec = _np.array(
+                                [[l.min_weight, l.max_weight] for l in _legs_sel],
+                                dtype=_np.float64)
                         # Call smooth_weights — passes nan_to_num'd matrix (same as in-pipeline)
                         _w_smooth = _ws.smooth_weights(
                             w_star=_w_star.copy(),
@@ -1138,6 +1159,8 @@ with tab1:
                             stock_indices=_stock_indices,
                             active_mask=_valid_mask,
                             eps_min=_ps_eps,
+                            per_stock_bounds=_bounds_vec,
+                            strikes=_strikes_vec,
                         )
                         # Evaluate both PnL series via shared canonical function
                         _sm_pnl = _adaptive_pnl_fn(_ts_mat, _stock_indices, _w_smooth, _valid_mask)

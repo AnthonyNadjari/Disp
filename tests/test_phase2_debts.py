@@ -113,3 +113,79 @@ def test_milp_never_selects_non_candidate_columns():
         "MILP certificate selected a column the GA cannot pick "
         "(excluded/filtered name)")
     assert abs(milp["weights"][col_map["M5"]]) <= 1e-9
+
+
+# ---------------------------------------------------------------------------
+# smooth_weights: metric-faithful blend (ws-aware + optional metrics)
+# ---------------------------------------------------------------------------
+
+
+def _fitted_solver(weights_dict, n=4, seed=3, with_extras=False):
+    from functions.dispersion.scoring import (
+        MetricWeights, ScoreContext, WeightConstraints, make_default_score_function)
+    from functions.dispersion.scoring.weight_solver import WeightSolver
+    rng = np.random.default_rng(seed)
+    ctx = ScoreContext(n_days=N_DAYS)
+    samples = [rng.normal(0.8, 1.2, N_DAYS) for _ in range(80)]
+    extras = ([{"weighted_strike": float(0.08 + 0.10 * rng.random())} for _ in samples]
+              if with_extras else None)
+    sf = make_default_score_function(weights=MetricWeights(weights_dict))
+    sf.build_reference(samples, ctx, sample_extras=extras)
+    wc = WeightConstraints(min_weight=0.05, max_weight=0.60, max_stocks=n)
+    return WeightSolver(sf, ctx, wc, missing_data_policy="fill_zero"), ctx
+
+
+def test_smooth_weights_requires_strikes_when_ws_active():
+    solver, _ = _fitted_solver({"mean_payoff": 0.5, "weighted_strike": 0.5},
+                               with_extras=True)
+    rng = np.random.default_rng(4)
+    pnl = rng.normal(0.8, 1.0, (N_DAYS, 4))
+    w_star = np.array([0.4, 0.3, 0.2, 0.1])
+    with pytest.raises(ValueError, match="weighted_strike"):
+        solver.smooth_weights(w_star, pnl, np.arange(4))
+
+
+def test_smooth_weights_ws_aware_blend_floor_holds():
+    solver, _ = _fitted_solver({"mean_payoff": 0.5, "weighted_strike": 0.5},
+                               with_extras=True)
+    rng = np.random.default_rng(5)
+    base = rng.normal(0.8, 1.0, (N_DAYS, 1))
+    pnl = np.repeat(base, 4, axis=1) + rng.normal(0, 1e-3, (N_DAYS, 4))
+    strikes = np.array([0.08, 0.12, 0.16, 0.20])
+    res = solver.solve(pnl, np.arange(4), strikes=strikes)
+    assert res.feasible
+    w_star = res.weights
+    eps = 0.05
+    w_sm = solver.smooth_weights(w_star.copy(), pnl, np.arange(4),
+                                 eps_min=eps, strikes=strikes)
+
+    def blend(w):
+        p = pnl @ w
+        return 0.5 * float(np.mean(p)) - 0.5 * float(np.dot(w, strikes))
+
+    if not np.allclose(w_sm, w_star):
+        # accepted smoothing: less dispersed AND the ws-aware blend floor held
+        assert np.std(w_sm) < np.std(w_star)
+        assert blend(w_sm) >= blend(w_star) - 4 * eps - 1e-6
+        assert float(np.min(pnl @ w_sm)) >= float(np.min(pnl @ w_star)) - 4 * eps - 1e-6
+
+
+def test_smooth_weights_optional_metric_blend():
+    solver, ctx = _fitted_solver({"mean_payoff": 0.6, "cvar_5": 0.4})
+    rng = np.random.default_rng(6)
+    pnl = rng.normal(0.6, 1.0, (N_DAYS, 4))
+    pnl[:, 0] += 0.8
+    res = solver.solve(pnl, np.arange(4))
+    assert res.feasible
+    w_star = res.weights
+    w_sm = solver.smooth_weights(w_star.copy(), pnl, np.arange(4), eps_min=0.05)
+
+    from functions.dispersion.scoring.metrics import CVaR5
+
+    def blend(w):
+        p = pnl @ w
+        return 0.6 * float(np.mean(p)) + 0.4 * CVaR5().compute(p, ctx)
+
+    if not np.allclose(w_sm, w_star):
+        assert np.std(w_sm) < np.std(w_star)
+        assert blend(w_sm) >= blend(w_star) - 4 * 0.05 - 1e-6

@@ -553,8 +553,10 @@ class WeightSolver:
           C1 (equality):   sum(w) = 1
           C2 (ineq, per-day): min_t(adaptive_pnl_t(w)) >= min(adaptive_pnl(w*)) - cur_eps
           C3 (ineq, blend):   raw_blend(w) >= raw_blend(w*) - cur_eps
-              where raw_blend(w) = lam_min*min(pnl) + lam_mean*mean(pnl) + lam_carry*last(pnl)
-              lam_* from user metric weights (higher_is_better signs applied)
+              where raw_blend = Σ_active lam_i · sign_i · raw_metric_i, built
+              from the ACTIVE metric set (core + optional metrics computed via
+              their Metric objects; weighted_strike enters as −lam·dot(w,
+              strikes) and REQUIRES the strikes argument when active).
           C4 (ineq, strike): max_net_strike - dot(w, strikes) >= 0
           Bounds: lb_i <= w_i <= ub_i
 
@@ -572,31 +574,57 @@ class WeightSolver:
         def _adaptive_pnl(w):
             return adaptive_pnl(pnl_matrix, stock_indices, w, active_mask)
 
-        # ── Raw blend function from user metric weights ──
-        # Extract lambdas: positive = higher_is_better metric contributes positively
+        # ── Raw blend from the ACTIVE metric set (metric-faithful) ──
+        # Each active metric contributes lam · sign · raw_value, where sign
+        # follows higher_is_better.  ``weighted_strike`` is the only metric
+        # not computable from the P&L series: it needs the per-stock strike
+        # vector and enters as −lam · dot(w, strikes).
+        # NOTE unit caveat: the eps ladder is expressed in blend units, which
+        # mix metric scales (P&L units for min/mean/carry/dd/cvar, [0,1] for
+        # hit_ratio, annualised ratio for sharpe, decimals for strikes) — the
+        # historical behaviour, kept as-is.
         weights_dict = dict(self._score_fn.weights.items())
-        lam_min = weights_dict.get("min_payoff", 0.0)
-        lam_mean = weights_dict.get("mean_payoff", 0.0)
-        lam_carry = weights_dict.get("last_carry", 0.0)
-        lam_hit = weights_dict.get("hit_ratio", 0.0)
+        active_names = [k for k, v in weights_dict.items() if v > 0]
+        metric_map = {m.name: m for m in self._score_fn.metrics}
+        _unknown = [k for k in active_names
+                    if k != "weighted_strike" and k not in metric_map]
+        if _unknown:
+            raise ValueError(
+                f"smooth_weights: active metric(s) {_unknown} are not present "
+                f"in the score function — cannot build a faithful raw blend."
+            )
+        if "weighted_strike" in active_names and strikes is None:
+            raise ValueError(
+                "smooth_weights: 'weighted_strike' carries a positive weight "
+                "but no per-stock strikes were provided. Pass strikes= (vector "
+                "aligned with stock_indices) — smoothing without the strike "
+                "term would silently trade the strike objective away."
+            )
 
-        def _raw_blend(pnl):
-            """Raw blend in PnL units — no normalization, no score_smooth."""
-            val = 0.0
-            if lam_min > 0:
-                val += lam_min * float(np.min(pnl))
-            if lam_mean > 0:
-                val += lam_mean * float(np.mean(pnl))
-            if lam_carry > 0:
-                val += lam_carry * float(pnl[-1]) if len(pnl) > 0 else 0.0
-            if lam_hit > 0:
-                val += lam_hit * float(np.mean(pnl > 0))
-            return val
+        def _raw_blend(pnl, w):
+            """Scalarised raw objective (sign-adjusted), no normalization."""
+            total = 0.0
+            for name in active_names:
+                lam = weights_dict[name]
+                if name == "weighted_strike":
+                    total += -lam * float(np.dot(w, strikes))
+                    continue
+                m = metric_map[name]
+                v = m.compute(pnl, self._ctx)
+                if not np.isfinite(v):
+                    raise ValueError(
+                        f"smooth_weights: metric '{name}' returned a non-finite "
+                        f"raw value on the reference basket — this configuration "
+                        f"cannot be smoothed safely (series too short or "
+                        f"degenerate)."
+                    )
+                total += lam * (1.0 if m.higher_is_better else -1.0) * float(v)
+            return total
 
         # ── Reference values from w_star ──
         ref_pnl = _adaptive_pnl(w_star)
         ref_min = float(np.min(ref_pnl))
-        ref_blend = _raw_blend(ref_pnl)
+        ref_blend = _raw_blend(ref_pnl, w_star)
         ref_disp = float(np.std(w_star))
 
         # ── Bounds ──
@@ -633,7 +661,7 @@ class WeightSolver:
                 {"type": "eq", "fun": lambda w: float(np.sum(w) - 1.0),
                  "jac": lambda w: np.ones(n)},
                 {"type": "ineq", "fun": lambda w, _fl=floor_min: float(np.min(_adaptive_pnl(w))) - _fl},
-                {"type": "ineq", "fun": lambda w, _fb=floor_blend: _raw_blend(_adaptive_pnl(w)) - _fb},
+                {"type": "ineq", "fun": lambda w, _fb=floor_blend: _raw_blend(_adaptive_pnl(w), w) - _fb},
             ]
             if strikes is not None and c.max_net_strike is not None:
                 cons.append({"type": "ineq", "fun": lambda w: float(c.max_net_strike - np.dot(w, strikes))})
@@ -652,7 +680,7 @@ class WeightSolver:
                 w_cand = self._project_to_bounded_simplex(w_cand, lb, ub)
                 cand_pnl = _adaptive_pnl(w_cand)
                 actual_min = float(np.min(cand_pnl))
-                actual_blend = _raw_blend(cand_pnl)
+                actual_blend = _raw_blend(cand_pnl, w_cand)
                 actual_disp = float(np.std(w_cand))
 
                 print(f"[SMOOTH-TRY] eps={cur_eps:.2f} success={res.success} dispersion {ref_disp:.4f}->{actual_disp:.4f} min {ref_min:.4f}->{actual_min:.4f} blend {ref_blend:.4f}->{actual_blend:.4f}", flush=True)
