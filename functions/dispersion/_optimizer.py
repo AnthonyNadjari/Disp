@@ -100,6 +100,25 @@ class _TuningConstants:
     local_search_sweeps: int = 6
     #: Multi-start seeds (incumbent + this many distinct elites). Range [0, 10].
     local_search_seeds: int = 3
+    #: Exhaustive-search ceiling: when the feasible long-subset count is <=
+    #: this, the post-GA local search enumerates ALL subsets (each an exact
+    #: solve, a few ms) and returns the true argmax — corner extremality
+    #: becomes a seed-INDEPENDENT GUARANTEE for universes up to this size
+    #: (covers realistic small candidate pools and every golden).  The count
+    #: bound is the safety: no time check, so the enumeration always completes.
+    #: Sized for ~a handful of seconds post-GA; raising it extends the
+    #: guarantee to bigger universes at a per-subset solve cost.  Above the
+    #: ceiling, no polynomial method can guarantee the global optimum, so the
+    #: heuristic descent + escape + random restarts runs instead (best-effort).
+    #: Range [0, 20000].
+    local_search_exhaustive_max_subsets: int = 2000
+    #: Random-restart diversification budget for the heuristic regime (large
+    #: universes, above the exhaustive ceiling): draw this many random
+    #: feasible subsets, 1-swap-descend each, keep the best — escapes the
+    #: shared basin the GA + elite starts fall into on near-homogeneous
+    #: universes.  Deterministic (run RNG).  Early-stops on the time budget.
+    #: 0 disables. Range [0, 2000].
+    local_search_random_restarts: int = 400
     #: Safety-net score tie window — below it the raw min decides. Range
     #: [1e-6, 1e-2].
     safety_tie_window: float = 1e-4
@@ -1166,6 +1185,52 @@ class DispersionOptimizer:
         n_evals = 0
         improved_any = False
 
+        # ── Exhaustive global search on small feasible spaces ──
+        # When the number of feasible long subsets is small enough, enumerate
+        # ALL of them (each inner solve is a cheap cached exact LP): this
+        # returns the TRUE argmax subset, making corner extremality
+        # seed-INDEPENDENT for modest universes.  Large production universes
+        # (combinatorially huge) fall through to the heuristic descent+escape
+        # below.  Acceptance is best-scalar, so already-optimal incumbents
+        # (e.g. the exact-path goldens) are returned unchanged.
+        _free_pool_ls = [j for j in range(len(self.long_candidates)) if j not in forced]
+        _lo_ls, _hi_ls = self._long_size_bounds(len(_free_pool_ls))
+        _n_forced = len(forced)
+        _total_subsets = sum(
+            math.comb(len(_free_pool_ls), s - _n_forced)
+            for s in range(_lo_ls, _hi_ls + 1)
+            if 0 <= s - _n_forced <= len(_free_pool_ls)
+        )
+        if 0 < _total_subsets <= TUNING.local_search_exhaustive_max_subsets:
+            # No time check: the subset count is already bounded by the
+            # ceiling, so the enumeration ALWAYS completes → the returned
+            # argmax is deterministic and seed-independent (the guarantee).
+            best_ex = None  # (scalar, step, weights, indices)
+            for s in range(_lo_ls, _hi_ls + 1):
+                k = s - _n_forced
+                if k < 0 or k > len(_free_pool_ls):
+                    continue
+                for combo in itertools.combinations(_free_pool_ls, k):
+                    trial = sorted(forced | set(combo))
+                    out = _eval_subset(trial)
+                    n_evals += 1
+                    if out is None:
+                        continue
+                    if best_ex is None or out[0] > best_ex[0] + 1e-12:
+                        best_ex = (out[0], out[1], out[2], trial)
+            if best_ex is not None:
+                _engine_log.debug(f"[LOCAL-SEARCH] exhaustive n_subsets={_total_subsets} evals={n_evals} scalar={best_ex[0]:.6f}")
+                if best_ex[0] > inc_scalar + 1e-12:
+                    best = self._copy(best)
+                    best.long_indices = list(best_ex[3])
+                    best.long_weights = best_ex[2]
+                    best.fitness = best_ex[1]
+                    return best, max(best_score, best_ex[1])
+                best.long_weights = inc_w
+                best.fitness = inc_score
+                return best, max(best_score, inc_score)
+            # No feasible subset at all → fall through (shouldn't happen).
+
         def _descend_1swap(indices, scalar, score, w):
             """Best-improvement 1-swap descent to a local optimum (or budget)."""
             nonlocal n_evals
@@ -1256,6 +1321,29 @@ class DispersionOptimizer:
                 best_ind_list, best_scalar, best_step, best_w)
             if r_scalar > best_scalar + 1e-12:
                 best_scalar, best_step, best_w, best_ind_list = r_scalar, r_score, r_w, r_ind
+
+        # Random-restart diversification (large universes only — small ones
+        # were already solved exactly above).  The GA + elite starts can share
+        # one basin on near-homogeneous universes; independent random restarts
+        # give the 1-swap descent fresh basins to fall into.  Deterministic
+        # (self._rng, seeded), time-bounded, best-improvement (never regresses).
+        if (_total_subsets > TUNING.local_search_exhaustive_max_subsets
+                and TUNING.local_search_random_restarts > 0):
+            for _r in range(TUNING.local_search_random_restarts):
+                if time.time() - t0 > time_budget:
+                    break
+                _lo_r, _hi_r = self._long_size_bounds(len(_free_pool_ls))
+                _n_r = self._rng.randint(_lo_r, _hi_r)
+                trial = self._pick_long_subset(_free_pool_ls, _n_r)
+                out = _eval_subset(trial)
+                n_evals += 1
+                if out is None:
+                    continue
+                r_scalar, r_score, r_w, r_ind = _descend_1swap(
+                    list(trial), out[0], out[1], out[2])
+                if r_scalar > best_scalar + 1e-12:
+                    best_scalar, best_step, best_w, best_ind_list = r_scalar, r_score, r_w, r_ind
+                    improved_any = True
 
         if improved_any:
             best = self._copy(best)

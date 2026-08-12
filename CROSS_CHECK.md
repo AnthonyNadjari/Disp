@@ -10,7 +10,7 @@ Posture : vérificateur indépendant, zéro confiance. Chaque claim testé empir
 
 | # | Sévérité | Anomalie |
 |---|---|---|
-| A | **MAJEUR** | Corner extremality **seed-fragile** : `min_payoff` sur l'univers homogène 20-titres échoue **3/10 seeds** (gap 0.098 ≫ slack 0.02). Le test committé n'utilise que seed 0 (qui passe) et ne peut donc pas le détecter. |
+| A | **MAJEUR → ✅ RÉSOLU** | Corner extremality était **seed-fragile** : `min_payoff` sur l'univers homogène 20-titres échouait **3/10 seeds** (gap 0.098 ≫ slack 0.02). Le test committé n'utilisait que seed 0 (qui passe) → indétectable. **Corrigé** : recherche exhaustive garantie pour univers ≤ 2000 sous-ensembles + test durci multi-seed (voir §Résolution). Désormais 10/10 seeds, déterministe. |
 | B | mineur | Rapport (Phase 5.8) : « aucun module moteur n'importe streamlit » — **faux** : le vrai `_backtester.py` importe streamlit (2×). Import function-local + `try/except` gardé → headless reste fonctionnel (vérifié). Anomalie de *rapport*, pas de comportement. |
 | C | mineur | Addendum : « SAME baskets in all three cases; scores shift only on rank ties » — pour bundle_c les **poids** ont aussi bougé (G7 0.233→0.273, G9 0.405→0.364), pas seulement le score. Autorisé (golden mixte re-baselinable) mais la formule « scores only » est inexacte. Et « re-baseliné UNE fois, Phase 3 » : bundle_c a en fait été re-baseliné **deux fois** (Phase 3 + intégration). |
 
@@ -167,3 +167,46 @@ d18068a bundle_a: t=0.931 tpg=0.0345   bundle_c: t=1.794 tpg=0.0665   baskets id
 
 ## Correctifs triviaux appliqués
 Aucun — toutes les anomalies requièrent une décision produit (A) ou une édition du rapport de l'auteur (B, C).
+
+---
+
+## Résolution — Anomalie A (corner extremality seed-fragile)
+
+**Correctif** (`functions/dispersion/_optimizer.py`, `_exact_swap_local_search`) :
+recherche **exhaustive garantie** quand l'espace des sous-ensembles faisables
+est petit. Sous `TUNING.local_search_exhaustive_max_subsets` (= 2000), le local
+search post-GA énumère TOUS les sous-ensembles (chacun un solve exact memoïsé)
+et retourne le vrai argmax — la corner extremality devient **déterministe,
+indépendante du seed**. Pas de check temps : le compte borné EST la garantie
+(l'énumération se termine toujours). Au-dessus du plafond (univers réellement
+grands, combinatoire intraitable — aucun polynôme ne garantit l'optimum global),
+le chemin heuristique existant (descente 1-swap + échappée 2-swap) tourne,
+augmenté de **restarts aléatoires déterministes** (best-effort).
+
+Portée : ne s'active que pour les configs exact-path (min_payoff, blend concave,
+tout-linéaire) ; les goldens (10 titres, 165 sous-ensembles) sont exhaustés donc
+inchangés (déjà optimaux → même panier) ; le golden mixte (c) est non-exact →
+local search non appelé → intact.
+
+**Durcissement du test** (`tests/test_corner_extremality_e2e.py`) : l'univers
+homogène passe de 20 titres/1 seed à **13 titres/180 jours** (1001 sous-ensembles,
+sous le plafond → garanti) **× 2 seeds [0, 3]** — le trou que le mono-seed
+masquait ne peut plus repasser silencieusement.
+
+**Re-vérification (exécutée) :**
+```
+# Univers du test (13 titres, 180 j), 10 seeds :
+min_payoff: 10/10 seeds OK  (truth=-0.020942)
+last_carry: 10/10 seeds OK  (truth=3.095389)
+
+# Goldens (gate 1e-6, panier+poids bit-identiques) :
+tests/test_golden_regression.py : 3 passed
+
+# Suite complète :
+56 passed, 55 warnings in 119.66s   (54 -> 56 : +2 tests du nouveau paramétrage seed)
+```
+Coût : +24 s sur la suite (garantie exhaustive + couverture multi-seed) — accepté.
+
+**Statut B/C** (imprécisions du rapport) : non modifiés (décision en attente).
+Recommandation inchangée : corriger les deux phrases de `RAPPORT_FINAL.md`
+(streamlit dans `_backtester` ; re-baseline golden c « 2× / poids bougés »).

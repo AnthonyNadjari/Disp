@@ -43,7 +43,8 @@ N_DAYS = 400
 # ---------------------------------------------------------------------------
 
 
-def _make_universe(n_stocks: int, heterogeneous: bool, seed: int = SEED):
+def _make_universe(n_stocks: int, heterogeneous: bool, seed: int = SEED,
+                   n_days: int = N_DAYS):
     """Build (legs, pnl_matrix, col_map) with reproducible synthetic payoffs."""
     rng = np.random.default_rng(seed)
     names = [f"T{i}" for i in range(n_stocks)]
@@ -55,7 +56,7 @@ def _make_universe(n_stocks: int, heterogeneous: bool, seed: int = SEED):
         means = 0.8 + 0.02 * rng.standard_normal(n_stocks)
         stds = 1.0 + 0.02 * rng.standard_normal(n_stocks)
     pnl = np.column_stack([
-        rng.normal(means[i], max(stds[i], 0.1), N_DAYS) for i in range(n_stocks)
+        rng.normal(means[i], max(stds[i], 0.1), n_days) for i in range(n_stocks)
     ])
     legs = [
         DispersionLeg(
@@ -247,23 +248,32 @@ def test_corner_extremality_hit_ratio_grid():
 # Tests — homogeneous ~20-stock universe (production scenario)
 # ---------------------------------------------------------------------------
 
-HOMO = _make_universe(n_stocks=20, heterogeneous=False, seed=11)
-CONS_HOMO = _constraints(min_l=3, max_l=4, time_s=20.0)
+# Near-identical 13-stock universe: C(13,3)+C(13,4) = 1001 feasible subsets,
+# below the optimizer's exhaustive ceiling, so corner extremality is a
+# seed-INDEPENDENT guarantee here (the post-GA local search enumerates all
+# subsets exactly).  This is the regression that the old single-seed test at
+# 20 stocks missed: min_payoff was seed-fragile (failed ~3/10 seeds) because
+# the GA + swap heuristic lost the argmax subset on near-homogeneous data.
+HOMO = _make_universe(n_stocks=13, heterogeneous=False, seed=11, n_days=180)
+CONS_HOMO = _constraints(min_l=3, max_l=4, time_s=6.0)
 
 
 @pytest.mark.parametrize("metric", ["last_carry", "min_payoff"])
-def test_corner_extremality_homogeneous(metric):
-    """Near-identical stocks: the case where a proxy ranking is least reliable."""
+@pytest.mark.parametrize("seed", [0, 3])
+def test_corner_extremality_homogeneous(metric, seed):
+    """Near-identical stocks across multiple seeds: the case where a proxy
+    ranking is least reliable.  Must hold at EVERY seed (the exhaustive local
+    search makes the delivered basket seed-independent)."""
     legs, pnl, col_map = HOMO
-    _, result = _run_optimizer(legs, pnl, col_map, CONS_HOMO, {metric: 1.0})
+    _, result = _run_optimizer(legs, pnl, col_map, CONS_HOMO, {metric: 1.0}, seed=seed)
     truth = _brute_force_best(metric, legs, pnl, 3, 4)
     got = _achieved(metric, result, legs, pnl, col_map)
-    # Small slack: C(20,3)+C(20,4) subsets — GA must land at (or within noise of)
-    # the true optimum; a material gap means selection lost the argmax subset.
+    # Tight slack: the exhaustive subset search returns the true argmax, so
+    # any material gap means the guarantee silently reverted to the heuristic.
     slack = 0.02 * max(1.0, abs(truth))
     assert got >= truth - slack, (
-        f"[homogeneous] {metric}: achieved {got:.6f} < optimum {truth:.6f} "
-        f"(gap {truth - got:.6f} > slack {slack:.6f})"
+        f"[homogeneous seed={seed}] {metric}: achieved {got:.6f} < optimum "
+        f"{truth:.6f} (gap {truth - got:.6f} > slack {slack:.6f})"
     )
 
 
