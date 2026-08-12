@@ -81,7 +81,13 @@ from functions.dispersion.scoring import (
     MetricWeights, ScoreFunction, ScoreContext, WeightSolver,
     WeightConstraints, make_default_score_function,
 )
-from functions.dispersion.scoring.weight_solver import VegaSpec, adaptive_pnl
+from functions.dispersion.scoring.weight_solver import (
+    VegaSpec,
+    adaptive_pnl,
+    concave_blend_lambdas,
+    concave_blend_value,
+    project_to_bounded_simplex,
+)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Internal representation
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -531,6 +537,27 @@ class DispersionOptimizer:
             out["axe_package_recycled"] = cleaned / s
         return out
 
+    def _subset_arrays(self, indices, candidates=None):
+        """Resolve a candidate subset to its matrix/solver inputs (single
+        implementation of a pattern that used to be copied ~6 times).
+
+        Returns (keys, cols, strikes, bounds):
+          keys    — per-leg series keys (:func:`_candidate_key`)
+          cols    — int array of P&L matrix columns, or None when ANY key is
+                    absent from the matrix (callers treat that as invalid)
+          strikes — per-leg solver strike vector (XC convention mono − cross)
+          bounds  — (n, 2) per-name [min_weight, max_weight]
+        """
+        cands = self.long_candidates if candidates is None else candidates
+        keys = [_candidate_key(cands[i], self.is_cross_corridor) for i in indices]
+        pos = [self._col_pos.get(k) for k in keys]
+        if len(pos) == 0 or any(c is None for c in pos):
+            return keys, None, None, None
+        strikes = self._solver_strikes(indices, cands)
+        bounds = np.array([[cands[i].min_weight, cands[i].max_weight] for i in indices],
+                          dtype=np.float64)
+        return keys, np.array(pos, dtype=int), strikes, bounds
+
     def _print_candidate_table(self):
         """Print a visible table of long/short candidates with PnL data quality."""
         lines = []
@@ -846,9 +873,8 @@ class DispersionOptimizer:
             metric_name = active[0]
             metric_obj = next(m for m in self._score_fn.metrics if m.name == metric_name)
             # Compute incumbent raw value from current best
-            inc_long_ids = [_candidate_key(self.long_candidates[i], self.is_cross_corridor) for i in best.long_indices]
-            inc_long_pos = np.array([self._col_pos[c] for c in inc_long_ids if c in self._col_pos])
-            if len(inc_long_pos) > 0:
+            _ik, inc_long_pos, _is, _ib = self._subset_arrays(best.long_indices)
+            if inc_long_pos is not None:
                 inc_pnl = self._adaptive_net_pnl(inc_long_pos, best.long_weights)
                 inc_raw = self._score_fn.raw_metrics(
                     inc_pnl, _ctx_for(best, best.long_weights)
@@ -856,49 +882,25 @@ class DispersionOptimizer:
             else:
                 inc_raw = -np.inf if metric_obj.higher_is_better else np.inf
         elif is_concave_blend and not has_hit_ratio:
-            # Compute scalarized raw objective for incumbent
-            w_dict = self._score_fn.weights
-            lam_min = w_dict.get("min_payoff", 0.0)
-            lam_mean = w_dict.get("mean_payoff", 0.0)
-            lam_carry = w_dict.get("last_carry", 0.0)
-            K_carry = 1
-            for m in self._score_fn.metrics:
-                if m.name == "last_carry" and hasattr(m, "_k"):
-                    K_carry = m._k
-                    break
+            # Scalarized raw objective for the incumbent — centralized blend
+            _lam_min, _lam_mean, _lam_carry, _k_carry = concave_blend_lambdas(self._score_fn)
 
             def _raw_blend_obj(pnl_series):
-                if len(pnl_series) == 0:
-                    return -np.inf
-                val = 0.0
-                if lam_min > 1e-12:
-                    val += lam_min * float(np.min(pnl_series))
-                if lam_mean > 1e-12:
-                    val += lam_mean * float(np.mean(pnl_series))
-                if lam_carry > 1e-12:
-                    tail = pnl_series[-K_carry:] if K_carry <= len(pnl_series) else pnl_series
-                    val += lam_carry * float(np.mean(tail))
-                return val
+                return concave_blend_value(pnl_series, _lam_min, _lam_mean,
+                                           _lam_carry, _k_carry)
 
-            inc_long_ids = [_candidate_key(self.long_candidates[i], self.is_cross_corridor) for i in best.long_indices]
-            inc_long_pos = np.array([self._col_pos[c] for c in inc_long_ids if c in self._col_pos])
-            if len(inc_long_pos) > 0:
+            _ik, inc_long_pos, _is, _ib = self._subset_arrays(best.long_indices)
+            if inc_long_pos is not None:
                 inc_pnl = self._adaptive_net_pnl(inc_long_pos, best.long_weights)
                 inc_raw = _raw_blend_obj(inc_pnl)
             else:
                 inc_raw = -np.inf
 
         for ind in candidates:
-            long_ids = [_candidate_key(self.long_candidates[i], self.is_cross_corridor) for i in ind.long_indices]
-            long_pos = np.array([self._col_pos[c] for c in long_ids if c in self._col_pos])
-            if len(long_pos) == 0:
+            _k, long_pos, strikes, per_stock_bounds = self._subset_arrays(ind.long_indices)
+            if long_pos is None:
                 continue
             n_long = len(long_pos)
-            strikes = self._solver_strikes(ind.long_indices[:n_long], self.long_candidates)
-            per_stock_bounds = np.array([
-                [self.long_candidates[i].min_weight, self.long_candidates[i].max_weight]
-                for i in ind.long_indices[:n_long]
-            ], dtype=np.float64)
             result = self._weight_solver.solve(
                 pnl_matrix=self._ts_mat,
                 stock_indices=long_pos,
@@ -1031,14 +1033,9 @@ class DispersionOptimizer:
             """-> (raw_scalar, step_score, weights) at exact optimal weights, or None."""
             if self._bucket_count_bounds and not self._bucket_counts_ok(indices):
                 return None
-            ids = [_candidate_key(self.long_candidates[i], self.is_cross_corridor) for i in indices]
-            pos = np.array([self._col_pos[c] for c in ids if c in self._col_pos])
-            if len(pos) != len(indices):
+            _ks, pos, strikes, bounds = self._subset_arrays(indices)
+            if pos is None:
                 return None
-            strikes = self._solver_strikes(indices, self.long_candidates)
-            bounds = np.array([
-                [self.long_candidates[i].min_weight, self.long_candidates[i].max_weight]
-                for i in indices], dtype=np.float64)
             res = self._weight_solver.solve(
                 pnl_matrix=self._ts_mat, stock_indices=pos,
                 strikes=strikes if _pass_strikes else None,
@@ -1247,7 +1244,7 @@ class DispersionOptimizer:
         max_w = np.array([candidates[i].max_weight for i in indices], dtype=np.float64)
         if min_w.sum() > 1.0 + 1e-10 or max_w.sum() < 1.0 - 1e-10:
             return None
-        w = self._project_to_simplex_bounded(np.full(n, 1.0 / n), min_w, max_w)
+        w = project_to_bounded_simplex(np.full(n, 1.0 / n), min_w, max_w)
         if (
                 w is None
                 or not np.all(np.isfinite(w))
@@ -1282,10 +1279,9 @@ class DispersionOptimizer:
             )
 
         # ── Long leg: resolve matrix columns (all must be present) ──
-        long_ids = [_candidate_key(self.long_candidates[i], self.is_cross_corridor)
-                    for i in individual.long_indices]
-        long_pos = np.array([self._col_pos[c] for c in long_ids if c in self._col_pos])
-        if len(long_pos) == 0 or len(long_pos) != len(individual.long_indices):
+        _keys, long_pos, _subset_strikes, _subset_bounds = self._subset_arrays(
+            individual.long_indices)
+        if long_pos is None:
             return 0.0
 
         # ── Bucket cardinality bounds on the subset ──
@@ -1297,12 +1293,9 @@ class DispersionOptimizer:
 
         # ── Long weights: deterministic function of the subset ──
         if self._exact_fitness and self._weight_solver is not None:
-            strikes = self._solver_strikes(individual.long_indices, self.long_candidates)
+            strikes = _subset_strikes
             _pass_strikes = (self.c.max_net_strike > 0) or self._ws_active()
-            per_stock_bounds = np.array([
-                [self.long_candidates[i].min_weight, self.long_candidates[i].max_weight]
-                for i in individual.long_indices
-            ], dtype=np.float64)
+            per_stock_bounds = _subset_bounds
             # Strike visibility log — first call only
             if not self._strike_logged:
                 self._strike_logged = True
@@ -1728,46 +1721,6 @@ class DispersionOptimizer:
                             axe_cleaned=axe_cleaned, axe_recycled=axe_recycled)
 
     # ══════════════════════════════════════════════════════════════════════════
-    # WEIGHT PROJECTION (single deterministic helper used by fitness + safety-net)
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _project_to_simplex_bounded(self, weights: np.ndarray, min_weights: np.ndarray, max_weights: np.ndarray) -> np.ndarray:
-        """Project weights onto the bounded simplex {w: sum=1, min<=w<=max}.
-        Uses iterative proportional fitting instead of clip-normalize cycles
-        which collapse weights to boundaries.
-        """
-        n = len(weights)
-        if n == 0:
-            return weights
-        w = np.clip(weights, min_weights, max_weights)
-        # Iterative adjustment: redistribute excess/deficit proportionally
-        for iteration in range(15):
-            s = w.sum()
-            if abs(s - 1.0) < 1e-10:
-                break
-            if s > 1.0:
-                # Need to reduce — take from stocks proportional to their room above min
-                excess = s - 1.0
-                room = w - min_weights
-                room_total = room.sum()
-                if room_total < 1e-12:
-                    break
-                reduction = room * (excess / room_total)
-                w = w - reduction
-                w = np.maximum(w, min_weights)
-            else:
-                # Need to increase — give to stocks proportional to their room below max
-                deficit = 1.0 - s
-                room = max_weights - w
-                room_total = room.sum()
-                if room_total < 1e-12:
-                    break
-                addition = room * (deficit / room_total)
-                w = w + addition
-                w = np.minimum(w, max_weights)
-        return w
-
-    # ══════════════════════════════════════════════════════════════════════════
     # CONSTRAINTS
     # ══════════════════════════════════════════════════════════════════════════
 
@@ -2043,9 +1996,10 @@ class DispersionOptimizer:
         # refined weights; the step rescore below stays vega-aware).
         if self._weight_solver.has_exact_path() and self._vega is None:
             try:
-                long_pos_final = [self._col_pos[_candidate_key(self.long_candidates[i], is_xcorr)]
-                                  for i in best.long_indices
-                                  if _candidate_key(self.long_candidates[i], is_xcorr) in self._col_pos]
+                _fk, _fp, _fs, _fb = self._subset_arrays(best.long_indices)
+                if _fp is None:
+                    raise ValueError("final basket has names missing from the P&L matrix")
+                long_pos_final = list(_fp)
                 sub_pnl_final = self._ts_mat[:, long_pos_final]
                 # Use adaptive bisection for final weights (exact on full curve)
                 _safety_policy = "adaptive_reweight" if self.missing_data_policy == MissingDataPolicy.ADAPTIVE_REWEIGHT else self._weight_solver._missing_data_policy
@@ -2070,7 +2024,7 @@ class DispersionOptimizer:
                               if self._ws_active() else None)
                     ga_score = self._score_fn.score(ga_pnl, self._make_ctx(_ga_ws))
 
-                    resolv_w = self._project_to_simplex_bounded(
+                    resolv_w = project_to_bounded_simplex(
                         np.asarray(resolv.weights, dtype=np.float64),
                         np.array(
                             [self.long_candidates[i].min_weight for i in best.long_indices],
@@ -2139,9 +2093,10 @@ class DispersionOptimizer:
             # user-facing result must carry the step-quantile score of the
             # delivered basket, exactly like the exact-path safety net does.
             try:
-                long_pos_final = [self._col_pos[_candidate_key(self.long_candidates[i], is_xcorr)]
-                                  for i in best.long_indices
-                                  if _candidate_key(self.long_candidates[i], is_xcorr) in self._col_pos]
+                _fk2, _fp2, _fs2, _fb2 = self._subset_arrays(best.long_indices)
+                if _fp2 is None:
+                    raise ValueError("final basket has names missing from the P&L matrix")
+                long_pos_final = list(_fp2)
                 _sp_final = None
                 _sw_final = None
                 if not self._long_only and len(best.short_indices) > 0:
@@ -2395,10 +2350,8 @@ class DispersionOptimizer:
             return None
 
         def _contender_net_and_ctx(long_idx, long_w, short_idx, short_w):
-            ids = [_candidate_key(self.long_candidates[i], self.is_cross_corridor)
-                   for i in long_idx]
-            pos = np.array([self._col_pos[c] for c in ids if c in self._col_pos])
-            if len(pos) != len(long_idx):
+            _bk, pos, _bs, _bb = self._subset_arrays(long_idx)
+            if pos is None:
                 return None
             spos = None
             sw = None

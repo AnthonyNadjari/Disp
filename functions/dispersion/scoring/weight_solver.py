@@ -83,7 +83,77 @@ __all__ = [
     "WeightSolverResult",
     "WeightSolver",
     "VegaSpec",
+    "project_to_bounded_simplex",
+    "concave_blend_lambdas",
+    "concave_blend_value",
 ]
+
+
+def project_to_bounded_simplex(w: np.ndarray, lb: np.ndarray, ub: np.ndarray) -> np.ndarray:
+    """THE canonical projection onto {w : Σw = 1, lb <= w <= ub}.
+
+    Iterative clipping: clip to the box, then redistribute the excess/deficit
+    proportionally among the variables that can still move.  Converges in
+    <= 2n iterations.  Single implementation for the whole engine (GA weight
+    derivation, LP numerical cleanup, sweep candidates, smoothing starts,
+    safety-net) — the historical optimizer-side duplicate is gone.
+    """
+    w = np.clip(np.asarray(w, dtype=np.float64), lb, ub)
+    for _ in range(len(w) * 2):
+        s = w.sum()
+        if abs(s - 1.0) < 1e-10:
+            break
+        excess = s - 1.0
+        if excess > 0:
+            # Need to decrease — only variables above their lb can decrease
+            free = w > lb + 1e-12
+        else:
+            # Need to increase — only variables below their ub can increase
+            free = w < ub - 1e-12
+        if not free.any():
+            # Infeasible — just normalize (shouldn't happen with valid bounds)
+            w = w / s
+            break
+        # Distribute proportionally among free variables
+        adjustment = excess * (w[free] / w[free].sum())
+        w[free] -= adjustment
+        w = np.clip(w, lb, ub)
+    return w
+
+
+def concave_blend_lambdas(score_fn) -> Tuple[float, float, float, int]:
+    """(lam_min, lam_mean, lam_carry, k_carry) of the concave-blend metrics.
+
+    Single extraction point for every consumer of the {min_payoff,
+    mean_payoff, last_carry} raw blend (concave LP objective, bisection
+    step 2, refinement acceptance).
+    """
+    w = score_fn.weights
+    lam_min = w.get("min_payoff", 0.0)
+    lam_mean = w.get("mean_payoff", 0.0)
+    lam_carry = w.get("last_carry", 0.0)
+    k_carry = 1
+    for m in score_fn.metrics:
+        if m.name == "last_carry" and hasattr(m, "_k"):
+            k_carry = m._k
+            break
+    return lam_min, lam_mean, lam_carry, k_carry
+
+
+def concave_blend_value(pnl: np.ndarray, lam_min: float, lam_mean: float,
+                        lam_carry: float, k_carry: int) -> float:
+    """Scalar raw value of the concave blend on a P&L series (currency units)."""
+    if len(pnl) == 0:
+        return -np.inf
+    val = 0.0
+    if lam_min > 1e-12:
+        val += lam_min * float(np.min(pnl))
+    if lam_mean > 1e-12:
+        val += lam_mean * float(np.mean(pnl))
+    if lam_carry > 1e-12:
+        tail = pnl[-k_carry:] if k_carry <= len(pnl) else pnl
+        val += lam_carry * float(np.mean(tail))
+    return val
 
 
 # ---------------------------------------------------------------------------
@@ -237,35 +307,8 @@ class WeightSolver:
         """Clear the memoisation cache."""
         self._cache.clear()
 
-    @staticmethod
-    def _project_to_bounded_simplex(w: np.ndarray, lb: np.ndarray, ub: np.ndarray) -> np.ndarray:
-        """Project weights onto simplex (sum=1) while respecting [lb, ub] per element.
-        
-        Uses iterative clipping: clip to bounds, redistribute excess/deficit
-        proportionally among unclamped variables. Converges in ≤n iterations.
-        """
-        w = np.clip(w, lb, ub)
-        for _ in range(len(w) * 2):
-            s = w.sum()
-            if abs(s - 1.0) < 1e-10:
-                break
-            excess = s - 1.0
-            # Find variables that can absorb the correction
-            if excess > 0:
-                # Need to decrease — only variables above their lb can decrease
-                free = w > lb + 1e-12
-            else:
-                # Need to increase — only variables below their ub can increase
-                free = w < ub - 1e-12
-            if not free.any():
-                # Infeasible — just normalize (shouldn't happen with valid bounds)
-                w = w / s
-                break
-            # Distribute proportionally among free variables
-            adjustment = excess * (w[free] / w[free].sum())
-            w[free] -= adjustment
-            w = np.clip(w, lb, ub)
-        return w
+    #: Canonical bounded-simplex projection (module-level single source of truth)
+    _project_to_bounded_simplex = staticmethod(project_to_bounded_simplex)
 
     @property
     def cache_size(self) -> int:
@@ -1090,18 +1133,7 @@ class WeightSolver:
         coherent.  The objective is a weighted sum that is linear in [w, t].
         """
         c = self._constraints
-        w_dict = self._score_fn.weights
-
-        lam_min = w_dict.get("min_payoff", 0.0)
-        lam_mean = w_dict.get("mean_payoff", 0.0)
-        lam_carry = w_dict.get("last_carry", 0.0)
-
-        # Read trailing window K from LastCarry metric instance
-        K = 1
-        for m in self._score_fn.metrics:
-            if m.name == "last_carry" and hasattr(m, "_k"):
-                K = m._k
-                break
+        lam_min, lam_mean, lam_carry, K = concave_blend_lambdas(self._score_fn)
 
         # Restrict to full-active days (where adaptive renorm is identity → linear exact)
         if full_active_days is not None:
@@ -1592,11 +1624,7 @@ class WeightSolver:
         f_constraint = f_star * (1 - 1e-6)  # slightly relax
 
         # Step 2: LP maximize linear blend subject to floor constraints
-        # Determine blend weights from score_fn
-        lam = self._score_fn.weights
-        lam_mean = lam.get("mean_payoff", 0.0)
-        lam_carry = lam.get("last_carry", 0.0)
-        lam_min = lam.get("min_payoff", 0.0)
+        lam_min, lam_mean, lam_carry, _K2 = concave_blend_lambdas(self._score_fn)
 
         # If only min_payoff is active (shouldn't reach here but safety), return bisect result
         if lam_mean == 0.0 and lam_carry == 0.0:
