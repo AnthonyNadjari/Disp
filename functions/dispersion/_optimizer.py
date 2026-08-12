@@ -34,6 +34,28 @@ def _dlog_ticker_mismatch(tickers: List[str], col_pos_keys: List[str]):
     """Visible debug for ticker format mismatch — disabled."""
     pass
 
+def _scoring_signature(metric_weights, seed: int, n_samples: int,
+                       reference_size: int) -> str:
+    """Reproducibility fingerprint: sha256[:16] over the scoring inputs.
+
+    Two runs with the same signature scored baskets on the same objective
+    (active metrics + weights), the same seed and the same reference-sample
+    geometry — their scores are directly comparable.
+    """
+    import hashlib
+    import json
+    payload = {
+        "metrics": {k: round(float(v), 12)
+                    for k, v in sorted(metric_weights.items()) if v > 0},
+        "seed": int(seed),
+        "n_samples": int(n_samples),
+        "reference_size": int(reference_size),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
+
+
 def _candidate_key(leg: DispersionLeg, is_cross_corridor: bool) -> str:
     """Return the series key for PnL matrix lookup.
     For cross-corridor: use DispersionLeg.corridor_condition_asset (Corridor Condition Asset)
@@ -375,6 +397,12 @@ class DispersionOptimizer:
                     "Check that _compute_net_pnl produces valid P&L for at least 100 random baskets."
                 )
             self._scoring_mode = "v2"
+            # Reproducibility fingerprint of this run's scoring setup
+            self._scoring_signature = _scoring_signature(
+                self._metric_weights, self.seed,
+                getattr(self, "_ref_n_samples", n_samples),
+                getattr(self, "_reference_size", 0),
+            )
             # Construct weight solver AFTER fitting so it sees the fitted score_fn
             # Determine weight solver policy: _use_exact_in_ga=True uses exact adaptive bisection,
             # False uses fill_zero proxy in GA (safety-net always uses exact).
@@ -1330,6 +1358,8 @@ class DispersionOptimizer:
         # FIT the score function with collected samples (extras carry per-sample
         # weighted strikes so the strike objective normalises like any metric)
         self._score_fn.build_reference(sample_pnls, ctx, sample_extras=sample_extras)
+        self._reference_size = len(sample_pnls)
+        self._ref_n_samples = int(n_samples)
         # Sanity: verify max_drawdown (and all metrics) have non-degenerate spread
         # If std==0 for any active metric, the quantile normalizer is saturated
         for m in self._score_fn.metrics:
@@ -1932,6 +1962,9 @@ class DispersionOptimizer:
             long_strike_weighted=0.0, short_strike_weighted=0.0,
             net_strike=0.0, score=-np.inf, generations_run=0, converged=False,
             scoring_mode=self._scoring_mode,
+            scoring_signature=getattr(self, "_scoring_signature", None),
+            seed=self.seed,
+            reference_size=getattr(self, "_reference_size", None),
         )
         r._debug_info = getattr(self, '_debug_table', None) or f"Rejections: {dict(self._rejection_reasons)}"
         return r
@@ -2207,6 +2240,9 @@ class DispersionOptimizer:
             long_cross_corridor=long_xcorr, short_cross_corridor=short_xcorr,
             scoring_mode=self._scoring_mode,
             unsmoothed_basket=self._last_unsmoothed_basket,
+            scoring_signature=getattr(self, "_scoring_signature", None),
+            seed=self.seed,
+            reference_size=getattr(self, "_reference_size", None),
         )
 
     @property

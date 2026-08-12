@@ -1,0 +1,58 @@
+{
+  "bundle_a_linear": {
+    "generations_run": 41,
+    "long_basket": [
+      [
+        "G5",
+        0.4
+      ],
+      [
+        "G7",
+        0.6
+      ]
+    ],
+    "net_strike": 0.13720000000000002,
+    "score": 0.8848484848484848,
+    "scoring_signature": "0d180ba8bc9f98b5"
+  },
+  "bundle_b_minpayoff": {
+    "generations_run": 52,
+    "long_basket": [
+      [
+        "G2",
+        0.49308049815246224
+      ],
+      [
+        "G7",
+        0.11811774606247709
+      ],
+      [
+        "G8",
+        0.38880175578506065
+      ]
+    ],
+    "net_strike": 0.1295403955901365,
+    "score": 1.0,
+    "scoring_signature": "86ce0a84bf0d73b2"
+  },
+  "bundle_c_mixed": {
+    "generations_run": 63,
+    "long_basket": [
+      [
+        "G7",
+        0.23211382238383066
+      ],
+      [
+        "G8",
+        0.3588769575401925
+      ],
+      [
+        "G9",
+        0.4090092200759768
+      ]
+    ],
+    "net_strike": 0.14906137238615288,
+    "score": 0.9721176470588235,
+    "scoring_signature": "a7bbf0a6dcbf20fb"
+  }
+}

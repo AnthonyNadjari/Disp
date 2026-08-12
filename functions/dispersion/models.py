@@ -587,6 +587,10 @@ class OptimizationResult:
     unsmoothed_basket: list = None  # [(ticker, weight), ...] pre-smooth weights, or None
     backtest: Optional["BacktestResult"] = None  # Backtest of winning basket (computed free)
     backtest_unsmoothed: Optional["BacktestResult"] = None  # Pre-smooth backtest (only when smoothing active)
+    # ── Scoring signature (reproducibility fingerprint of the run) ──
+    scoring_signature: Optional[str] = None  # sha256[:16] of (active metrics+weights, seed, n_samples, reference size)
+    seed: Optional[int] = None               # RNG seed the optimizer ran with
+    reference_size: Optional[int] = None     # number of baskets in the fitted normalizer reference
 
     @property
     def is_long_only(self) -> bool:

@@ -1,0 +1,158 @@
+{
+  "bundle_version": 1,
+  "config": null,
+  "constraints": {
+    "crossover_rate": 0.8,
+    "elite_ratio": 0.05,
+    "max_generations": 150,
+    "max_net_strike": 10.0,
+    "max_stocks_long": 3,
+    "max_stocks_short": 0,
+    "min_stocks_long": 2,
+    "min_stocks_short": 0,
+    "mutation_rate": 0.1,
+    "population_size": 40,
+    "stagnation_limit": 25,
+    "time_limit_seconds": 60.0,
+    "tournament_size": 3
+  },
+  "created_utc": "2026-08-12T08:02:11.409333+00:00",
+  "long_candidates": [
+    {
+      "corridor_condition_asset": null,
+      "max_weight": 0.6,
+      "metrics": {},
+      "min_weight": 0.05,
+      "sector": null,
+      "strike_cross_corridor": null,
+      "strike_mono_var_swap": 0.1,
+      "variance_asset": "G0",
+      "weight": 0.0
+    },
+    {
+      "corridor_condition_asset": null,
+      "max_weight": 0.6,
+      "metrics": {},
+      "min_weight": 0.05,
+      "sector": null,
+      "strike_cross_corridor": null,
+      "strike_mono_var_swap": 0.10600000000000001,
+      "variance_asset": "G1",
+      "weight": 0.0
+    },
+    {
+      "corridor_condition_asset": null,
+      "max_weight": 0.6,
+      "metrics": {},
+      "min_weight": 0.05,
+      "sector": null,
+      "strike_cross_corridor": null,
+      "strike_mono_var_swap": 0.112,
+      "variance_asset": "G2",
+      "weight": 0.0
+    },
+    {
+      "corridor_condition_asset": null,
+      "max_weight": 0.6,
+      "metrics": {},
+      "min_weight": 0.05,
+      "sector": null,
+      "strike_cross_corridor": null,
+      "strike_mono_var_swap": 0.11800000000000001,
+      "variance_asset": "G3",
+      "weight": 0.0
+    },
+    {
+      "corridor_condition_asset": null,
+      "max_weight": 0.6,
+      "metrics": {},
+      "min_weight": 0.05,
+      "sector": null,
+      "strike_cross_corridor": null,
+      "strike_mono_var_swap": 0.124,
+      "variance_asset": "G4",
+      "weight": 0.0
+    },
+    {
+      "corridor_condition_asset": null,
+      "max_weight": 0.6,
+      "metrics": {},
+      "min_weight": 0.05,
+      "sector": null,
+      "strike_cross_corridor": null,
+      "strike_mono_var_swap": 0.13,
+      "variance_asset": "G5",
+      "weight": 0.0
+    },
+    {
+      "corridor_condition_asset": null,
+      "max_weight": 0.6,
+      "metrics": {},
+      "min_weight": 0.05,
+      "sector": null,
+      "strike_cross_corridor": null,
+      "strike_mono_var_swap": 0.136,
+      "variance_asset": "G6",
+      "weight": 0.0
+    },
+    {
+      "corridor_condition_asset": null,
+      "max_weight": 0.6,
+      "metrics": {},
+      "min_weight": 0.05,
+      "sector": null,
+      "strike_cross_corridor": null,
+      "strike_mono_var_swap": 0.14200000000000002,
+      "variance_asset": "G7",
+      "weight": 0.0
+    },
+    {
+      "corridor_condition_asset": null,
+      "max_weight": 0.6,
+      "metrics": {},
+      "min_weight": 0.05,
+      "sector": null,
+      "strike_cross_corridor": null,
+      "strike_mono_var_swap": 0.14800000000000002,
+      "variance_asset": "G8",
+      "weight": 0.0
+    },
+    {
+      "corridor_condition_asset": null,
+      "max_weight": 0.6,
+      "metrics": {},
+      "min_weight": 0.05,
+      "sector": null,
+      "strike_cross_corridor": null,
+      "strike_mono_var_swap": 0.154,
+      "variance_asset": "G9",
+      "weight": 0.0
+    }
+  ],
+  "meta": {
+    "numpy": "2.4.6",
+    "pandas": "3.0.5"
+  },
+  "optimizer": {
+    "adj_divs": false,
+    "bisect_in_ga": false,
+    "forced_long_indices": null,
+    "global_cap": 9999999.0,
+    "global_floor": -9999999.0,
+    "is_cross_corridor": false,
+    "missing_data_policy": "fill_zero",
+    "reweight_grace_days": 3
+  },
+  "provenance": {
+    "golden_case": "bundle_c_mixed",
+    "universe_seed": 23
+  },
+  "result": null,
+  "score_weights": {
+    "hit_ratio": 0.3,
+    "mean_payoff": 0.4,
+    "min_payoff": 0.3
+  },
+  "seed": 3,
+  "short_candidates": []
+}

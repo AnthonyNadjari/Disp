@@ -496,6 +496,7 @@ def optimize(
     seed: int = 0,
     forced_tickers: List[str] = None,
     excluded_tickers: List[str] = None,
+    save_bundle_path: str = None,
 ) -> OptimizationResult:
     """
     Find optimal basket via genetic algorithm.
@@ -531,6 +532,11 @@ def optimize(
     excluded_tickers : list of str, optional
         Names removed from the candidate universe (long and short) before
         optimization.  Must not overlap forced_tickers.
+    save_bundle_path : str, optional
+        Directory path: write a replayable run bundle (P&L matrix as parquet
+        + JSON with legs/constraints/weights/seed/result) after the GA runs.
+        See :mod:`functions.dispersion.run_bundle`.  Only written when the
+        GA actually ran (not on empty-universe early exits).
 
     Returns
     -------
@@ -822,6 +828,39 @@ def optimize(
     )
     opt_result = optimizer.run()
     opt_result._final_raw_min = getattr(optimizer, '_final_raw_min', None)
+
+    # ── Optional: persist a replayable run bundle (offline reproduction) ──
+    if save_bundle_path:
+        import dataclasses as _dc
+        from functions.dispersion.run_bundle import save_run_bundle
+        save_run_bundle(
+            save_bundle_path,
+            pnl_matrix=optimizer._orig_ts_mat,
+            column_map=col_map,
+            long_candidates=long_valid,
+            short_candidates=short_valid,
+            constraints=constraints,
+            score_weights=metric_weights.to_dict(),
+            seed=seed,
+            missing_data_policy=config.missing_data_policy,
+            adj_divs=config.adj_divs,
+            reweight_grace_days=3,
+            is_cross_corridor=config.cross_corridor,
+            global_cap=config.global_cap,
+            global_floor=config.global_floor,
+            bisect_in_ga=bisect_in_ga,
+            forced_long_indices=_forced_indices if _forced_indices else None,
+            dates=list(_optimizer_dates),
+            config=_dc.asdict(config),
+            provenance={
+                "forced_tickers": sorted(_forced_set) if _forced_set else [],
+                "excluded_tickers": sorted(_excluded_set) if _excluded_set else [],
+                "start_date": start_date,
+                "end_date": end_date,
+                "filter_zero_hr": bool(filter_zero_hr),
+            },
+            result=opt_result,
+        )
 
     # ── Persist smoothing state for interactive post-smoothing in UI ──
     opt_result._smooth_state = {

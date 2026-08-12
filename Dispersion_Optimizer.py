@@ -253,6 +253,17 @@ def _render_optimization_result(result, is_cross, debug_info=None):
     col_s3.metric("Long Weight", f"{long_total:.1f}%")
     col_s4.metric("Short Weight", f"{short_total:.1f}%")
     st.caption(f"Generations: {result.generations_run} | Converged: {result.converged}")
+    # Scoring signature — reproducibility fingerprint of the run
+    if getattr(result, 'scoring_signature', None):
+        with st.expander("🧾 Scoring signature (debug)", expanded=False):
+            st.markdown(
+                f"- **Signature:** `{result.scoring_signature}`\n"
+                f"- **Seed:** `{result.seed}`\n"
+                f"- **Reference sample size:** `{result.reference_size}` baskets\n"
+                f"- **Scoring mode:** `{result.scoring_mode}`")
+            st.caption(
+                "Same signature = same objective (active metrics + weights), same seed "
+                "and same reference geometry — scores are directly comparable.")
     # Show backtest if available
     if result.backtest and result.backtest.timeseries is not None and not result.backtest.timeseries.empty:
         with st.expander("📈 Backtest", expanded=True):
