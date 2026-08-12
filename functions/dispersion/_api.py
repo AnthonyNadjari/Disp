@@ -732,6 +732,7 @@ def _prepare_optimization_inputs(
         _unmatched = forced_set - _matched
         if _unmatched:
             import difflib
+            from collections import Counter
             # In cross-corridor mode the per-name key IS the Corridor Condition
             # Asset (the traded single stock), NOT the shared Variance Asset
             # (index). Report the candidates under the key the user must force,
@@ -744,29 +745,61 @@ def _prepare_optimization_inputs(
                 _cand_keys = sorted({s.variance_asset for s in long_valid})
                 _key_label = "Variance Asset"
             _cand_lower = {k.casefold(): k for k in _cand_keys}
-            # Did the name appear in the RAW input but get dropped (no price data
-            # / 0%-HR / exclusion)?  long_legs = the user's parsed rows, pre-load.
+            # Did the name appear in the RAW input but get dropped?
+            # long_legs = the user's parsed rows, pre-load.
             _raw_keys = set()
             for _s in long_legs:
                 _raw_keys |= _leg_keys(_s)
+            # Column sets to pinpoint WHY a present name is not a candidate.
+            # cross-corridor: price_data = variance-asset (index) prices,
+            # index_data = corridor-asset (stock) prices.
+            _pd_cols = {str(c).strip() for c in price_data.columns} if price_data is not None else set()
+            _id_cols = ({str(c).strip() for c in index_data.columns}
+                        if (index_data is not None and not getattr(index_data, "empty", True)) else set())
+            _cc_counts = Counter(str(s.corridor_condition_asset).strip()
+                                 for s in long_legs if getattr(s, "corridor_condition_asset", None))
+
+            def _why_dropped(u):
+                rows = [s for s in long_legs if u in _leg_keys(s)]
+                if not rows:
+                    return "not present in the parsed input."
+                s = rows[0]
+                va = str(s.variance_asset).strip()
+                cc = (str(s.corridor_condition_asset).strip()
+                      if getattr(s, "corridor_condition_asset", None) else "")
+                if config.cross_corridor:
+                    if va not in _pd_cols:
+                        return (f"its Variance Asset (index) '{va}' was NOT returned by Bloomberg, "
+                                f"so the whole row is dropped — check that index ticker.")
+                    if cc and _cc_counts.get(cc, 0) > 1:
+                        return (f"'{cc}' appears on {_cc_counts[cc]} input rows (duplicate); P&L "
+                                f"columns are keyed by Corridor Condition Asset so duplicates "
+                                f"collapse — keep one row per stock.")
+                    if cc and cc not in _id_cols:
+                        return (f"its corridor stock price '{cc}' did not load from Bloomberg "
+                                f"(the cross P&L cannot be computed) — check that stock ticker.")
+                    return ("data loaded but no P&L column was produced (history too short for the "
+                            "n_exp warm-up, or all-NaN series).")
+                if va not in _pd_cols:
+                    return f"its ticker '{va}' was NOT returned by Bloomberg."
+                return "data loaded but no P&L column was produced (history too short, or all-NaN)."
+
             _lines = []
             for u in sorted(_unmatched):
-                near = [_cand_lower[n] for n in
-                        difflib.get_close_matches(u, list(_cand_lower.keys()), n=3, cutoff=0.6)]
                 if u in _raw_keys:
-                    _lines.append(
-                        f"  - '{u}': present in your input but NOT a candidate — its "
-                        f"price series failed to load, or it was removed by the 0%-HR "
-                        f"filter / exclusions.")
-                elif near:
-                    _lines.append(f"  - '{u}': not found. Did you mean {near}?")
+                    _lines.append(f"  - '{u}': present in your input but NOT a candidate — {_why_dropped(u)}")
                 else:
-                    _lines.append(f"  - '{u}': not found.")
+                    near = [_cand_lower[n] for n in
+                            difflib.get_close_matches(u, list(_cand_lower.keys()), n=3, cutoff=0.6)]
+                    if near:
+                        _lines.append(f"  - '{u}': not found. Did you mean {near}?")
+                    else:
+                        _lines.append(f"  - '{u}': not found.")
             _hint = ""
             if config.cross_corridor:
                 _hint = (
                     f"\nCross-corridor: force the {_key_label} (the traded single "
-                    f"stock, e.g. '005930 KS Equity'), not the Variance Asset (index).")
+                    f"stock, e.g. '005930 KP Equity'), not the Variance Asset (index).")
             raise ValueError(
                 f"Forced ticker(s) not found among the {len(_cand_keys)} candidate "
                 f"name(s) after filtering:\n" + "\n".join(_lines) + _hint +

@@ -86,6 +86,13 @@ def _run_bt(src_df, is_vol_swap, n_exp, local_floor, local_cap,
             global_floor, global_cap, ubar, dbar, adj_divs="No",
             start_date=None, is_cross_corridor=False, missing_data_policy="Adaptive Reweight"):
     """Run backtest via new API, return (timeseries_df, metadata_dict, figure, None)."""
+    # Vol-swap UI uses product-specific labels ('Underlying' / 'Strike (%)') —
+    # normalise to the canonical names up front so BOTH the conversion below and
+    # the metadata access (src_df['Variance Asset']) work for vol swaps too.
+    src_df = src_df.copy()
+    if 'Underlying' in src_df.columns:
+        src_df.rename(columns={'Underlying': 'Variance Asset',
+                               'Strike (%)': 'Strike Mono Var Swap (%)'}, inplace=True)
     cfg = DispersionConfig(
         product_type=ProductType.VOL_SWAP if is_vol_swap else ProductType.VAR_SWAP_CORRIDOR,
         cross_corridor=is_cross_corridor,

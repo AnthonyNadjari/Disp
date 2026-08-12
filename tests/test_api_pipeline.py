@@ -171,6 +171,31 @@ def test_api_cross_corridor_force_corridor_asset(api_offline):
     assert "IDX Index" not in msg, f"sample must NOT be the index: {msg}"
 
 
+def test_api_cross_corridor_forced_present_but_dropped(api_offline):
+    """Issue A: a forced name that IS in the input but whose row was dropped at
+    load (here: not in the built col_map) must raise a message that says so —
+    'present in your input but NOT a candidate' with a concrete reason — instead
+    of the misleading 'not found / did you mean'."""
+    corr, pnl, col_map, long_df = _xc_universe(n=5)
+    # Add a 6th input row whose corridor stock is NOT in the built col_map
+    ghost = "005930 KP Equity"
+    long_df = pd.concat([long_df, pd.DataFrame([{
+        "Variance Asset": "IDX Index", "Corridor Condition Asset": ghost,
+        "Strike Cross Corridor (%)": 25.0, "Strike Mono Var Swap (%)": 12.0,
+        "Min Weight": 5.0, "Max Weight": 60.0,
+    }])], ignore_index=True)
+    api = api_offline(pnl, col_map, ["IDX Index"])   # col_map has only the 5 real corr keys
+    cfg = DispersionConfig(cross_corridor=True, missing_data_policy=MissingDataPolicy.FILL_ZERO)
+
+    with pytest.raises(ValueError) as ei:
+        api.optimize(long_df, cfg, _cons(), score_weights={"mean_payoff": 1.0},
+                     seed=0, forced_tickers=[ghost.lower()])
+    msg = str(ei.value)
+    assert "present in your input but NOT a candidate" in msg, msg
+    assert ghost in msg, msg
+    assert "Did you mean" not in msg, f"should not be a 'did you mean' case: {msg}"
+
+
 def test_api_mono_force_bogus_message(api_offline):
     """Mono mode: the bogus-forced message reports the Variance Asset key."""
     tickers, pnl, col_map, long_df = _universe()
