@@ -189,3 +189,48 @@ def test_smooth_weights_optional_metric_blend():
     if not np.allclose(w_sm, w_star):
         assert np.std(w_sm) < np.std(w_star)
         assert blend(w_sm) >= blend(w_star) - 4 * 0.05 - 1e-6
+
+
+# ---------------------------------------------------------------------------
+# n_reference_samples: exposed parameter, defaults unchanged
+# ---------------------------------------------------------------------------
+
+
+def _quick_opt(n_ref=None, seed=0, weights=None):
+    names = [f"R{i}" for i in range(6)]
+    pnl = _mk_pnl(6, seed=23)
+    col_map = {n: i for i, n in enumerate(names)}
+    opt = DispersionOptimizer(
+        long_candidates=_mk_legs(names),
+        short_candidates=[],
+        pnl_matrix=pnl,
+        column_map=col_map,
+        constraints=_cons(),
+        missing_data_policy=MissingDataPolicy.FILL_ZERO,
+        metric_weights=MetricWeights(weights or {"mean_payoff": 1.0}),
+        seed=seed,
+        n_reference_samples=n_ref,
+    )
+    return opt.run()
+
+
+def test_n_reference_samples_default_unchanged():
+    """Explicitly passing the adaptive default (300 for non-tail configs)
+    must reproduce the default run bit-for-bit."""
+    r_default = _quick_opt(n_ref=None)
+    r_explicit = _quick_opt(n_ref=300)
+    assert r_default.long_basket == r_explicit.long_basket
+    assert r_default.score == r_explicit.score
+    assert r_default.scoring_signature == r_explicit.scoring_signature
+
+
+def test_n_reference_samples_changes_reference_and_signature():
+    r_default = _quick_opt(n_ref=None)
+    r_more = _quick_opt(n_ref=600)
+    assert r_more.reference_size > r_default.reference_size
+    assert r_more.scoring_signature != r_default.scoring_signature
+
+
+def test_n_reference_samples_too_small_raises():
+    with pytest.raises(ValueError, match="n_reference_samples"):
+        _quick_opt(n_ref=50)

@@ -173,6 +173,7 @@ class RunBundle:
     global_floor: float = -9999999.0
     bisect_in_ga: bool = False
     forced_long_indices: Optional[List[int]] = None
+    n_reference_samples: Optional[int] = None  # None = adaptive default (300/800)
     dates: Optional[List] = None            # optional row index of pnl_matrix
     config: Optional[Dict] = None           # DispersionConfig snapshot (informational)
     provenance: Dict = field(default_factory=dict)  # forced/excluded tickers, dates, ...
@@ -218,6 +219,7 @@ class RunBundle:
             bisect_in_ga=self.bisect_in_ga,
             forced_long_indices=(list(self.forced_long_indices)
                                  if self.forced_long_indices else None),
+            n_reference_samples=self.n_reference_samples,
         )
         return optimizer.run()
 
@@ -245,6 +247,7 @@ def save_run_bundle(
     global_floor: float = -9999999.0,
     bisect_in_ga: bool = False,
     forced_long_indices: Optional[List[int]] = None,
+    n_reference_samples: Optional[int] = None,
     dates=None,
     config: Optional[Dict] = None,
     provenance: Optional[Dict] = None,
@@ -292,6 +295,8 @@ def save_run_bundle(
             "bisect_in_ga": bool(bisect_in_ga),
             "forced_long_indices": (sorted(int(i) for i in forced_long_indices)
                                     if forced_long_indices else None),
+            "n_reference_samples": (int(n_reference_samples)
+                                    if n_reference_samples is not None else None),
         },
         "long_candidates": [_leg_to_dict(l) for l in long_candidates],
         "short_candidates": [_leg_to_dict(l) for l in short_candidates],
@@ -349,6 +354,7 @@ def load_run_bundle(path: str) -> RunBundle:
         global_floor=float(opt.get("global_floor", -9999999.0)),
         bisect_in_ga=bool(opt.get("bisect_in_ga", False)),
         forced_long_indices=opt.get("forced_long_indices"),
+        n_reference_samples=opt.get("n_reference_samples"),
         dates=dates,
         config=payload.get("config"),
         provenance=dict(payload.get("provenance") or {}),

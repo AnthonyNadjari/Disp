@@ -196,6 +196,7 @@ class DispersionOptimizer:
         smooth_weights: bool = False,
         smooth_eps: float = 0.05,
         forced_long_indices: Optional[List[int]] = None,
+        n_reference_samples: Optional[int] = None,
     ):
         self.long_candidates = long_candidates
         self.short_candidates = short_candidates
@@ -206,6 +207,15 @@ class DispersionOptimizer:
         self.missing_data_policy = missing_data_policy
         self._smooth_weights = smooth_weights
         self._smooth_eps = smooth_eps
+        # Reference-sample size override (None = adaptive default 300/800).
+        # The normalizer needs >= 100 fitted baskets to be meaningful.
+        if n_reference_samples is not None and int(n_reference_samples) < 100:
+            raise ValueError(
+                f"n_reference_samples must be >= 100 (quantile normalizer needs "
+                f"a meaningful reference), got {n_reference_samples}."
+            )
+        self._n_reference_samples = (int(n_reference_samples)
+                                     if n_reference_samples is not None else None)
         self.adj_divs = adj_divs
         self.reweight_grace_days = reweight_grace_days
         self.is_cross_corridor = is_cross_corridor
@@ -382,9 +392,11 @@ class DispersionOptimizer:
             active_metrics = [m for m in self._score_fn._metrics
                              if m.name in self._metric_weights.active_names]
             self._all_metrics_linear = all(m.is_linear for m in active_metrics)
-            # P5: Adaptive n_samples — reduced for speed; tail metrics get more
+            # P5: Adaptive n_samples — reduced for speed; tail metrics get more.
+            # An explicit n_reference_samples overrides the adaptive default.
             has_tail = any(getattr(m, 'is_tail_metric', False) for m in active_metrics)
-            n_samples = 800 if has_tail else 300
+            n_samples = (self._n_reference_samples if self._n_reference_samples
+                         else (800 if has_tail else 300))
             self._weight_solver = None  # not available during reference build
             _dlog(f"BUILD REFERENCE SAMPLE: n_samples={n_samples}")
             self._build_reference_sample(n_samples=n_samples)

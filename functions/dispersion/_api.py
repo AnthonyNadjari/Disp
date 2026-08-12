@@ -497,6 +497,7 @@ def optimize(
     forced_tickers: List[str] = None,
     excluded_tickers: List[str] = None,
     save_bundle_path: str = None,
+    n_reference_samples: int = None,
 ) -> OptimizationResult:
     """
     Find optimal basket via genetic algorithm.
@@ -537,6 +538,10 @@ def optimize(
         + JSON with legs/constraints/weights/seed/result) after the GA runs.
         See :mod:`functions.dispersion.run_bundle`.  Only written when the
         GA actually ran (not on empty-universe early exits).
+    n_reference_samples : int, optional
+        Size of the random-basket reference sample used to fit the quantile
+        normalizer.  Default None = adaptive (300, or 800 when a tail metric
+        such as min_payoff / cvar_5 is active).  Must be >= 100.
 
     Returns
     -------
@@ -825,6 +830,7 @@ def optimize(
         smooth_weights=False,
         smooth_eps=0.05,
         forced_long_indices=_forced_indices if _forced_indices else None,
+        n_reference_samples=n_reference_samples,
     )
     opt_result = optimizer.run()
     opt_result._final_raw_min = getattr(optimizer, '_final_raw_min', None)
@@ -850,6 +856,7 @@ def optimize(
             global_floor=config.global_floor,
             bisect_in_ga=bisect_in_ga,
             forced_long_indices=_forced_indices if _forced_indices else None,
+            n_reference_samples=n_reference_samples,
             dates=list(_optimizer_dates),
             config=_dc.asdict(config),
             provenance={
