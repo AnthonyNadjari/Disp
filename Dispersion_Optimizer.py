@@ -835,7 +835,8 @@ with tab1:
         st.success(f"✅ Configuration saved: {n_long} long candidates, {n_short} short candidates")
         col44, col45 = st.columns(2)
         with col44:
-            st.subheader("🎯 Basket Size Constraints")
+            st.subheader("🎯 Constraints")
+            st.markdown("**📐 Basket size**")
             _sz1, _sz2 = st.columns(2)
             min_stocks_long = _sz1.number_input("Min stocks (long)", step=1, value=3)
             max_stocks_long = _sz2.number_input("Max stocks (long)", step=1, value=8)
@@ -848,6 +849,8 @@ with tab1:
                 help="Bounds the GA search only — Bloomberg load, reference fitting and "
                      "the post-GA polish are extra wall time.")
             seed = _sz5.number_input("Random seed", value=0, step=1, min_value=0)
+            st.divider()
+            st.markdown("**🎛️ Universe shaping** · optional")
             forced_tickers_raw = st.text_area(
                 "🔒 Force names in basket (one per line or comma-separated)",
                 value="", height=68,
@@ -970,6 +973,8 @@ with tab1:
                             warns.append(f"Axe targets — names not in the candidate universe (ignored): {miss_v}")
                 return df, warns
 
+            st.divider()
+            st.markdown("**⚡ Vega**")
             vega_on = st.toggle(
                 "⚡ Absolute Vega mode (axe recycling)", value=False, key="_vega_toggle",
                 help="OFF = historical percentage weights (sum=1). ON = absolute Vega "
@@ -1040,15 +1045,6 @@ with tab1:
                 vega_v_min = None
                 vega_v_max = None
                 recycle_weight = 0.0
-            robustness_check = st.checkbox(
-                "🧪 Robustness check (bootstrap)", value=False,
-                help="Resample the days 300× with replacement and re-rank the winner "
-                     "against its 10 best refinement challengers: how often does it "
-                     "stay #1? Adds a few seconds.")
-            run_milp = st.checkbox("🔬 Certify vs exact optimum (MILP, slow)", value=False)
-            st.session_state['_run_milp'] = run_milp
-            bisect_in_ga = st.checkbox("🎯 Exact solver in GA (slow, certification runs)", value=False)
-            st.session_state['_bisect_in_ga'] = bisect_in_ga
         with col45:
             st.subheader("⚖️ Optimization Weights")
             col18, col19 = st.columns(2)
@@ -1111,7 +1107,17 @@ with tab1:
             help="Remove long stocks with 0% hit ratio and short stocks with 100% hit ratio before optimization. Only applies if remaining candidates >= min stocks.",
             key="filter_zero_hr"
         )
-        enable_profiling = st.checkbox("📊 Enable Performance Profiling", value=False, key="enable_profiling")
+        with st.expander("🔬 Advanced · certification & diagnostics"):
+            robustness_check = st.checkbox(
+                "🧪 Robustness check (bootstrap)", value=False,
+                help="Resample the days 300× with replacement and re-rank the winner "
+                     "against its 10 best refinement challengers: how often does it "
+                     "stay #1? Adds a few seconds.")
+            run_milp = st.checkbox("🔬 Certify vs exact optimum (MILP, slow)", value=False)
+            st.session_state['_run_milp'] = run_milp
+            bisect_in_ga = st.checkbox("🎯 Exact solver in GA (slow, certification runs)", value=False)
+            st.session_state['_bisect_in_ga'] = bisect_in_ga
+            enable_profiling = st.checkbox("📊 Enable Performance Profiling", value=False, key="enable_profiling")
         if st.button("🚀 Run Genetic Algorithm Optimization", type="primary", use_container_width=True):
             is_long_only = st.session_state.get('is_long_only', False)
             if max_strike <= 0:
