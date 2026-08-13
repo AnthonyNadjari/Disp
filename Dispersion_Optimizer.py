@@ -520,21 +520,30 @@ with tab1:
                     'Min Weight': [],
                     'Max Weight': []
                 })
+            _xc_base = ['Variance Asset', 'Corridor Condition Asset', 'Strike Cross Corridor (%)',
+                        'Strike Mono Var Swap (%)', 'Min Weight', 'Max Weight']
+            # In Vega mode, one extra optional column: absolute per-name Vega cap
+            # (blank = no cap). Concentration is still handled by Min/Max Weight.
+            _xc_show_cols = _xc_base + (['Vega cap'] if st.session_state.get('_vega_toggle', False) else [])
+            _xc_paste_cols = _xc_base + ['Vega cap']
+            _xc_show = st.session_state.long_df_cross.copy()
+            for _c in _xc_show_cols:
+                if _c not in _xc_show.columns:
+                    _xc_show[_c] = ''
             st.data_editor(
-                st.session_state.long_df_cross[
-                    ['Variance Asset', 'Corridor Condition Asset', 'Strike Cross Corridor (%)',
-                     'Strike Mono Var Swap (%)', 'Min Weight', 'Max Weight']],
+                _xc_show[_xc_show_cols],
                 num_rows="dynamic",
                 use_container_width=True,
                 key="long_editor_cross",
-                column_order=['Variance Asset', 'Corridor Condition Asset', 'Strike Cross Corridor (%)',
-                              'Strike Mono Var Swap (%)', 'Min Weight', 'Max Weight'],
+                column_order=_xc_show_cols,
             )
+            if st.session_state.get('_vega_toggle', False):
+                st.caption("`Vega cap` (optional) = max absolute Vega on that name; blank = no cap.")
             long_pasted_text = st.text_area(
                 "Paste long basket data here:",
                 height=100,
                 key="long_paste_cross",
-                help="Format: Variance Asset, Corridor Condition Asset, Strike Cross Corridor (%), Strike Mono Var Swap (%), Min Weight, Max Weight"
+                help="Format: Variance Asset, Corridor Condition Asset, Strike Cross Corridor (%), Strike Mono Var Swap (%), Min Weight, Max Weight[, Vega cap]"
             )
             if st.button("Fill Long Basket", key="fill_long_cross"):
                 if long_pasted_text:
@@ -543,9 +552,7 @@ with tab1:
                             values = long_pasted_text.split(
                                 '\t') if '\t' in long_pasted_text else long_pasted_text.split(',')
                             row_data = {}
-                            for i, col in enumerate(
-                                    ['Variance Asset', 'Corridor Condition Asset', 'Strike Cross Corridor (%)',
-                                     'Strike Mono Var Swap (%)', 'Min Weight', 'Max Weight']):
+                            for i, col in enumerate(_xc_paste_cols):
                                 row_data[col] = [values[i] if i < len(values) else '']
                             st.session_state.long_df_cross = pd.DataFrame(row_data)
                         else:
@@ -559,9 +566,7 @@ with tab1:
                                 df = df.iloc[1:].reset_index(drop=True)
                                 st.toast("⚠️ Header row detected and skipped", icon="ℹ️")
                             new_data = pd.DataFrame()
-                            for i, col in enumerate(
-                                    ['Variance Asset', 'Corridor Condition Asset', 'Strike Cross Corridor (%)',
-                                     'Strike Mono Var Swap (%)', 'Min Weight', 'Max Weight']):
+                            for i, col in enumerate(_xc_paste_cols):
                                 new_data[col] = df.iloc[:, i] if i < df.shape[1] else [''] * len(df)
                             st.session_state.long_df_cross = new_data
                         st.rerun()
@@ -573,8 +578,10 @@ with tab1:
                 _opt_std_cols = ['Underlying', 'Strike (%)', 'Min Weight', 'Max Weight']
             else:
                 _opt_std_cols = ['Variance Asset', 'Strike Mono Var Swap (%)', 'Min Weight', 'Max Weight']
-            # Reset if columns changed (product type switch)
-            if 'long_df' not in st.session_state or list(st.session_state.long_df.columns) != _opt_std_cols:
+            # Reset only on a product-type switch (base columns absent), NOT when
+            # the optional 'Vega cap' column has been added by a paste.
+            if 'long_df' not in st.session_state or not all(
+                    c in st.session_state.long_df.columns for c in _opt_std_cols):
                 st.session_state.long_df = pd.DataFrame({
                     _opt_std_cols[0]: ['SAN FP Equity', 'BNP FP Equity', 'ACA FP Equity', 'GLE FP Equity',
                                        'DBK GR Equity', 'CBK GR Equity', 'ISP IM Equity', 'UCG IM Equity',
@@ -583,17 +590,26 @@ with tab1:
                     'Min Weight': [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
                     'Max Weight': [25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25]
                 })
+            _std_show_cols = _opt_std_cols + (['Vega cap'] if st.session_state.get('_vega_toggle', False) else [])
+            _std_paste_cols = _opt_std_cols + ['Vega cap']
+            _std_show = st.session_state.long_df.copy()
+            for _c in _std_show_cols:
+                if _c not in _std_show.columns:
+                    _std_show[_c] = ''
             st.data_editor(
-                st.session_state.long_df,
+                _std_show[_std_show_cols],
                 num_rows="dynamic",
                 use_container_width=True,
-                key="long_editor"
+                key="long_editor",
+                column_order=_std_show_cols,
             )
+            if st.session_state.get('_vega_toggle', False):
+                st.caption("`Vega cap` (optional) = max absolute Vega on that name; blank = no cap.")
             long_pasted_text = st.text_area(
                 "Paste long basket data here:",
                 height=100,
                 key="long_paste",
-                help=f"Format: {', '.join(_opt_std_cols)}"
+                help=f"Format: {', '.join(_opt_std_cols)}[, Vega cap]"
             )
             if st.button("Fill Long Basket", key="fill_long"):
                 if long_pasted_text:
@@ -602,7 +618,7 @@ with tab1:
                             values = long_pasted_text.split(
                                 '\t') if '\t' in long_pasted_text else long_pasted_text.split(',')
                             row_data = {}
-                            for i, col in enumerate(_opt_std_cols):
+                            for i, col in enumerate(_std_paste_cols):
                                 row_data[col] = [values[i] if i < len(values) else '']
                             st.session_state.long_df = pd.DataFrame(row_data)
                         else:
@@ -610,7 +626,7 @@ with tab1:
                                              sep='\t' if '\t' in long_pasted_text else ',',
                                              header=None)
                             new_data = pd.DataFrame()
-                            for i, col in enumerate(_opt_std_cols):
+                            for i, col in enumerate(_std_paste_cols):
                                 new_data[col] = df.iloc[:, i] if i < df.shape[1] else [''] * len(df)
                             st.session_state.long_df = new_data
                         st.rerun()
@@ -895,10 +911,11 @@ with tab1:
 
             def _inject_axes_groups(df, is_xc):
                 """Attach 'Sector' (from the 2 group name-lists) and, in Vega mode,
-                'Axe Target'/'Axe Cap' (from the per-name Vega inventory) onto a COPY
-                of the candidate df — matched by the per-row candidate key (Corridor
-                Condition Asset in cross-corridor, else Variance Asset). The engine
-                already reads these columns; this is pure UI→engine glue.
+                the engine's 'Axe Cap' (from the candidate table's per-row 'Vega cap'
+                column) and 'Axe Target' (from the axe-targets widget, matched by the
+                per-row candidate key: Corridor Condition Asset in cross-corridor, else
+                Variance Asset) onto a COPY of the candidate df. The engine already
+                reads these columns; this is pure UI→engine glue.
                 Returns (df, warnings)."""
                 warns = []
                 if df is None or df.empty:
@@ -930,54 +947,56 @@ with tab1:
                                    if str(nm).strip().casefold() not in cand})
                     if miss:
                         warns.append(f"Group names not in the candidate universe (ignored): {miss}")
-                # ── Vega inventory → Axe Target / Axe Cap ──
+                # ── Vega mode: cap from the candidate table, axe target from the widget ──
                 if st.session_state.get('_vega_toggle', False):
+                    # Per-name absolute cap: read straight from the candidate table's
+                    # 'Vega cap' column (already row-aligned) → engine 'Axe Cap'.
+                    if 'Vega cap' in df.columns:
+                        df['Axe Cap'] = df['Vega cap']
+                    # Axe target (recycling inventory): from the dedicated widget, name-matched.
                     inv = st.session_state.get('_vega_inv_df')
                     if inv is not None and not inv.empty:
-                        tgt, cap = {}, {}
+                        tgt = {}
                         for _, r in inv.iterrows():
                             k = str(r.get('Name', '')).strip().casefold()
                             if not k:
                                 continue
                             tgt[k] = r.get('Axe target', '')
-                            cap[k] = r.get('Vega cap', '')
                         df['Axe Target'] = [tgt.get(k, '') for k in keys]
-                        df['Axe Cap'] = [cap.get(k, '') for k in keys]
                         miss_v = sorted({str(r.get('Name', '')) for _, r in inv.iterrows()
                                          if str(r.get('Name', '')).strip().casefold()
                                          and str(r.get('Name', '')).strip().casefold() not in cand})
                         if miss_v:
-                            warns.append(f"Vega inventory — names not in the candidate universe (ignored): {miss_v}")
+                            warns.append(f"Axe targets — names not in the candidate universe (ignored): {miss_v}")
                 return df, warns
 
             vega_on = st.toggle(
                 "⚡ Absolute Vega mode (axe recycling)", value=False, key="_vega_toggle",
                 help="OFF = historical percentage weights (sum=1). ON = absolute Vega "
-                     "per name with free total V in [V min, V max]; Min/Max Weight "
-                     "become concentration bounds on v_i/V. When ON, a dedicated "
-                     "per-name Vega inventory table appears below (Axe target + Vega cap "
-                     "per name). Basket P&L stays Σ(v_i·pnl_i)/V — comparable OFF.")
+                     "per name with free total V in [V min, V max]; Min/Max Weight still "
+                     "cap concentration (v_i/V). A per-name absolute cap lives in the "
+                     "candidate table's 'Vega cap' column; axe targets (recycling) go in "
+                     "the list below. Basket P&L stays Σ(v_i·pnl_i)/V — comparable OFF.")
             if vega_on:
                 st.markdown("**⚡ Vega settings**")
                 st.caption("Total package Vega V is free within these bounds:")
                 _vg_c1, _vg_c2 = st.columns(2)
                 vega_v_min = _vg_c1.number_input("Total V — min", value=50.0, min_value=0.01)
                 vega_v_max = _vg_c2.number_input("Total V — max", value=200.0, min_value=0.01)
-                st.markdown("**Per-name inventory**")
+                st.markdown("**Axe targets (recycling) — optional**")
                 st.caption(
-                    "Paste one line per name: `Name  Axe target  Vega cap` (tab or comma), "
-                    "then **Fill**. **Axe target** = the axe to recycle on that name; "
-                    "**Vega cap** = the max v_i allowed for that name (**leave blank = no "
-                    "cap**). Names must also appear in the candidate table above.")
+                    "Paste one line per name: `Name  Axe target` (tab or comma), then "
+                    "**Fill**. Axe target = the axe you want to recycle on that name. "
+                    "(Per-name Vega caps are set in the candidate table, not here.) "
+                    "Names must also appear in the candidate table above.")
                 if '_vega_inv_df' not in st.session_state:
                     st.session_state['_vega_inv_df'] = pd.DataFrame(
                         {'Name': pd.Series(dtype='str'),
-                         'Axe target': pd.Series(dtype='float'),
-                         'Vega cap': pd.Series(dtype='float')})
+                         'Axe target': pd.Series(dtype='float')})
                 _vega_paste = st.text_area(
-                    "Paste Vega inventory (Name, Axe target, Vega cap)",
+                    "Paste axe targets (Name, Axe target)",
                     value="", height=100, key="_vega_inv_paste")
-                if st.button("Fill Vega inventory", key="_vega_inv_fill"):
+                if st.button("Fill axe targets", key="_vega_inv_fill"):
                     if _vega_paste.strip():
                         try:
                             _rows = []
@@ -990,12 +1009,11 @@ with tab1:
                                 _rows.append({
                                     'Name': _p[0] if len(_p) > 0 else '',
                                     'Axe target': _p[1] if len(_p) > 1 else '',
-                                    'Vega cap': _p[2] if len(_p) > 2 else '',
                                 })
                             st.session_state['_vega_inv_df'] = pd.DataFrame(_rows)
                             st.rerun()
                         except Exception as _ve:
-                            st.error(f"Vega inventory error: {_ve}")
+                            st.error(f"Axe targets error: {_ve}")
                 _vega_inv_edited = st.data_editor(
                     st.session_state['_vega_inv_df'],
                     num_rows="dynamic", use_container_width=True, key="_vega_inv_editor")
@@ -1015,9 +1033,9 @@ with tab1:
                                and _inv_now['Axe target'].astype(str).str.strip().replace('nan', '').any())
                 if recycle_weight > 0 and not _has_target:
                     st.warning(
-                        "♻️ Recycling weight > 0 but the Vega inventory has no Axe target — "
-                        "the criterion would be auto-deactivated (degenerate metric). Fill "
-                        "the inventory above so it counts.")
+                        "♻️ Recycling weight > 0 but no Axe target is set — the criterion "
+                        "would be auto-deactivated (degenerate metric). Fill the axe-targets "
+                        "list above so it counts.")
             else:
                 vega_v_min = None
                 vega_v_max = None
