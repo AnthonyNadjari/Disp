@@ -270,9 +270,9 @@ def _render_optimization_result(result, is_cross, debug_info=None):
             col_v3.metric("Package recycled", f"{result.axe_recycled * 100:.1f}%")
         st.caption(
             "Vega allocation below = the actual trade (vᵢ = wᵢ·V). The two axe "
-            "figures are a separate overlay: **book cleaned** = Σ min(vᵢ, cibleᵢ)/Σ cibles, "
-            "**package recycled** = Σ min(vᵢ, cibleᵢ)/V. 0% means none of the SELECTED "
-            "names had a matched Cible — check the Vega inventory names match the "
+            "figures are a separate overlay: **book cleaned** = Σ min(vᵢ, targetᵢ)/Σ targets, "
+            "**package recycled** = Σ min(vᵢ, targetᵢ)/V. 0% means none of the SELECTED "
+            "names had a matched Axe target — check the Vega inventory names match the "
             "candidates (a mismatch warning is shown above the run).")
         if result.vega_basket:
             with st.expander("⚡ Vega allocation (absolute)", expanded=False):
@@ -820,48 +820,52 @@ with tab1:
         col44, col45 = st.columns(2)
         with col44:
             st.subheader("🎯 Basket Size Constraints")
-            min_stocks_long = st.number_input("Min stocks in long basket", step=1, value=3)
-            max_stocks_long = st.number_input("Max stocks in long basket", step=1, value=8)
-            min_stocks_short = st.number_input("Min stocks in short basket", step=1, value=2)
-            max_stocks_short = st.number_input("Max stocks in short basket", step=1, value=5)
-            max_strike = st.number_input("Max net strike (%)", value=15.00)
-            time_limit = st.number_input("Time Limit (seconds)", max_value=600, value=20)
-            seed = st.number_input("Random seed", value=0, step=1, min_value=0)
+            _sz1, _sz2 = st.columns(2)
+            min_stocks_long = _sz1.number_input("Min stocks (long)", step=1, value=3)
+            max_stocks_long = _sz2.number_input("Max stocks (long)", step=1, value=8)
+            min_stocks_short = _sz1.number_input("Min stocks (short)", step=1, value=2)
+            max_stocks_short = _sz2.number_input("Max stocks (short)", step=1, value=5)
+            _sz3, _sz4, _sz5 = st.columns(3)
+            max_strike = _sz3.number_input("Max net strike (%)", value=15.00)
+            time_limit = _sz4.number_input(
+                "Time limit (s)", max_value=600, value=20,
+                help="Bounds the GA search only — Bloomberg load, reference fitting and "
+                     "the post-GA polish are extra wall time.")
+            seed = _sz5.number_input("Random seed", value=0, step=1, min_value=0)
             forced_tickers_raw = st.text_area(
                 "🔒 Force names in basket (one per line or comma-separated)",
                 value="", height=68,
                 help="These names WILL be in the final basket. Their weights stay "
                      "governed by the Min/Max Weight inputs. Never removed by the 0%-HR filter.")
-            with st.expander("🌍 Groupes (max 2) — borne le % et/ou le nombre de noms par groupe"):
+            with st.expander("🌍 Groups (max 2) — cap the % and/or the number of names per group"):
                 st.caption(
-                    "Colle une liste de noms par groupe, puis borne son poids (%) "
-                    "et/ou son nombre de noms **dans le panier final**. Un nom ne peut "
-                    "appartenir qu'à un seul groupe ; les noms hors groupe restent "
-                    "libres (pas besoin de tout partitionner). Valeurs neutres = pas "
-                    "de contrainte : 0 % = pas de plancher, 100 % = pas de plafond, "
-                    "0 nom = pas de limite.")
+                    "Paste a list of names per group, then bound its weight (%) and/or "
+                    "its number of names **in the final basket**. A name can belong to "
+                    "at most one group; names outside every group stay free (no need to "
+                    "partition everything). Neutral values = no constraint: 0 % = no "
+                    "floor, 100 % = no cap, 0 names = no limit.")
                 _grp_spec = []
                 for _gi, _gph in ((1, "US"), (2, "EU")):
-                    st.markdown(f"**Groupe {_gi}**")
+                    st.markdown(f"**Group {_gi}**")
                     _glabel = st.text_input(
-                        f"Libellé du groupe {_gi}", key=f"_grp{_gi}_label",
-                        placeholder=f"ex. {_gph}")
+                        f"Group {_gi} label", key=f"_grp{_gi}_label",
+                        placeholder=f"e.g. {_gph}")
                     _gnames_raw = st.text_area(
-                        f"Noms du groupe {_gi} (un par ligne ou séparés par des virgules)",
+                        f"Group {_gi} names (one per line or comma-separated)",
                         value="", height=68, key=f"_grp{_gi}_names")
                     _gc1, _gc2, _gc3, _gc4 = st.columns(4)
-                    _minw = _gc1.number_input("% min", min_value=0.0, max_value=100.0,
+                    _minw = _gc1.number_input("Min %", min_value=0.0, max_value=100.0,
                                               value=0.0, step=1.0, key=f"_grp{_gi}_minw")
-                    _maxw = _gc2.number_input("% max", min_value=0.0, max_value=100.0,
+                    _maxw = _gc2.number_input("Max %", min_value=0.0, max_value=100.0,
                                               value=100.0, step=1.0, key=f"_grp{_gi}_maxw")
-                    _minn = _gc3.number_input("Nb min", min_value=0, value=0, step=1,
+                    _minn = _gc3.number_input("Min names", min_value=0, value=0, step=1,
                                               key=f"_grp{_gi}_minn")
-                    _maxn = _gc4.number_input("Nb max", min_value=0, value=0, step=1,
+                    _maxn = _gc4.number_input("Max names", min_value=0, value=0, step=1,
                                               key=f"_grp{_gi}_maxn")
                     _gnames = [t.strip() for t in (_gnames_raw or "").replace(',', '\n').splitlines()
                                if t.strip()]
                     _grp_spec.append({
-                        'label': (_glabel.strip() or f"Groupe {_gi}"),
+                        'label': (_glabel.strip() or f"Group {_gi}"),
                         'names': _gnames,
                         'min_w': float(_minw), 'max_w': float(_maxw),
                         'min_n': int(_minn), 'max_n': int(_maxn),
@@ -918,32 +922,32 @@ with tab1:
                             continue
                         name2grp[k] = g['label']
                 if overlap:
-                    warns.append(f"Noms présents dans deux groupes (gardés dans le 1er): "
+                    warns.append(f"Names present in two groups (kept in the first): "
                                  f"{sorted(set(map(str, overlap)))}")
                 if name2grp:
                     df['Sector'] = [name2grp.get(k, '') for k in keys]
                     miss = sorted({str(nm) for g in groups for nm in (g.get('names') or [])
                                    if str(nm).strip().casefold() not in cand})
                     if miss:
-                        warns.append(f"Noms de groupe absents des candidats (ignorés): {miss}")
+                        warns.append(f"Group names not in the candidate universe (ignored): {miss}")
                 # ── Vega inventory → Axe Target / Axe Cap ──
                 if st.session_state.get('_vega_toggle', False):
                     inv = st.session_state.get('_vega_inv_df')
                     if inv is not None and not inv.empty:
                         tgt, cap = {}, {}
                         for _, r in inv.iterrows():
-                            k = str(r.get('Nom', '')).strip().casefold()
+                            k = str(r.get('Name', '')).strip().casefold()
                             if not k:
                                 continue
-                            tgt[k] = r.get('Cible', '')
-                            cap[k] = r.get('Plafond', '')
+                            tgt[k] = r.get('Axe target', '')
+                            cap[k] = r.get('Vega cap', '')
                         df['Axe Target'] = [tgt.get(k, '') for k in keys]
                         df['Axe Cap'] = [cap.get(k, '') for k in keys]
-                        miss_v = sorted({str(r.get('Nom', '')) for _, r in inv.iterrows()
-                                         if str(r.get('Nom', '')).strip().casefold()
-                                         and str(r.get('Nom', '')).strip().casefold() not in cand})
+                        miss_v = sorted({str(r.get('Name', '')) for _, r in inv.iterrows()
+                                         if str(r.get('Name', '')).strip().casefold()
+                                         and str(r.get('Name', '')).strip().casefold() not in cand})
                         if miss_v:
-                            warns.append(f"Inventaire Vega — noms absents des candidats (ignorés): {miss_v}")
+                            warns.append(f"Vega inventory — names not in the candidate universe (ignored): {miss_v}")
                 return df, warns
 
             vega_on = st.toggle(
@@ -951,26 +955,29 @@ with tab1:
                 help="OFF = historical percentage weights (sum=1). ON = absolute Vega "
                      "per name with free total V in [V min, V max]; Min/Max Weight "
                      "become concentration bounds on v_i/V. When ON, a dedicated "
-                     "'Inventaire Vega par nom' table appears below (Cible + Plafond "
+                     "per-name Vega inventory table appears below (Axe target + Vega cap "
                      "per name). Basket P&L stays Σ(v_i·pnl_i)/V — comparable OFF.")
             if vega_on:
+                st.markdown("**⚡ Vega settings**")
+                st.caption("Total package Vega V is free within these bounds:")
                 _vg_c1, _vg_c2 = st.columns(2)
-                vega_v_min = _vg_c1.number_input("V min (Vega)", value=50.0, min_value=0.01)
-                vega_v_max = _vg_c2.number_input("V max (Vega)", value=200.0, min_value=0.01)
-                st.markdown("**⚡ Inventaire Vega par nom (cible + plafond)**")
+                vega_v_min = _vg_c1.number_input("Total V — min", value=50.0, min_value=0.01)
+                vega_v_max = _vg_c2.number_input("Total V — max", value=200.0, min_value=0.01)
+                st.markdown("**Per-name inventory**")
                 st.caption(
-                    "Colle une ligne par nom : `Nom  Cible  Plafond` (tab ou virgule), "
-                    "puis « Remplir ». Cible = axe à recycler ; Plafond = v_i max pour "
-                    "ce nom. Les noms doivent aussi figurer dans la table de candidats.")
+                    "Paste one line per name: `Name  Axe target  Vega cap` (tab or comma), "
+                    "then **Fill**. **Axe target** = the axe to recycle on that name; "
+                    "**Vega cap** = the max v_i allowed for that name (**leave blank = no "
+                    "cap**). Names must also appear in the candidate table above.")
                 if '_vega_inv_df' not in st.session_state:
                     st.session_state['_vega_inv_df'] = pd.DataFrame(
-                        {'Nom': pd.Series(dtype='str'),
-                         'Cible': pd.Series(dtype='float'),
-                         'Plafond': pd.Series(dtype='float')})
+                        {'Name': pd.Series(dtype='str'),
+                         'Axe target': pd.Series(dtype='float'),
+                         'Vega cap': pd.Series(dtype='float')})
                 _vega_paste = st.text_area(
-                    "Coller l'inventaire Vega (Nom, Cible, Plafond)",
+                    "Paste Vega inventory (Name, Axe target, Vega cap)",
                     value="", height=100, key="_vega_inv_paste")
-                if st.button("Remplir l'inventaire Vega", key="_vega_inv_fill"):
+                if st.button("Fill Vega inventory", key="_vega_inv_fill"):
                     if _vega_paste.strip():
                         try:
                             _rows = []
@@ -981,37 +988,36 @@ with tab1:
                                 _sep = '\t' if '\t' in _line else ','
                                 _p = [x.strip() for x in _line.split(_sep)]
                                 _rows.append({
-                                    'Nom': _p[0] if len(_p) > 0 else '',
-                                    'Cible': _p[1] if len(_p) > 1 else '',
-                                    'Plafond': _p[2] if len(_p) > 2 else '',
+                                    'Name': _p[0] if len(_p) > 0 else '',
+                                    'Axe target': _p[1] if len(_p) > 1 else '',
+                                    'Vega cap': _p[2] if len(_p) > 2 else '',
                                 })
                             st.session_state['_vega_inv_df'] = pd.DataFrame(_rows)
                             st.rerun()
                         except Exception as _ve:
-                            st.error(f"Erreur inventaire Vega: {_ve}")
+                            st.error(f"Vega inventory error: {_ve}")
                 _vega_inv_edited = st.data_editor(
                     st.session_state['_vega_inv_df'],
                     num_rows="dynamic", use_container_width=True, key="_vega_inv_editor")
                 st.session_state['_vega_inv_df'] = _vega_inv_edited
-                st.markdown("**♻️ Priorité recyclage**")
                 recycle_weight = st.number_input(
-                    "Poids priorité recyclage (package)", step=0.01, min_value=0.00,
+                    "♻️ Recycling priority weight (package)", step=0.01, min_value=0.00,
                     max_value=1.00, value=0.30, key="_recycle_weight",
-                    help="À quel point privilégier un panier CONCENTRÉ en axe "
-                         "(critère B = Σ min(vega_i, cible_i) / V). Entre dans le même "
-                         "mélange normalisé que les autres poids (last_carry, mean_payoff, "
-                         "hit_ratio, min_payoff). 0 = inactif.")
+                    help="How strongly to favour a basket CONCENTRATED in axe "
+                         "(criterion B = Σ min(v_i, target_i) / V). Enters the same "
+                         "normalized blend as the other weights (last_carry, mean_payoff, "
+                         "hit_ratio, min_payoff). 0 = inactive.")
                 # Guard against the silent auto-deactivation the user hit: recycling
                 # asked for, but no axe target anywhere → degenerate metric → dropped.
                 _inv_now = st.session_state.get('_vega_inv_df')
                 _has_target = (_inv_now is not None and not _inv_now.empty
-                               and 'Cible' in _inv_now.columns
-                               and _inv_now['Cible'].astype(str).str.strip().replace('nan', '').any())
+                               and 'Axe target' in _inv_now.columns
+                               and _inv_now['Axe target'].astype(str).str.strip().replace('nan', '').any())
                 if recycle_weight > 0 and not _has_target:
                     st.warning(
-                        "♻️ Poids recyclage > 0 mais l'inventaire Vega est vide (aucune "
-                        "Cible) — le critère serait automatiquement désactivé (métrique "
-                        "dégénérée). Remplis l'inventaire ci-dessus pour qu'il compte.")
+                        "♻️ Recycling weight > 0 but the Vega inventory has no Axe target — "
+                        "the criterion would be auto-deactivated (degenerate metric). Fill "
+                        "the inventory above so it counts.")
             else:
                 vega_v_min = None
                 vega_v_max = None
@@ -1059,7 +1065,7 @@ with tab1:
                                                         max_value=1.00, value=0.00,
                                                         help="Minimize the basket's weighted net strike. "
                                                              "The Max net strike hard limit stays active independently.")
-                # Recycling priority is now the dedicated '♻️ Priorité recyclage'
+                # Recycling priority is now the dedicated 'Recycling priority weight'
                 # knob in the Vega block above (criterion B = axe_package_recycled).
                 # Criterion A (axe_book_cleaned) is retired per design decision.
                 axe_cleaned_weight = 0.0
