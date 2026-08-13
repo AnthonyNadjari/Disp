@@ -973,6 +973,23 @@ with tab1:
                             warns.append(f"Axe targets — names not in the candidate universe (ignored): {miss_v}")
                 return df, warns
 
+        with col45:
+            st.subheader("⚖️ Optimization Weights")
+            col18, col19 = st.columns(2)
+            with col18:
+                last_carry_weight = st.number_input("Last carry weight", step=0.01, min_value=0.00,
+                                                    max_value=1.00, value=0.30,
+                                                    help="Recent payoff (last maturities)")
+                mean_payoff_weight = st.number_input("Mean payoff weight", step=0.01, min_value=0.00,
+                                                     max_value=1.00, value=0.30,
+                                                     help="Average payoff over the backtest window")
+            with col19:
+                hit_ratio_weight = st.number_input("Hit ratio weight", step=0.01, min_value=0.00,
+                                                   max_value=1.00, value=0.30,
+                                                   help="Fraction of positive payoffs")
+                min_payoff_weight = st.number_input("Min payoff weight", step=0.01, min_value=0.00,
+                                                    max_value=1.00, value=0.10,
+                                                    help="Worst single payoff (floor protection)")
             st.divider()
             st.markdown("**⚡ Vega**")
             vega_on = st.toggle(
@@ -983,6 +1000,9 @@ with tab1:
                      "candidate table's 'Vega cap' column; axe targets (recycling) go in "
                      "the list below. Basket P&L stays Σ(v_i·pnl_i)/V — comparable OFF.")
             if vega_on:
+                st.info("💡 A per-name **Vega cap** column is now available in the Long "
+                        "Basket Candidates table above — set a max Vega per name there "
+                        "(blank = no cap).")
                 st.markdown("**⚡ Vega settings**")
                 st.caption("Total package Vega V is free within these bounds:")
                 _vg_c1, _vg_c2 = st.columns(2)
@@ -1045,23 +1065,6 @@ with tab1:
                 vega_v_min = None
                 vega_v_max = None
                 recycle_weight = 0.0
-        with col45:
-            st.subheader("⚖️ Optimization Weights")
-            col18, col19 = st.columns(2)
-            with col18:
-                last_carry_weight = st.number_input("Last carry weight", step=0.01, min_value=0.00,
-                                                    max_value=1.00, value=0.30,
-                                                    help="Recent payoff (last maturities)")
-                mean_payoff_weight = st.number_input("Mean payoff weight", step=0.01, min_value=0.00,
-                                                     max_value=1.00, value=0.30,
-                                                     help="Average payoff over the backtest window")
-            with col19:
-                hit_ratio_weight = st.number_input("Hit ratio weight", step=0.01, min_value=0.00,
-                                                   max_value=1.00, value=0.30,
-                                                   help="Fraction of positive payoffs")
-                min_payoff_weight = st.number_input("Min payoff weight", step=0.01, min_value=0.00,
-                                                    max_value=1.00, value=0.10,
-                                                    help="Worst single payoff (floor protection)")
             with st.expander("➕ Optional criteria (0 = inactive)"):
                 col19b, col19c = st.columns(2)
                 with col19b:
