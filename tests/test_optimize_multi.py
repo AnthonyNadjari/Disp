@@ -45,7 +45,7 @@ def api_offline_counted(monkeypatch):
         def fake_load(self, basket):
             counter["loads"] += 1
             legs = list(basket.long_candidates) + list(basket.short_candidates)
-            return {"price_data": price_df, "index_data": None, "legs": legs,
+            return {"variance_px": price_df, "corridor_px": None, "legs": legs,
                     "long_legs": list(basket.long_candidates),
                     "short_legs": list(basket.short_candidates)}
 

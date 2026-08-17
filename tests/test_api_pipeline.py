@@ -46,8 +46,8 @@ def api_offline(monkeypatch):
         def fake_load(self, basket):
             legs = list(basket.long_candidates) + list(basket.short_candidates)
             return {
-                "price_data": price_df,
-                "index_data": None,
+                "variance_px": price_df,
+                "corridor_px": None,
                 "legs": legs,
                 "long_legs": list(basket.long_candidates),
                 "short_legs": list(basket.short_candidates),

@@ -82,7 +82,7 @@ def _convert_bt_df_cross(df):
     result = pd.DataFrame(rows)
     return result
 
-def _run_bt(src_df, is_vol_swap, n_exp, local_floor, local_cap,
+def _run_bt(src_df, is_vol_swap, n_exp, local_cap,
             global_floor, global_cap, ubar, dbar, adj_divs="No",
             start_date=None, is_cross_corridor=False, missing_data_policy="Adaptive Reweight"):
     """Run backtest via new API, return (timeseries_df, metadata_dict, figure, None)."""
@@ -1566,10 +1566,10 @@ with tab1:
                         _smooth_basket = list(zip(_basket_keys, _w_smooth.tolist()))
                         _bt = DispersionBacktester(_ss["internal_cfg"])
                         _bt_kwargs = dict(
-                            price_data=_ss["price_data_all"],
+                            variance_px=_ss["variance_px_all"],
                             short_basket=_last_run.short_basket,
                             legs=_ss["legs"],
-                            index_data=_ss["index_data_all"],
+                            corridor_px=_ss["corridor_px_all"],
                             start_date=_ss["start_date"],
                         )
                         try:
@@ -1856,7 +1856,7 @@ with tab3:
             # Run backtest
             if is_cross_corridor:
                 df_res_basket, backtest_metadata, graph_data, cross_corridor_data = _run_bt(
-                    st.session_state.edited_df_cross, is_vol_swap, n_exp, local_floor, local_cap,
+                    st.session_state.edited_df_cross, is_vol_swap, n_exp, local_cap,
                     global_floor, global_cap, ubar, dbar, adj_divs=adj_divs,
                     start_date=bt_start_date,
                     is_cross_corridor=True,
@@ -1898,7 +1898,7 @@ with tab3:
                         st.session_state['fig_sectorial'] = sectorial_result['fig']
             else:
                 df_res_basket, backtest_metadata, graph_data, cross_corridor_data = _run_bt(
-                    st.session_state.edited_df_bis, is_vol_swap, n_exp, local_floor, local_cap,
+                    st.session_state.edited_df_bis, is_vol_swap, n_exp, local_cap,
                     global_floor, global_cap, ubar, dbar, adj_divs=adj_divs,
                     start_date=bt_start_date,
                     is_cross_corridor=False,
@@ -2040,17 +2040,17 @@ with tab3:
                             # Cross-corridor: show stock leg and index leg separately
                             if is_cross_corridor and _cross_legs_2 is not None and isinstance(_cross_legs_2,
                                                                                               pd.DataFrame):
-                                stock_leg_col = f"{col} (stock leg)"
+                                stock_leg_col = f"{col} (mono leg — stock var)"
                                 index_leg_col = None
                                 for c in _cross_legs_2.columns:
-                                    if c.startswith(f"{col} (index leg"):
+                                    if c.startswith(f"{col} (cross leg"):
                                         index_leg_col = c
                                         break
                                 if stock_leg_col in _cross_legs_2.columns and index_leg_col:
                                     st.caption("**Individual Legs**")
                                     legs_df = pd.DataFrame({
-                                        "Stock Leg": _cross_legs_2[stock_leg_col],
-                                        "Index Leg": _cross_legs_2[index_leg_col],
+                                        "Mono Leg (stock)": _cross_legs_2[stock_leg_col],
+                                        "Cross Leg (index)": _cross_legs_2[index_leg_col],
                                     }).dropna()
                                     st.line_chart(legs_df, use_container_width=True)
         # ✅ NEW: Conditional plotting based on toggle
@@ -2154,7 +2154,7 @@ with tab3:
                 df_for_60d = st.session_state.edited_df_cross if is_cross_corridor else st.session_state.edited_df_bis
                 # Generate 60D backtest
                 df_res_60d, _, _, _ = _run_bt(
-                    df_for_60d, is_vol_swap, 60, local_floor, local_cap,
+                    df_for_60d, is_vol_swap, 60, local_cap,
                     global_floor, global_cap, ubar, dbar, adj_divs=adj_divs,
                     start_date=bt_start_date,
                     is_cross_corridor=is_cross_corridor
@@ -2196,7 +2196,7 @@ with tab3:
                     if 'email_60d_graph' not in st.session_state or 'fig_60d_split' not in st.session_state:
                         df_for_60d = st.session_state.edited_df_cross if is_cross_corridor else st.session_state.edited_df_bis
                         df_res_60d, _, _, _ = _run_bt(
-                            df_for_60d, is_vol_swap, 60, local_floor, local_cap,
+                            df_for_60d, is_vol_swap, 60, local_cap,
                             global_floor, global_cap, ubar, dbar, adj_divs=adj_divs,
                             start_date=bt_start_date,
                             is_cross_corridor=is_cross_corridor

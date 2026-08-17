@@ -1,13 +1,43 @@
 """
 Backtest engine — swap calculation, basket backtesting, and data loading.
-Handles:
-  - DROP_INCOMPLETE_DAYS: only keep days where ALL legs have data
-  - ADAPTIVE_REWEIGHT: redistribute weights for missing legs, track active count
-  - Direct Bloomberg fetch via xbbg for price data
+
+NAMING CONVENTION (the reference for this whole package — name by ROLE, never
+by asset class, because the class is only the usual case while the role never
+flips):
+
+  Variance Asset            usually the INDEX (e.g. 'HSCEI Index').
+                            Underlies the CROSS leg: index variance observed
+                            inside the stock's corridor. Shared across rows.
+                            Its price series is ``variance_px``.
+
+  Corridor Condition Asset  usually the STOCK (e.g. '005930 KP Equity').
+                            Underlies the MONO leg (var/vol swap on the stock),
+                            defines the corridor for BOTH legs, and is the
+                            per-name key (P&L column, forced tickers, vega).
+                            Its price series is ``corridor_px``.
+
+  Cross-corridor leg P&L  = ( MONO(stock) − CROSS(index) ) × 100
+                            pnl_mono / pnl_cross in code. "Long/Short Leg" in
+                            results refers to the BASKET sides, never to
+                            mono/cross.
+
+  Mono mode (cross_corridor=False): each leg's variance_px is the traded name
+  itself; the corridor is observed on itself (corridor product) or absent
+  (vol swap). The same role names hold.
+
+Missing-data policies (how gap days are filled):
+  - FILL_ZERO             gap day contributes 0 for that name (legacy Gaia_PP)
+  - DROP_INCOMPLETE_DAYS  keep only days where EVERY weighted name trades
+  - ADAPTIVE_REWEIGHT     redistribute a gapped name's weight to active names
+                          (``reweight_grace_days`` can hold its slot open for
+                          short gaps)
+
 Uses numpy throughout for performance — no pandas row iteration.
 """
 
 from __future__ import annotations
+
+import warnings
 
 import numpy as np
 import numba as nb
@@ -227,6 +257,121 @@ class SwapCalculator:
             return _rolling_pnl_corridor(prices, prices, strike, c.barrier_up, c.barrier_down, c.n_exp, c.local_cap)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Shared leg-P&L builders — ONE source of truth for the optimizer matrix
+# (_api._build_pnl_matrix) and the backtester (_compute_all_pnl)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _leg_pnl_cross_corridor(
+    variance_px_col: np.ndarray,
+    corridor_px_col: np.ndarray,
+    leg: DispersionLeg,
+    config: SwapConfig,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Both sub-legs of ONE cross-corridor leg (per the module convention):
+
+        mono  = swap on the STOCK — variance AND corridor on corridor_px_col
+        cross = swap on the INDEX inside the stock's corridor —
+                variance on variance_px_col, corridor on corridor_px_col
+
+    Returns (pnl_mono, pnl_cross), rolling P&L arrays in decimal (×100 is
+    applied by the caller). The leg P&L is pnl_mono − pnl_cross.
+    """
+    strike_cross = leg.strike_cross_corridor if leg.strike_cross_corridor else leg.strike_mono_var_swap
+    if config.is_vol_swap:
+        pnl_mono = _rolling_pnl_volswap(
+            corridor_px_col, leg.strike_mono_var_swap, config.n_exp, config.local_cap)
+        pnl_cross = _rolling_pnl_volswap(
+            variance_px_col, strike_cross, config.n_exp, config.local_cap)
+    else:
+        pnl_mono = _rolling_pnl_corridor(
+            corridor_px_col, corridor_px_col, leg.strike_mono_var_swap,
+            config.barrier_up, config.barrier_down, config.n_exp, config.local_cap)
+        pnl_cross = _rolling_pnl_corridor(
+            variance_px_col, corridor_px_col, strike_cross,
+            config.barrier_up, config.barrier_down, config.n_exp, config.local_cap)
+    return pnl_mono, pnl_cross
+
+
+def compute_leg_pnl_columns(
+    variance_px: pd.DataFrame,
+    corridor_px: Optional[pd.DataFrame],
+    legs: List[DispersionLeg],
+    config: SwapConfig,
+    capture_cross_legs: bool = False,
+) -> Tuple[np.ndarray, List[str], Dict[str, dict]]:
+    """Per-leg P&L columns — the single builder behind both engines.
+
+    Column key = Corridor Condition Asset (the stock) in cross-corridor mode,
+    else Variance Asset. A cross-corridor leg whose corridor price column is
+    missing is DROPPED with a warning — never silently degraded to a plain
+    index swap. A duplicate key raises: columns are keyed by it, so a
+    duplicate would silently misalign every later column.
+
+    Returns (pnl_matrix [n_rows × n_legs], column_keys, cross_legs) where
+    cross_legs maps key → {'mono_pnl','cross_pnl','corridor_asset',
+    'variance_asset'} (populated only when capture_cross_legs and cross mode).
+    """
+    calc = SwapCalculator(config)
+    leg_map: Dict[str, DispersionLeg] = {}
+    column_keys: List[str] = []
+    skipped_missing_corr = []
+    corr_cols = set(corridor_px.columns) if (
+        corridor_px is not None and not getattr(corridor_px, "empty", True)) else set()
+    for leg in legs:
+        if leg.variance_asset not in variance_px.columns:
+            continue
+        if config.is_cross_corridor:
+            if not leg.corridor_condition_asset or leg.corridor_condition_asset not in corr_cols:
+                skipped_missing_corr.append(leg.corridor_condition_asset or leg.variance_asset)
+                continue
+            key = leg.corridor_condition_asset
+        else:
+            key = leg.variance_asset
+        if key in leg_map:
+            key_label = ("Corridor Condition Asset" if config.is_cross_corridor
+                         else "Variance Asset")
+            raise ValueError(
+                f"Duplicate candidate key '{key}': the same {key_label} appears on "
+                f"more than one input row. P&L columns are keyed by it — duplicates "
+                f"would silently misalign the matrix. Keep one row per name.")
+        leg_map[key] = leg
+        column_keys.append(key)
+    if skipped_missing_corr:
+        warnings.warn(
+            f"Cross-corridor: {len(skipped_missing_corr)} leg(s) dropped — their corridor "
+            f"stock price did not load from Bloomberg, so no valid cross-corridor P&L can "
+            f"be computed (no silent fall-back to an index swap). "
+            f"Sample: {sorted(set(map(str, skipped_missing_corr)))[:10]}",
+            stacklevel=2,
+        )
+
+    n_rows = len(variance_px)
+    pnl_matrix = np.full((n_rows, len(column_keys)), np.nan)
+    cross_legs: Dict[str, dict] = {}
+    for i, key in enumerate(column_keys):
+        leg = leg_map[key]
+        variance_px_col = variance_px[leg.variance_asset].values.astype(np.float64)
+        if config.is_cross_corridor:
+            corridor_px_col = corridor_px[leg.corridor_condition_asset].values.astype(np.float64)
+            pnl_mono, pnl_cross = _leg_pnl_cross_corridor(
+                variance_px_col, corridor_px_col, leg, config)
+            n = min(len(pnl_mono), len(pnl_cross), n_rows)
+            pnl_matrix[:n, i] = (pnl_mono[:n] - pnl_cross[:n]) * 100
+            if capture_cross_legs:
+                cross_legs[key] = {
+                    'mono_pnl': pnl_mono[:n] * 100,
+                    'cross_pnl': pnl_cross[:n] * 100,
+                    'corridor_asset': leg.corridor_condition_asset,
+                    'variance_asset': leg.variance_asset,
+                }
+        else:
+            pnl = calc.compute(variance_px_col, leg.strike_mono_var_swap, corridor_prices=None)
+            n = min(len(pnl), n_rows)
+            pnl_matrix[:n, i] = pnl[:n] * 100
+    return pnl_matrix, column_keys, cross_legs
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Dispersion Backtester
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -269,7 +414,7 @@ class DispersionBacktester:
     Usage:
         config = SwapConfig.volswap(n_exp=310, missing_data_policy=MissingDataPolicy.ADAPTIVE_REWEIGHT)
         bt = DispersionBacktester(config)
-        result = bt.run(price_data, legs, weights)
+        result = bt.run(variance_px, legs, weights)
     """
 
     def __init__(self, config: SwapConfig):
@@ -285,20 +430,20 @@ class DispersionBacktester:
 
     def run(
         self,
-        price_data: pd.DataFrame,
+        variance_px: pd.DataFrame,
         legs: List[DispersionLeg],
         weights: Dict[str, float],
-        index_data: Optional[pd.DataFrame] = None,
+        corridor_px: Optional[pd.DataFrame] = None,
         start_date: Optional[date] = None,
         end_date: Optional[date] = None,
     ) -> BacktestResult:
         """
         Run basket backtest.
         Args:
-            price_data: Prices DataFrame (columns = tickers, index = dates)
+            variance_px: Variance Asset prices (columns = tickers, index = dates)
             legs: List of DispersionLeg objects
             weights: {ticker: weight} — positive=long, negative=short
-            index_data: For cross-corridor mode (corridor observation prices)
+            corridor_px: Corridor Condition Asset (stock) prices — cross-corridor only
             start_date: Filter output from this date (default: 5 years ago)
             end_date: Filter output up to this date inclusive (default: no upper bound).
                 Must match the optimizer's scoring window so reported metrics don't
@@ -307,7 +452,7 @@ class DispersionBacktester:
         if start_date is None:
             start_date = date.today() - relativedelta(years=20)  # fetch max available history
         # Step 1: Compute per-leg rolling P&L as numpy matrix
-        pnl_matrix, pnl_column_keys, dates_index = self._compute_all_pnl(price_data, legs, index_data)
+        pnl_matrix, pnl_column_keys, dates_index = self._compute_all_pnl(variance_px, legs, corridor_px)
         # Step 1b: Convert weights to use pnl_column_keys (Corridor Condition Asset for cross-corridor)
         weights_by_key = {}
         for leg in legs:
@@ -390,15 +535,15 @@ class DispersionBacktester:
         if self.config.is_cross_corridor and self._cross_legs:
             leg_columns = {}
             for leg_key, leg_data in self._cross_legs.items():
-                corr_asset = leg_data['corridor_asset']
+                variance_asset = leg_data['variance_asset']
                 # Pad to match dates_index length
-                stock_pnl = np.full(len(dates_index), np.nan)
-                index_pnl = np.full(len(dates_index), np.nan)
-                n = len(leg_data['stock_pnl'])
-                stock_pnl[:n] = leg_data['stock_pnl']
-                index_pnl[:n] = leg_data['index_pnl']
-                leg_columns[f"{leg_key} (stock leg)"] = stock_pnl
-                leg_columns[f"{leg_key} (index leg: {corr_asset})"] = index_pnl
+                stock_pnl = np.full(len(dates_index), np.nan)  # mono leg
+                index_pnl = np.full(len(dates_index), np.nan)  # cross leg
+                n = len(leg_data['mono_pnl'])
+                stock_pnl[:n] = leg_data['mono_pnl']
+                index_pnl[:n] = leg_data['cross_pnl']
+                leg_columns[f"{leg_key} (mono leg — stock var)"] = stock_pnl
+                leg_columns[f"{leg_key} (cross leg — index var: {variance_asset})"] = index_pnl
             cross_leg_df = pd.DataFrame(leg_columns, index=dates_index)
             if valid_mask is not None:
                 cross_leg_df = cross_leg_df[valid_mask]
@@ -411,11 +556,11 @@ class DispersionBacktester:
 
     def run_from_optimization(
         self,
-        price_data: pd.DataFrame,
+        variance_px: pd.DataFrame,
         long_basket: List[Tuple[str, float]],
         short_basket: List[Tuple[str, float]],
         legs: List[DispersionLeg],
-        index_data: Optional[pd.DataFrame] = None,
+        corridor_px: Optional[pd.DataFrame] = None,
         start_date: Optional[date] = None,
         end_date: Optional[date] = None,
     ) -> BacktestResult:
@@ -438,111 +583,32 @@ class DispersionBacktester:
             bt.metrics = {"hit_ratio": 0, "mean_return": 0, "last_value": 0, "max_drawdown": 0, "n_observations": 0}
             return bt
 
-        return self.run(price_data, legs, weights, index_data, start_date, end_date)
+        return self.run(variance_px, legs, weights, corridor_px, start_date, end_date)
 
     # ─── Internal ────────────────────────────────────────────────────────────────
 
     def _compute_all_pnl(
         self,
-        price_data: pd.DataFrame,
+        variance_px: pd.DataFrame,
         legs: List[DispersionLeg],
-        index_data: Optional[pd.DataFrame],
+        corridor_px: Optional[pd.DataFrame],
     ) -> Tuple[np.ndarray, List[str], pd.DatetimeIndex]:
+        """Per-leg P&L matrix via the shared builder `compute_leg_pnl_columns`
+        (same code path as the optimizer matrix), capturing the per-leg
+        mono/cross breakdown for the cross-corridor display.
+
+        Returns: (pnl_matrix [n_rows x n_cols], column_keys, dates_index).
+        NaN means "no data for this leg on this date" — the missing-data
+        policy handles it downstream.
         """
-        Compute per-leg P&L as a pure numpy matrix.
-        For cross-corridor mode:
-          - Each row has Variance Asset (variance_asset field) and Corridor Condition Asset (leg)
-          - Column key = Corridor Condition Asset for uniqueness
-        For standard mode:
-          - Single P&L per leg using its own corridor/prices
-        Returns: (pnl_matrix [n_rows x n_cols], column_keys, dates_index)
-        NOTE: NaN is preserved to indicate "no data for this leg on this date"
-        (e.g. leg not yet listed). The missing-data policy handles NaN downstream.
-        """
-        # Build column keys: for cross-corridor, use Corridor Condition Asset to avoid duplicates
-        leg_map = {}
-        column_keys = []
-        _skipped_corr = []
-        _idx_cols = set(index_data.columns) if (index_data is not None and not getattr(index_data, "empty", True)) else set()
-        for s in legs:
-            if s.variance_asset not in price_data.columns:
-                continue
-            # For cross-corridor: key by Corridor Condition Asset (s.corridor_condition_asset) to avoid
-            # overwriting when all legs share the same Variance Asset (e.g. .SPX)
-            if self.config.is_cross_corridor:
-                # Require the corridor stock price; never silently fall back to a
-                # plain index variance swap (mislabelled as the stock) — drop + warn.
-                if not s.corridor_condition_asset or s.corridor_condition_asset not in _idx_cols:
-                    _skipped_corr.append(s.corridor_condition_asset or s.variance_asset)
-                    continue
-                map_key = s.corridor_condition_asset
-            else:
-                map_key = s.variance_asset
-            leg_map[map_key] = s
-            column_keys.append(map_key)
-        if _skipped_corr:
-            import warnings
+        pnl_matrix, column_keys, cross_legs = compute_leg_pnl_columns(
+            variance_px, corridor_px, legs, self.config, capture_cross_legs=True)
+        self._cross_legs = cross_legs
+        if column_keys and (~np.isnan(pnl_matrix)).sum() == 0:
             warnings.warn(
-                f"[Backtester] Cross-corridor: {len(_skipped_corr)} leg(s) dropped — corridor "
-                f"stock price missing, no silent fall-back to an index swap: "
-                f"{sorted(set(map(str, _skipped_corr)))[:10]}", stacklevel=2)
-
-        n_rows = len(price_data)
-        pnl_data = np.full((n_rows, len(column_keys)), np.nan)
-
-        for i, map_key in enumerate(leg_map.keys()):
-            leg = leg_map[map_key]
-            prices = price_data[leg.variance_asset].values.astype(np.float64)
-
-            if self.config.is_cross_corridor and leg.corridor_condition_asset and index_data is not None:
-                if leg.corridor_condition_asset in index_data.columns:
-                    index_prices = index_data[leg.corridor_condition_asset].values.astype(np.float64)
-                    # Cross-corridor backtest:
-                    #   Mono leg:   corridor=Corridor Condition Asset (leg), variance=Corridor Condition Asset
-                    #   Cross leg:  corridor=Corridor Condition Asset (leg), variance=Variance Asset (index)
-                    if self.config.is_vol_swap:
-                        # Mono leg: realized_vol on Corridor Condition Asset
-                        pnl_long = _rolling_pnl_volswap(index_prices, leg.strike_mono_var_swap, self.config.n_exp, self.config.local_cap)
-                        # Cross leg: realized_vol on Variance Asset
-                        idx_strike = leg.strike_cross_corridor if leg.strike_cross_corridor else leg.strike_mono_var_swap
-                        pnl_short = _rolling_pnl_volswap(prices, idx_strike, self.config.n_exp, self.config.local_cap)
-                    else:
-                        # Mono leg: variance=Corridor Condition Asset, corridor=Corridor Condition Asset
-                        pnl_long = _rolling_pnl_corridor(index_prices, index_prices, leg.strike_mono_var_swap,
-                                                         self.config.barrier_up, self.config.barrier_down, self.config.n_exp, self.config.local_cap)
-                        # Cross leg: variance=Variance Asset, corridor=Corridor Condition Asset
-                        idx_strike = leg.strike_cross_corridor if leg.strike_cross_corridor else leg.strike_mono_var_swap
-                        pnl_short = _rolling_pnl_corridor(prices, index_prices, idx_strike,
-                                                          self.config.barrier_up, self.config.barrier_down, self.config.n_exp, self.config.local_cap)
-                    # Net = long - short (per line)
-                    n = min(len(pnl_long), len(pnl_short), n_rows)
-                    pnl_data[:n, i] = (pnl_long[:n] - pnl_short[:n]) * 100
-                    # Store individual legs for cross-corridor breakdown
-                    self._cross_legs[map_key] = {
-                        'stock_pnl': pnl_long[:n] * 100,
-                        'index_pnl': pnl_short[:n] * 100,
-                        'corridor_asset': leg.corridor_condition_asset,
-                    }
-                else:
-                    # Fallback: just leg on itself
-                    pnl = self._calc.compute(prices, leg.strike_mono_var_swap, corridor_prices=None)
-                    n = min(len(pnl), n_rows)
-                    pnl_data[:n, i] = pnl[:n] * 100
-            else:
-                # Standard: corridor on self or vol swap
-                pnl = self._calc.compute(prices, leg.strike_mono_var_swap, corridor_prices=None)
-                n = min(len(pnl), n_rows)
-                pnl_data[:n, i] = pnl[:n] * 100
-
-        # Diagnostic: check pnl is non-trivial
-        non_nan_count = (~np.isnan(pnl_data)).sum()
-        non_zero_count = (np.nan_to_num(pnl_data, nan=0.0) != 0).sum()
-        if non_nan_count == 0:
-            import warnings
-            warnings.warn(f"[Backtester] pnl_data is ALL NaN! shape={pnl_data.shape}, "
-                         f"tickers={list(leg_map.keys())[:5]}..., n_rows={n_rows}")
-
-        return pnl_data, column_keys, price_data.index
+                f"[Backtester] pnl_matrix is ALL NaN! shape={pnl_matrix.shape}, "
+                f"tickers={column_keys[:5]}..., n_rows={len(variance_px)}")
+        return pnl_matrix, column_keys, variance_px.index
 
     def _apply_fill_zero_policy(
         self,
@@ -740,7 +806,7 @@ class DispersionDataLoader:
     Usage:
         loader = DispersionDataLoader(config)
         data = loader.load(basket)
-        # data['price_data'], data['index_data'], data['legs']
+        # data['variance_px'], data['corridor_px'], data['legs']
     """
 
     def __init__(self, config: SwapConfig, logger=None):
@@ -753,28 +819,28 @@ class DispersionDataLoader:
         Load all data needed for optimization and backtesting.
         Returns:
             {
-                'price_data': pd.DataFrame (stocks, union calendar),
-                'index_data': pd.DataFrame or None (for cross-corridor),
+                'variance_px': pd.DataFrame (Variance Asset prices, union calendar),
+                'corridor_px': pd.DataFrame or None (Corridor Condition Asset prices, cross-corridor only),
                 'legs': List[DispersionLeg] (with metrics populated),
                 'n_long': int,
             }
         """
         start = self._start_date()
-        all_stocks = basket.all_candidates
+        all_legs = basket.all_candidates
         if self.config.is_cross_corridor:
-            price_data, index_data = self._fetch_cross_corridor(all_stocks, start)
+            variance_px, corridor_px = self._fetch_cross_corridor(all_legs, start)
         else:
-            price_data = self._fetch_standard(all_stocks, start)
-            index_data = None
+            variance_px = self._fetch_standard(all_legs, start)
+            corridor_px = None
         # Compute per-leg metrics
-        self._compute_metrics(all_stocks, price_data, index_data)
+        self._compute_metrics(all_legs, variance_px, corridor_px)
         return {
-            "price_data": price_data,
-            "index_data": index_data,
-            "legs": all_stocks,
+            "variance_px": variance_px,
+            "corridor_px": corridor_px,
+            "legs": all_legs,
             "n_long": len(basket.long_candidates),
-            "long_legs": all_stocks[:len(basket.long_candidates)],
-            "short_legs": all_stocks[len(basket.long_candidates):],
+            "long_legs": all_legs[:len(basket.long_candidates)],
+            "short_legs": all_legs[len(basket.long_candidates):],
         }
 
     # def _start_date(self) -> str:
@@ -829,61 +895,61 @@ class DispersionDataLoader:
         today_str = date.today().strftime("%m/%d/%Y")
         # Fetch variance asset prices (batch)
         try:
-            stock_df = _cached_bdh(var_tickers, field, start, today_str)
+            variance_px = _cached_bdh(var_tickers, field, start, today_str)
         except Exception as e:
             self._logger("ERROR", f"Bloomberg variance asset fetch failed: {e}")
             return pd.DataFrame(), pd.DataFrame()
 
-        if stock_df is None or stock_df.empty:
+        if variance_px is None or variance_px.empty:
             self._logger("ERROR", f"Bloomberg returned empty data for {len(var_tickers)} variance asset tickers")
             return pd.DataFrame(), pd.DataFrame()
 
-        if isinstance(stock_df.columns, pd.MultiIndex):
-            stock_df.columns = stock_df.columns.get_level_values(0)
-        stock_df.columns = [str(c).strip() for c in stock_df.columns]
-        stock_df = _ensure_datetime_index(stock_df)
+        if isinstance(variance_px.columns, pd.MultiIndex):
+            variance_px.columns = variance_px.columns.get_level_values(0)
+        variance_px.columns = [str(c).strip() for c in variance_px.columns]
+        variance_px = _ensure_datetime_index(variance_px)
         # Log missing variance assets
-        missing_var = [t for t in var_tickers if t not in stock_df.columns]
+        missing_var = [t for t in var_tickers if t not in variance_px.columns]
         if missing_var:
             self._logger("WARNING", f"{len(missing_var)}/{len(var_tickers)} variance assets missing from Bloomberg: {missing_var[:5]}")
         # Fetch corridor condition asset prices (batch) — always PX_LAST
-        index_df = pd.DataFrame()
+        corridor_px = pd.DataFrame()
         if corr_tickers:
             try:
-                index_df = _cached_bdh(corr_tickers, "PX_LAST", start, today_str)
+                corridor_px = _cached_bdh(corr_tickers, "PX_LAST", start, today_str)
             except Exception as e:
                 self._logger("ERROR", f"Bloomberg corridor asset fetch failed: {e}")
-                index_df = pd.DataFrame()
-            if index_df is not None and not index_df.empty:
-                if isinstance(index_df.columns, pd.MultiIndex):
-                    index_df.columns = index_df.columns.get_level_values(0)
-                index_df.columns = [str(c).strip() for c in index_df.columns]
-                index_df = _ensure_datetime_index(index_df)
-                missing_corr = [t for t in corr_tickers if t not in index_df.columns]
+                corridor_px = pd.DataFrame()
+            if corridor_px is not None and not corridor_px.empty:
+                if isinstance(corridor_px.columns, pd.MultiIndex):
+                    corridor_px.columns = corridor_px.columns.get_level_values(0)
+                corridor_px.columns = [str(c).strip() for c in corridor_px.columns]
+                corridor_px = _ensure_datetime_index(corridor_px)
+                missing_corr = [t for t in corr_tickers if t not in corridor_px.columns]
                 if missing_corr:
                     self._logger("WARNING", f"Corridor condition assets missing from Bloomberg: {missing_corr}")
         # Align to same dates
-        if not index_df.empty:
-            all_dates = stock_df.index.union(index_df.index)
-            stock_df = stock_df.reindex(all_dates)
-            index_df = index_df.reindex(all_dates)
-        return stock_df.sort_index(), index_df.sort_index() if not index_df.empty else pd.DataFrame()
+        if not corridor_px.empty:
+            all_dates = variance_px.index.union(corridor_px.index)
+            variance_px = variance_px.reindex(all_dates)
+            corridor_px = corridor_px.reindex(all_dates)
+        return variance_px.sort_index(), corridor_px.sort_index() if not corridor_px.empty else pd.DataFrame()
 
     def _compute_metrics(
-        self, legs: List[DispersionLeg], price_data: pd.DataFrame, index_data: Optional[pd.DataFrame]
+        self, legs: List[DispersionLeg], variance_px: pd.DataFrame, corridor_px: Optional[pd.DataFrame]
     ):
         """Populate each leg's .metrics dict with backtest stats."""
         for leg in legs:
-            if leg.variance_asset not in price_data.columns:
+            if leg.variance_asset not in variance_px.columns:
                 leg.metrics = {"last_value": 0, "avg_5y": 0, "avg_3y": 0, "hit_ratio": 50, "max_drawdown": 0}
                 continue
 
-            prices = price_data[leg.variance_asset].dropna().values.astype(np.float64)
+            prices = variance_px[leg.variance_asset].dropna().values.astype(np.float64)
             # Determine corridor prices for cross-corridor
             corridor_prices = None
-            if self.config.is_cross_corridor and leg.corridor_condition_asset and index_data is not None:
-                if leg.corridor_condition_asset in index_data.columns:
-                    corridor_prices = index_data[leg.corridor_condition_asset].dropna().values.astype(np.float64)
+            if self.config.is_cross_corridor and leg.corridor_condition_asset and corridor_px is not None:
+                if leg.corridor_condition_asset in corridor_px.columns:
+                    corridor_prices = corridor_px[leg.corridor_condition_asset].dropna().values.astype(np.float64)
             if len(prices) < self.config.n_exp + 1:
                 leg.metrics = {"last_value": 0, "avg_5y": 0, "avg_3y": 0, "hit_ratio": 50, "max_drawdown": 0}
                 continue
@@ -904,78 +970,3 @@ class DispersionDataLoader:
                 "hit_ratio": float((valid > 0).sum() / max(1, (valid != 0).sum()) * 100),
                 "max_drawdown": float((cumsum - np.maximum.accumulate(cumsum)).min()),
             }
-
-def run_backtest(
-    tickers: List[str],
-    strikes: Dict[str, float],
-    weights: Dict[str, float],
-    config: SwapConfig,
-    corridor_condition_assets: Dict[str, str] = None,
-    start_date: Optional[date] = None,
-    index_strikes: Dict[str, float] = None,
-    logger: Optional[Callable[[str, str], None]] = None,
-) -> BacktestResult:
-    """
-    Canonical backtest entry point for dispersion trading.
-    
-    Usage:
-        from functions.dispersion import run_backtest, SwapConfig
-        
-        result = run_backtest(
-            tickers=['AAPL.O', 'MSFT.O'],
-            strikes={'AAPL.O': 0.05, 'MSFT.O': 0.05},
-            weights={'AAPL.O': 0.5, 'MSFT.O': 0.5},
-            config=SwapConfig.cross_corridor(n_exp=252)
-        )
-    
-    Args:
-        tickers: List of leg tickers
-        strikes: Dict mapping ticker → strike (decimal, e.g. 0.05 = 5%)
-        weights: Dict mapping ticker → weight (decimal, e.g. 0.5 = 50%)
-        config: SwapConfig with product type, n_exp, barriers, etc.
-        corridor_condition_assets: Dict mapping ticker → corridor condition asset (for cross-corridor)
-        start_date: Start date for backtest (default: config.start_date)
-        index_strikes: Dict mapping ticker → cross corridor strike (for cross-corridor)
-        logger: Optional logger function (level, msg)
-    
-    Returns:
-        BacktestResult with timeseries, metrics, per-leg PnL
-    """
-    from functions.dispersion import BasketInput, Basket, DispersionDataLoader, DispersionBacktester
-    
-    # Build DispersionLeg objects
-    legs = []
-    for t in tickers:
-        leg_kwargs = {
-            'variance_asset': t,
-            'strike_mono_var_swap': strikes.get(t),
-            'weight': weights.get(t, 0),
-        }
-        if corridor_condition_assets and t in corridor_condition_assets:
-            leg_kwargs['corridor_condition_asset'] = corridor_condition_assets[t]
-            if index_strikes and t in index_strikes:
-                leg_kwargs['strike_cross_corridor'] = index_strikes[t]
-        legs.append(DispersionLeg(**leg_kwargs))
-    
-    # Build BasketInput and load data
-    basket_input = BasketInput(long_candidates=legs, short_candidates=[])
-    loader = DispersionDataLoader(config, logger=logger)
-    data = loader.load(basket_input)
-    
-    # Run backtest
-    backtester = DispersionBacktester(config, logger=logger)
-    # Convert weights to use series_key (Corridor Condition Asset for cross-corridor)
-    weights_by_key = {}
-    for s in legs:
-        key = backtester._series_key(s)
-        if key in weights:
-            weights_by_key[key] = weights[key]
-    result = backtester.run(
-        price_data=data['price_data'],
-        legs=data['legs'],
-        weights=weights_by_key,
-        index_data=data.get('index_data'),
-        start_date=start_date or config.start_date,
-    )
-    
-    return result

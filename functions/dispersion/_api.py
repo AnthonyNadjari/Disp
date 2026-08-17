@@ -247,92 +247,29 @@ def _df_to_backtest_inputs(df: pd.DataFrame, is_cross_corridor: bool) -> Tuple[L
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _build_pnl_matrix(
-    price_data: pd.DataFrame,
-    index_data: Optional[pd.DataFrame],
+    variance_px: pd.DataFrame,
+    corridor_px: Optional[pd.DataFrame],
     legs: List[DispersionLeg],
     cfg: DispersionConfig,
 ) -> Tuple[np.ndarray, Dict[str, int]]:
+    """Optimizer-side P&L matrix — thin wrapper over the SHARED builder
+    `functions.dispersion._backtester.compute_leg_pnl_columns` (the exact same
+    code path the backtester uses), so scored and backtested P&L can never
+    drift apart.
+
+    variance_px = Variance Asset prices (the index in cross-corridor mode);
+    corridor_px = Corridor Condition Asset (stock) prices, None in mono mode.
+    Returns (pnl_matrix, column_map) — columns keyed by the per-name key
+    (Corridor Condition Asset in cross-corridor, else Variance Asset).
     """
-    Build PNL matrix from prices using numba kernels.
-    Returns (pnl_matrix, column_map).
-    """
-    from functions.dispersion._backtester import (
-        SwapCalculator, _rolling_pnl_corridor, _rolling_pnl_volswap,
-    )
+    from functions.dispersion._backtester import compute_leg_pnl_columns
 
     internal_cfg = _to_swap_config(cfg)
-
-    # Build column keys: for cross-corridor, use Corridor Condition Asset to avoid duplicates
-    # IMPORTANT: leg_map must be keyed by the UNIQUE per-leg key (not variance_asset, which is
-    # the same "SPX Index" for all cross-corridor legs and would collapse the map to 1 entry).
-    leg_map = {}
-    column_keys = []
-    _skipped_missing_corr = []
-    _idx_cols = set(index_data.columns) if (index_data is not None and not index_data.empty) else set()
-    for s in legs:
-        if s.variance_asset not in price_data.columns:
-            continue
-        if cfg.cross_corridor:
-            # Cross-corridor REQUIRES the corridor stock price. Never silently fall
-            # back to a plain index variance swap (that would turn the leg into a
-            # long index-vol position mislabelled as the stock): drop it + warn.
-            if not s.corridor_condition_asset or s.corridor_condition_asset not in _idx_cols:
-                _skipped_missing_corr.append(s.corridor_condition_asset or s.variance_asset)
-                continue
-            map_key = s.corridor_condition_asset
-        else:
-            map_key = s.variance_asset
-        leg_map[map_key] = s
-        column_keys.append(map_key)
-    if _skipped_missing_corr:
-        warnings.warn(
-            f"Cross-corridor: {len(_skipped_missing_corr)} leg(s) dropped — their corridor "
-            f"stock price did not load from Bloomberg, so no valid cross-corridor P&L can be "
-            f"computed (no silent fall-back to an index swap). "
-            f"Sample: {sorted(set(map(str, _skipped_missing_corr)))[:10]}",
-            stacklevel=2,
-        )
-
+    pnl_matrix, column_keys, _ = compute_leg_pnl_columns(
+        variance_px, corridor_px, legs, internal_cfg, capture_cross_legs=False)
     col_map = {t: i for i, t in enumerate(column_keys)}
-    n_rows = len(price_data)
-    pnl_matrix = np.full((n_rows, len(column_keys)), np.nan)
-
-    calc = SwapCalculator(internal_cfg)
-    if index_data is not None and not index_data.empty:
-        index_data = index_data.loc[index_data.index.isin(price_data.index)]
-
-    for i, key in enumerate(leg_map.keys()):
-        leg = leg_map[key]
-        prices = price_data[leg.variance_asset].values.astype(np.float64)
-
-        if cfg.cross_corridor and leg.corridor_condition_asset and index_data is not None and leg.corridor_condition_asset in index_data.columns:
-            index_prices = index_data[leg.corridor_condition_asset].values.astype(np.float64)
-            # Cross-corridor backtest:
-            #   Mono leg:   corridor=Corridor Condition Asset, variance=Corridor Condition Asset
-            #   Cross leg:  corridor=Corridor Condition Asset, variance=Variance Asset
-            if cfg.is_vol_swap:
-                # Mono leg: realized_vol on Corridor Condition Asset
-                pnl_long = _rolling_pnl_volswap(index_prices, leg.strike_mono_var_swap, cfg.n_exp, cfg.local_cap)
-                # Cross leg: realized_vol on Variance Asset
-                cross_strike = leg.strike_cross_corridor if leg.strike_cross_corridor else leg.strike_mono_var_swap
-                pnl_short = _rolling_pnl_volswap(prices, cross_strike, cfg.n_exp, cfg.local_cap)
-            else:
-                # Mono leg: variance=Corridor Condition Asset, corridor=Corridor Condition Asset
-                pnl_long = _rolling_pnl_corridor(
-                    index_prices, index_prices, leg.strike_mono_var_swap,
-                    cfg.barrier_up, cfg.barrier_down, cfg.n_exp, cfg.local_cap)
-                # Cross leg: variance=Variance Asset, corridor=Corridor Condition Asset
-                cross_strike = leg.strike_cross_corridor if leg.strike_cross_corridor else leg.strike_mono_var_swap
-                pnl_short = _rolling_pnl_corridor(
-                    prices, index_prices, cross_strike,
-                    cfg.barrier_up, cfg.barrier_down, cfg.n_exp, cfg.local_cap)
-            n = min(len(pnl_long), len(pnl_short), n_rows)
-            pnl_matrix[:n, i] = (pnl_long[:n] - pnl_short[:n]) * 100
-        else:
-            pnl = calc.compute(prices, leg.strike_mono_var_swap, corridor_prices=None)
-            pnl_matrix[:len(pnl), i] = pnl * 100
-
     return pnl_matrix, col_map
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -568,7 +505,7 @@ def _prepare_optimization_inputs(
     basket = BasketInput(long_candidates=long_legs, short_candidates=short_legs)
     data = loader.load(basket)
 
-    if data["price_data"].empty:
+    if data["variance_px"].empty:
         empty_ts = pd.DataFrame({"Long Leg": [], "Short Leg": [], "Result": []})
         return {"early_result": OptimizationResult(
             long_basket=[], short_basket=[],
@@ -579,8 +516,8 @@ def _prepare_optimization_inputs(
         )}
 
     # ── Step 3: Build PNL matrix ──
-    price_data_all = data["price_data"]
-    index_data_all = data.get("index_data")
+    variance_px_all = data["variance_px"]
+    corridor_px_all = data.get("corridor_px")
     legs = data["legs"]
     long_legs_loaded = data["long_legs"]
     short_legs_loaded = data["short_legs"]
@@ -589,20 +526,20 @@ def _prepare_optimization_inputs(
     # then slice the resulting matrix to [start_date, end_date].
     # This ensures the rolling kernel has n_exp warm-up rows BEFORE start_date,
     # so the optimizer's matrix row 0 matches the backtest curve row 0 exactly.
-    price_data_for_build = price_data_all
-    index_data_for_build = index_data_all
+    variance_px_for_build = variance_px_all
+    corridor_px_for_build = corridor_px_all
     if not start_date and not end_date:
         # No explicit dates: use lookback window including warm-up buffer
         lookback_days = int(config.lookback_years * 252) + config.n_exp
-        if len(price_data_for_build) > lookback_days:
-            price_data_for_build = price_data_for_build.iloc[-lookback_days:]
-            if index_data_for_build is not None and not index_data_for_build.empty:
-                index_data_for_build = index_data_for_build.iloc[-lookback_days:]
+        if len(variance_px_for_build) > lookback_days:
+            variance_px_for_build = variance_px_for_build.iloc[-lookback_days:]
+            if corridor_px_for_build is not None and not corridor_px_for_build.empty:
+                corridor_px_for_build = corridor_px_for_build.iloc[-lookback_days:]
 
-    pnl_matrix_full, col_map = _build_pnl_matrix(price_data_for_build, index_data_for_build, legs, config)
+    pnl_matrix_full, col_map = _build_pnl_matrix(variance_px_for_build, corridor_px_for_build, legs, config)
 
-    # Slice to [start_date, end_date] — rows in pnl_matrix_full correspond 1:1 to price_data_for_build.index
-    _build_index = price_data_for_build.index
+    # Slice to [start_date, end_date] — rows in pnl_matrix_full correspond 1:1 to variance_px_for_build.index
+    _build_index = variance_px_for_build.index
     if start_date:
         _start_idx = _build_index.searchsorted(pd.Timestamp(start_date), side='left')
     else:
@@ -615,9 +552,9 @@ def _prepare_optimization_inputs(
 
     # Also keep the date index for the optimizer window (used later for NUMERIC-CHECK alignment)
     _optimizer_dates = _build_index[_start_idx:_end_idx]
-    # price_data = sliced prices (used only for candidate filtering, not PnL computation)
-    price_data = price_data_for_build.iloc[_start_idx:_end_idx]
-    index_data = index_data_for_build.iloc[_start_idx:_end_idx] if (index_data_for_build is not None and not index_data_for_build.empty) else index_data_for_build
+    # variance_px = sliced prices (used only for candidate filtering, not PnL computation)
+    variance_px = variance_px_for_build.iloc[_start_idx:_end_idx]
+    corridor_px = corridor_px_for_build.iloc[_start_idx:_end_idx] if (corridor_px_for_build is not None and not corridor_px_for_build.empty) else corridor_px_for_build
 
     # ── Step 4: Filter candidates ──
     valid_tickers = set(col_map.keys())
@@ -767,11 +704,10 @@ def _prepare_optimization_inputs(
             for _s in long_legs:
                 _raw_keys |= _leg_keys(_s)
             # Column sets to pinpoint WHY a present name is not a candidate.
-            # cross-corridor: price_data = variance-asset (index) prices,
-            # index_data = corridor-asset (stock) prices.
-            _pd_cols = {str(c).strip() for c in price_data.columns} if price_data is not None else set()
-            _id_cols = ({str(c).strip() for c in index_data.columns}
-                        if (index_data is not None and not getattr(index_data, "empty", True)) else set())
+            # cross-corridor: variance_px = index prices, corridor_px = stock prices.
+            _pd_cols = {str(c).strip() for c in variance_px.columns} if variance_px is not None else set()
+            _id_cols = ({str(c).strip() for c in corridor_px.columns}
+                        if (corridor_px is not None and not getattr(corridor_px, "empty", True)) else set())
             _cc_counts = Counter(str(s.corridor_condition_asset).strip()
                                  for s in long_legs if getattr(s, "corridor_condition_asset", None))
 
@@ -825,8 +761,8 @@ def _prepare_optimization_inputs(
     return {
         "early_result": None,
         "internal_cfg": internal_cfg,
-        "price_data_all": price_data_all,
-        "index_data_all": index_data_all,
+        "variance_px_all": variance_px_all,
+        "corridor_px_all": corridor_px_all,
         "legs": legs,
         "pnl_matrix": pnl_matrix,
         "col_map": col_map,
@@ -999,8 +935,8 @@ def optimize(
     if prep["early_result"] is not None:
         return prep["early_result"]
     internal_cfg = prep["internal_cfg"]
-    price_data_all = prep["price_data_all"]
-    index_data_all = prep["index_data_all"]
+    variance_px_all = prep["variance_px_all"]
+    corridor_px_all = prep["corridor_px_all"]
     legs = prep["legs"]
     pnl_matrix = prep["pnl_matrix"]
     col_map = prep["col_map"]
@@ -1119,8 +1055,8 @@ def optimize(
         "long_candidates": long_valid,
         "is_cross_corridor": config.cross_corridor,
         "missing_data_policy": config.missing_data_policy,
-        "price_data_all": price_data_all,
-        "index_data_all": index_data_all,
+        "variance_px_all": variance_px_all,
+        "corridor_px_all": corridor_px_all,
         "legs": legs,
         "internal_cfg": internal_cfg,
         "start_date": start_date,
@@ -1171,11 +1107,11 @@ def optimize(
     # bt.run() applies start_date filter internally after computing rolling PnL
     bt = DispersionBacktester(internal_cfg)
     bt_result = bt.run_from_optimization(
-        price_data=price_data_all,
+        variance_px=variance_px_all,
         long_basket=opt_result.long_basket,
         short_basket=opt_result.short_basket,
         legs=legs,
-        index_data=index_data_all,
+        corridor_px=corridor_px_all,
         start_date=start_date,
         end_date=end_date,
     )
@@ -1421,11 +1357,11 @@ def optimize_multi(
         if run_backtests and result.long_basket:
             bt = DispersionBacktester(prep["internal_cfg"])
             result.backtest = bt.run_from_optimization(
-                price_data=prep["price_data_all"],
+                variance_px=prep["variance_px_all"],
                 long_basket=result.long_basket,
                 short_basket=result.short_basket,
                 legs=prep["legs"],
-                index_data=prep["index_data_all"],
+                corridor_px=prep["corridor_px_all"],
                 start_date=start_date,
                 end_date=end_date,
             )
@@ -1503,17 +1439,17 @@ def backtest(
     )
     data = loader.load(basket)
 
-    if data["price_data"].empty:
+    if data["variance_px"].empty:
         empty_ts = pd.DataFrame({"Long Leg": [], "Short Leg": [], "Result": []})
         return BacktestResult(timeseries=empty_ts)
 
     # ── Step 3: Run backtester ──
     bt = DispersionBacktester(internal_cfg)
     return bt.run(
-        price_data=data["price_data"],
+        data["variance_px"],
         legs=data["legs"],
         weights=weights,
-        index_data=data.get("index_data"),
+        corridor_px=data.get("corridor_px"),
         start_date=start_date,
     )
 
