@@ -116,6 +116,10 @@ def _rolling_pnl_volswap(prices: np.ndarray, strike: float, n_exp: int, local_ca
         cum_valid[i] = count
     # For each date, use cumulative count to find window start (O(1) per date)
     for i in range(n):
+        # No-trade / missing day for this name: emit NaN, never carry a stale
+        # window forward onto a day the name did not actually trade.
+        if np.isnan(prices[i]):
+            continue
         c = cum_valid[i]
         if c < n_exp + 1:
             continue
@@ -152,6 +156,9 @@ def _rolling_pnl_corridor(
             valid_indices[n_valid] = i
             n_valid += 1
     for i in range(n):
+        # No-trade / missing day on either series: emit NaN (don't carry stale P&L).
+        if np.isnan(prices_var[i]) or np.isnan(prices_corr[i]):
+            continue
         count = 0
         for v in range(n_valid):
             if valid_indices[v] <= i:
@@ -283,6 +290,7 @@ class DispersionBacktester:
         weights: Dict[str, float],
         index_data: Optional[pd.DataFrame] = None,
         start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
     ) -> BacktestResult:
         """
         Run basket backtest.
@@ -292,6 +300,9 @@ class DispersionBacktester:
             weights: {ticker: weight} — positive=long, negative=short
             index_data: For cross-corridor mode (corridor observation prices)
             start_date: Filter output from this date (default: 5 years ago)
+            end_date: Filter output up to this date inclusive (default: no upper bound).
+                Must match the optimizer's scoring window so reported metrics don't
+                include post-cutoff (out-of-sample) data.
         """
         if start_date is None:
             start_date = date.today() - relativedelta(years=20)  # fetch max available history
@@ -362,9 +373,14 @@ class DispersionBacktester:
         per_leg_df = pd.DataFrame(pnl_matrix, index=dates_index, columns=pnl_column_keys)
         if valid_mask is not None:
             per_leg_df = per_leg_df[valid_mask]
-        # Step 4: Filter from start_date
+        # Step 4: Filter to [start_date, end_date]
         start_date = pd.Timestamp(start_date).normalize()
-        mask = pd.to_datetime(result_df.index).normalize() >= start_date
+        _idx_norm = pd.to_datetime(result_df.index).normalize()
+        mask = _idx_norm >= start_date
+        if end_date is not None:
+            # Upper-bound the delivered curve/metrics to the optimizer's window —
+            # no post-cutoff (out-of-sample) leak into reported results.
+            mask = mask & (_idx_norm <= pd.Timestamp(end_date).normalize())
         result_df = result_df[mask]
         if active_series is not None:
             active_series = active_series[mask]
@@ -401,6 +417,7 @@ class DispersionBacktester:
         legs: List[DispersionLeg],
         index_data: Optional[pd.DataFrame] = None,
         start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
     ) -> BacktestResult:
         """Run backtest directly from optimizer output.
         
@@ -421,7 +438,7 @@ class DispersionBacktester:
             bt.metrics = {"hit_ratio": 0, "mean_return": 0, "last_value": 0, "max_drawdown": 0, "n_observations": 0}
             return bt
 
-        return self.run(price_data, legs, weights, index_data, start_date)
+        return self.run(price_data, legs, weights, index_data, start_date, end_date)
 
     # ─── Internal ────────────────────────────────────────────────────────────────
 
@@ -445,22 +462,30 @@ class DispersionBacktester:
         # Build column keys: for cross-corridor, use Corridor Condition Asset to avoid duplicates
         leg_map = {}
         column_keys = []
+        _skipped_corr = []
+        _idx_cols = set(index_data.columns) if (index_data is not None and not getattr(index_data, "empty", True)) else set()
         for s in legs:
             if s.variance_asset not in price_data.columns:
                 continue
             # For cross-corridor: key by Corridor Condition Asset (s.corridor_condition_asset) to avoid
             # overwriting when all legs share the same Variance Asset (e.g. .SPX)
-            if self.config.is_cross_corridor and s.corridor_condition_asset:
+            if self.config.is_cross_corridor:
+                # Require the corridor stock price; never silently fall back to a
+                # plain index variance swap (mislabelled as the stock) — drop + warn.
+                if not s.corridor_condition_asset or s.corridor_condition_asset not in _idx_cols:
+                    _skipped_corr.append(s.corridor_condition_asset or s.variance_asset)
+                    continue
                 map_key = s.corridor_condition_asset
             else:
                 map_key = s.variance_asset
             leg_map[map_key] = s
-            if self.config.is_cross_corridor and s.corridor_condition_asset:
-                # Use Corridor Condition Asset as column key (e.g., NVDA US Equity)
-                # This ensures unique column per leg in cross-corridor mode
-                column_keys.append(s.corridor_condition_asset)
-            else:
-                column_keys.append(s.variance_asset)
+            column_keys.append(map_key)
+        if _skipped_corr:
+            import warnings
+            warnings.warn(
+                f"[Backtester] Cross-corridor: {len(_skipped_corr)} leg(s) dropped — corridor "
+                f"stock price missing, no silent fall-back to an index swap: "
+                f"{sorted(set(map(str, _skipped_corr)))[:10]}", stacklevel=2)
 
         n_rows = len(price_data)
         pnl_data = np.full((n_rows, len(column_keys)), np.nan)

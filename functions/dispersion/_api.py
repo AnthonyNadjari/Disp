@@ -267,15 +267,31 @@ def _build_pnl_matrix(
     # the same "SPX Index" for all cross-corridor legs and would collapse the map to 1 entry).
     leg_map = {}
     column_keys = []
+    _skipped_missing_corr = []
+    _idx_cols = set(index_data.columns) if (index_data is not None and not index_data.empty) else set()
     for s in legs:
         if s.variance_asset not in price_data.columns:
             continue
-        if cfg.cross_corridor and s.corridor_condition_asset:
+        if cfg.cross_corridor:
+            # Cross-corridor REQUIRES the corridor stock price. Never silently fall
+            # back to a plain index variance swap (that would turn the leg into a
+            # long index-vol position mislabelled as the stock): drop it + warn.
+            if not s.corridor_condition_asset or s.corridor_condition_asset not in _idx_cols:
+                _skipped_missing_corr.append(s.corridor_condition_asset or s.variance_asset)
+                continue
             map_key = s.corridor_condition_asset
         else:
             map_key = s.variance_asset
         leg_map[map_key] = s
         column_keys.append(map_key)
+    if _skipped_missing_corr:
+        warnings.warn(
+            f"Cross-corridor: {len(_skipped_missing_corr)} leg(s) dropped — their corridor "
+            f"stock price did not load from Bloomberg, so no valid cross-corridor P&L can be "
+            f"computed (no silent fall-back to an index swap). "
+            f"Sample: {sorted(set(map(str, _skipped_missing_corr)))[:10]}",
+            stacklevel=2,
+        )
 
     col_map = {t: i for i, t in enumerate(column_keys)}
     n_rows = len(price_data)
@@ -1161,6 +1177,7 @@ def optimize(
         legs=legs,
         index_data=index_data_all,
         start_date=start_date,
+        end_date=end_date,
     )
     opt_result.backtest = bt_result
 
@@ -1410,6 +1427,7 @@ def optimize_multi(
                 legs=prep["legs"],
                 index_data=prep["index_data_all"],
                 start_date=start_date,
+                end_date=end_date,
             )
         results.append(result)
 
