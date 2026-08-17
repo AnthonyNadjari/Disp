@@ -48,10 +48,29 @@ import pandas as pd
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class MissingDataPolicy(Enum):
-    """How to handle stocks with missing price data in backtests."""
-    DROP_INCOMPLETE_DAYS = "drop"       # Only keep days where ALL stocks have data
-    ADAPTIVE_REWEIGHT = "reweight"      # Redistribute weights; track active count
-    FILL_ZERO = "fill_zero"            # NaN → 0 contribution (original Gaia_PP behavior)
+    """The 3 ways a gap day (a name with no P&L observation) is filled.
+
+    DROP_INCOMPLETE_DAYS ("drop")
+        Keep only days where EVERY weighted name trades. Cleanest curve, but
+        one stale/late-listed name shrinks the whole sample to the
+        intersection of histories.
+
+    ADAPTIVE_REWEIGHT ("reweight")  — default
+        Redistribute a gapped name's weight to the active names, day by day
+        (constant-vega exposure). With ``reweight_grace_days`` > 0, a gap of
+        <= grace days keeps the name's weight allocated (contributing 0) —
+        the basket runs under-invested for those days instead of being
+        recomposed. Tracks the active-name count.
+
+    FILL_ZERO ("fill_zero")
+        Legacy Gaia_PP: a gap day contributes 0 for that name — the basket is
+        silently under-invested on gap days; all days are kept.
+
+    Enum VALUES are stable (serialized in run bundles) — never rename them.
+    """
+    DROP_INCOMPLETE_DAYS = "drop"
+    ADAPTIVE_REWEIGHT = "reweight"
+    FILL_ZERO = "fill_zero"
 
 class ProductType(Enum):
     """Swap product type — determines which P&L kernel to use."""

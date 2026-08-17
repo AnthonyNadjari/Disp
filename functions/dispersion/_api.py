@@ -28,10 +28,28 @@
 #
 # RULE: All conversions happen HERE in _api.py. Internal modules never convert.
 # ═══════════════════════════════════════════════════════════════════════════════
-"""
-Public entry points for the dispersion engine.
+"""Public headless API for the Gaia_PP dispersion engine.
 
-    from functions.dispersion import solve, price, optimize, backtest
+The Streamlit page is ONLY a front-end: everything it does routes through the
+functions below and works identically from a plain script / notebook:
+
+    from functions.dispersion._api import optimize, backtest, optimize_multi
+    from functions.dispersion.models import DispersionConfig, OptimizationConstraints
+
+    cfg = DispersionConfig(cross_corridor=True, n_exp=252)     # product setup
+    cons = OptimizationConstraints(min_stocks_long=5, max_stocks_long=10,
+                                   max_net_strike=0.29, time_limit_seconds=30)
+    result = optimize(long_df, cfg, cons,
+                      score_weights={"mean_payoff": 0.5, "hit_ratio": 0.5},
+                      seed=0)
+    result.long_basket, result.score, result.backtest.timeseries
+
+    bt = backtest(basket_df, cfg)          # standalone basket backtest
+
+Input DataFrames use the SAME columns the page shows (Variance Asset,
+Corridor Condition Asset, strikes in %, Min/Max Weight in %). The naming
+convention (variance vs corridor asset, mono vs cross leg) is documented at
+the top of functions/dispersion/_backtester.py.
 """
 from __future__ import annotations
 
@@ -154,6 +172,11 @@ def _df_to_legs(df: pd.DataFrame, is_cross_corridor: bool) -> List[DispersionLeg
         # Strike: DataFrame is percentage → DispersionLeg is decimal
         # Long leg uses Strike Mono Var Swap (%)
         strike_pct = float(row.get('Strike Mono Var Swap (%)', 0))
+        if not np.isfinite(strike_pct):
+            raise ValueError(
+                f"'{var_asset}': 'Strike Mono Var Swap (%)' is blank/NaN. A missing "
+                f"mono strike would silently produce an all-NaN leg (under DROP it "
+                f"wipes the whole backtest; otherwise the leg just vanishes).")
         strike = strike_pct / 100.0
 
         # Corridor Condition Asset / Strike Cross Corridor
@@ -208,6 +231,10 @@ def _df_to_backtest_inputs(df: pd.DataFrame, is_cross_corridor: bool) -> Tuple[L
 
         # Strike: percentage → decimal
         strike_pct = float(row.get('Strike Mono Var Swap (%)', 0))
+        if not np.isfinite(strike_pct):
+            raise ValueError(
+                f"'{var_asset}': 'Strike Mono Var Swap (%)' is blank/NaN — a missing "
+                f"mono strike silently drops the leg from the backtest.")
         strike = strike_pct / 100.0
 
         # Corridor Condition Asset / Strike Cross Corridor

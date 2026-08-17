@@ -72,8 +72,8 @@ def _vol_swap_window(prices: np.ndarray, strike: float, n_exp: int, local_cap: f
     n = len(prices)
     sq_logs = np.empty(n - 1)
     for i in range(1, n):
-        if prices[i - 1] <= 0:
-            return np.nan
+        if prices[i - 1] <= 0 or prices[i] <= 0:
+            return np.nan   # non-positive price → NaN, never inf via log(0)
         sq_logs[i - 1] = np.log(prices[i] / prices[i - 1]) ** 2
     # Original Gaia_PP uses sq_logs[1:] — skips the first daily return in window
     realized = np.sqrt(np.sum(sq_logs[1:]) * 252.0 / n_exp)
@@ -100,8 +100,8 @@ def _corridor_varswap_window(
     n = len(prices_var)
     sq_logs = np.empty(n - 1)
     for i in range(1, n):
-        if prices_var[i - 1] <= 0:
-            return np.nan
+        if prices_var[i - 1] <= 0 or prices_var[i] <= 0:
+            return np.nan   # non-positive price → NaN, never inf via log(0)
         sq_logs[i - 1] = np.log(prices_var[i] / prices_var[i - 1]) ** 2
     min_len = min(len(prices_var), len(prices_corr))
     in_corridor = np.zeros(min_len - 1)
@@ -837,8 +837,10 @@ class DispersionDataLoader:
         try:
             df = _cached_bdh(all_tickers, field, start, today_str)
         except Exception as e:
-            self._logger("ERROR", f"Bloomberg batch fetch failed: {e}")
-            return pd.DataFrame()
+            # Fail LOUD: an infra failure must never look like an empty universe.
+            raise RuntimeError(
+                f"Bloomberg fetch failed for {len(all_tickers)} tickers "
+                f"({field}, {start} → today): {e}") from e
 
         if df is None or df.empty:
             self._logger("ERROR", f"Bloomberg returned empty DataFrame for {len(all_tickers)} tickers")
@@ -866,8 +868,10 @@ class DispersionDataLoader:
         try:
             variance_px = _cached_bdh(var_tickers, field, start, today_str)
         except Exception as e:
-            self._logger("ERROR", f"Bloomberg variance asset fetch failed: {e}")
-            return pd.DataFrame(), pd.DataFrame()
+            # Fail LOUD: an infra failure must never look like an empty universe.
+            raise RuntimeError(
+                f"Bloomberg fetch failed for {len(var_tickers)} Variance Asset "
+                f"tickers ({field}): {e}") from e
 
         if variance_px is None or variance_px.empty:
             self._logger("ERROR", f"Bloomberg returned empty data for {len(var_tickers)} variance asset tickers")
@@ -887,8 +891,10 @@ class DispersionDataLoader:
             try:
                 corridor_px = _cached_bdh(corr_tickers, "PX_LAST", start, today_str)
             except Exception as e:
-                self._logger("ERROR", f"Bloomberg corridor asset fetch failed: {e}")
-                corridor_px = pd.DataFrame()
+                # Fail LOUD — a missing corridor feed would otherwise drop every leg.
+                raise RuntimeError(
+                    f"Bloomberg fetch failed for {len(corr_tickers)} Corridor "
+                    f"Condition Asset tickers: {e}") from e
             if corridor_px is not None and not corridor_px.empty:
                 if isinstance(corridor_px.columns, pd.MultiIndex):
                     corridor_px.columns = corridor_px.columns.get_level_values(0)

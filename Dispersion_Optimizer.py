@@ -16,11 +16,15 @@ def set_optimization_logger(callback=None):
     _log_callback = callback
 
 def _parse_policy(s: str) -> MissingDataPolicy:
-    if s == "Adaptive Reweight":
+    """Map a UI label (old or new wording) to the policy enum."""
+    t = str(s).strip().casefold()
+    if t.startswith("adaptive"):
         return MissingDataPolicy.ADAPTIVE_REWEIGHT
-    elif s == "Fill Zero (Gaia_PP)":
+    if t.startswith("fill zero"):
         return MissingDataPolicy.FILL_ZERO
-    return MissingDataPolicy.DROP_INCOMPLETE_DAYS
+    if t.startswith("drop"):
+        return MissingDataPolicy.DROP_INCOMPLETE_DAYS
+    raise ValueError(f"Unknown missing-data policy label: {s!r}")
 
 def _convert_bt_df_standard(df):
     """edited_df_bis → backtest() input format.
@@ -735,12 +739,14 @@ with tab1:
     with col20:
         missing_data_policy = st.selectbox(
             "Missing Data Policy",
-            ["Adaptive Reweight", "Fill Zero (Gaia_PP)", "Drop Incomplete Days"],
+            ["Adaptive Reweight — redistribute gapped names' weight (default)",
+             "Fill Zero — gap days contribute 0 (legacy Gaia_PP)",
+             "Drop Incomplete Days — keep only days where every name trades"],
             index=0,
             key="missing_data_policy_tab1",
             help="Adaptive Reweight: redistributes weights when stocks have missing data. Fill Zero: missing=0 contribution. Drop: only keeps days where all stocks have data."
         )
-        if missing_data_policy == "Adaptive Reweight":
+        if str(missing_data_policy).startswith("Adaptive"):
             reweight_grace_days = st.number_input(
                 "Grace days (reweight)", min_value=0, max_value=30, value=0,
                 key="grace_days_tab1",
@@ -1693,10 +1699,12 @@ with tab3:
     with col3:
         adj_divs = st.selectbox("Adjust for Dividends", ["No", "Yes"], key="adj_divs")
         missing_data_policy = st.selectbox("Missing Data Policy",
-                                           ["Adaptive Reweight", "Fill Zero (Gaia_PP)", "Drop Incomplete Days"],
+                                           ["Adaptive Reweight — redistribute gapped names' weight (default)",
+                                            "Fill Zero — gap days contribute 0 (legacy Gaia_PP)",
+                                            "Drop Incomplete Days — keep only days where every name trades"],
                                            index=0, key="mdp_tab3",
                                            help="Adaptive Reweight: redistribute weights for missing stocks. Fill Zero: original Gaia_PP behavior.")
-        if missing_data_policy == "Adaptive Reweight":
+        if str(missing_data_policy).startswith("Adaptive"):
             reweight_grace_days = st.number_input(
                 "Grace days (reweight)", min_value=0, max_value=30, value=0,
                 key="grace_days_tab3",

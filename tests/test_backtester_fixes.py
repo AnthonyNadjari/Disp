@@ -258,3 +258,36 @@ def test_bundle_v1_replays_with_grace_zero(tmp_path):
         json.dump(payload, f)
     b1 = load_run_bundle(path)
     assert b1.reweight_grace_days == 0, "v1 bundles must replay with grace=0 (it was inert)"
+
+
+# ── Commit-4 robustness: strike validation, loud Bloomberg, no inf ───────────
+
+def test_blank_mono_strike_raises_at_parse():
+    from functions.dispersion._api import _df_to_legs
+    df = pd.DataFrame({
+        "Variance Asset": ["OK Equity", "BAD Equity"],
+        "Strike Mono Var Swap (%)": [21.4, np.nan],
+        "Min Weight": [1.0, 1.0], "Max Weight": [60.0, 60.0],
+    })
+    with pytest.raises(ValueError, match="BAD Equity.*Strike Mono Var Swap"):
+        _df_to_legs(df, is_cross_corridor=False)
+
+
+def test_duplicate_corridor_key_raises():
+    from functions.dispersion._backtester import compute_leg_pnl_columns
+    dates = pd.bdate_range("2020-01-02", periods=100)
+    variance_px = pd.DataFrame({"IDX Index": _series(100, seed=8)}, index=dates)
+    corridor_px = pd.DataFrame({"DUP Equity": _series(100, seed=9)}, index=dates)
+    legs = [DispersionLeg(variance_asset="IDX Index", corridor_condition_asset="DUP Equity",
+                          strike_mono_var_swap=0.10, strike_cross_corridor=0.10)
+            for _ in range(2)]
+    cfg = _to_swap_config(DispersionConfig(cross_corridor=True, n_exp=20))
+    with pytest.raises(ValueError, match="Duplicate candidate key 'DUP Equity'"):
+        compute_leg_pnl_columns(variance_px, corridor_px, legs, cfg)
+
+
+def test_zero_price_yields_nan_not_inf():
+    prices = _series(120, seed=10)
+    prices[100] = 0.0                       # pathological zero close
+    out = _rolling_pnl_volswap(prices, 0.10, 20, 2.5)
+    assert not np.isinf(out[~np.isnan(out)]).any(), "zero price must yield NaN, never inf"
