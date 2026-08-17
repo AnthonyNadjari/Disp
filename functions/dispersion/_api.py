@@ -1149,11 +1149,19 @@ def optimize(
     # Use FULL price history (not date-cut) so backtester has n_exp warm-up rows
     # bt.run() applies start_date filter internally after computing rolling PnL
     bt = DispersionBacktester(internal_cfg)
+    # Winner backtest: only the basket's legs — non-basket candidates carried
+    # weight 0 anyway, computing their rolling P&L here was pure waste.
+    _basket_keys = ({k for k, _ in opt_result.long_basket}
+                    | {k for k, _ in opt_result.short_basket})
+    _basket_legs = [l for l in legs
+                    if (l.corridor_condition_asset
+                        if config.cross_corridor and l.corridor_condition_asset
+                        else l.variance_asset) in _basket_keys]
     bt_result = bt.run_from_optimization(
         variance_px=variance_px_all,
         long_basket=opt_result.long_basket,
         short_basket=opt_result.short_basket,
-        legs=legs,
+        legs=_basket_legs,
         corridor_px=corridor_px_all,
         start_date=start_date,
         end_date=end_date,
@@ -1400,11 +1408,17 @@ def optimize_multi(
 
         if run_backtests and result.long_basket:
             bt = DispersionBacktester(prep["internal_cfg"])
+            _bk = ({k for k, _ in result.long_basket}
+                   | {k for k, _ in result.short_basket})
+            _bl = [l for l in prep["legs"]
+                   if (l.corridor_condition_asset
+                       if config.cross_corridor and l.corridor_condition_asset
+                       else l.variance_asset) in _bk]
             result.backtest = bt.run_from_optimization(
                 variance_px=prep["variance_px_all"],
                 long_basket=result.long_basket,
                 short_basket=result.short_basket,
-                legs=prep["legs"],
+                legs=_bl,
                 corridor_px=prep["corridor_px_all"],
                 start_date=start_date,
                 end_date=end_date,

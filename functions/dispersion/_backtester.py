@@ -179,24 +179,21 @@ def _rolling_pnl_corridor(
     """
     n = min(len(prices_var), len(prices_corr))
     out = np.full(n, np.nan)
-    # Pre-compute jointly-valid indices
+    # Pre-compute jointly-valid indices + cumulative count (O(n), same trick as
+    # the volswap kernel — replaces the per-row rescan that made this O(n²))
     valid_indices = np.empty(n, dtype=np.int64)
     n_valid = 0
+    cum_valid = np.zeros(n, dtype=np.int64)
     for i in range(n):
         if not np.isnan(prices_var[i]) and not np.isnan(prices_corr[i]):
             valid_indices[n_valid] = i
             n_valid += 1
+        cum_valid[i] = n_valid
     for i in range(n):
         # No-trade / missing day on either series: emit NaN (don't carry stale P&L).
         if np.isnan(prices_var[i]) or np.isnan(prices_corr[i]):
             continue
-        count = 0
-        for v in range(n_valid):
-            if valid_indices[v] <= i:
-                count += 1
-            else:
-                break
-
+        count = cum_valid[i]
         if count < n_exp + 1:
             continue
 
@@ -746,10 +743,12 @@ def _cached_bdh(tickers: list, field: str, start: str, end: str):
     """Bloomberg fetch with Streamlit-aware caching. Falls back to in-memory TTL cache."""
     # Try Streamlit cache first (survives reruns, 10 min TTL)
     try:
-        import streamlit as st
+        import streamlit as st  # noqa: F401 — presence check only
+    except ImportError:
+        st = None
+    if st is not None:
+        # Real fetch errors must PROPAGATE (fail loud, no silent double-fetch).
         return _st_cached_bdh(tuple(sorted(tickers)), field, start, end)
-    except (ImportError, Exception):
-        pass
 
     # Fallback: in-memory dict cache (5 min TTL)
     import time as _time
@@ -764,16 +763,22 @@ def _cached_bdh(tickers: list, field: str, start: str, end: str):
     _bbg_cache_ts[key] = now
     return df
 
+_st_fetch = None   # cached-fetch singleton — decorate ONCE, not per call
+
+
 def _st_cached_bdh(tickers_tuple: tuple, field: str, start: str, end: str):
     """Streamlit-cached Bloomberg fetch (10 min TTL, persists across reruns)."""
-    import streamlit as st
+    global _st_fetch
+    if _st_fetch is None:
+        import streamlit as st
 
-    @st.cache_data(ttl=600, show_spinner=False)
-    def _fetch(tickers_key, field, start, end):
-        from xbbg import blp
-        return blp.bdh(list(tickers_key), field, start, end)
+        @st.cache_data(ttl=600, show_spinner=False)
+        def _fetch(tickers_key, field, start, end):
+            from xbbg import blp
+            return blp.bdh(list(tickers_key), field, start, end)
 
-    return _fetch(tickers_tuple, field, start, end)
+        _st_fetch = _fetch
+    return _st_fetch(tickers_tuple, field, start, end)
 
 class DispersionDataLoader:
     """
