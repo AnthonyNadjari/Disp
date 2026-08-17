@@ -2175,7 +2175,8 @@ with tab3:
                     df_for_60d, is_vol_swap, 60, local_cap,
                     global_floor, global_cap, ubar, dbar, adj_divs=adj_divs,
                     start_date=bt_start_date,
-                    is_cross_corridor=is_cross_corridor
+                    is_cross_corridor=is_cross_corridor,
+                    reweight_grace_days=reweight_grace_days
                 )
                 st.session_state['carry_result_series'] = df_res_60d["Result"]
                 # Display 60D main chart
@@ -2217,7 +2218,8 @@ with tab3:
                             df_for_60d, is_vol_swap, 60, local_cap,
                             global_floor, global_cap, ubar, dbar, adj_divs=adj_divs,
                             start_date=bt_start_date,
-                            is_cross_corridor=is_cross_corridor
+                            is_cross_corridor=is_cross_corridor,
+                            reweight_grace_days=reweight_grace_days
                         )
                         st.session_state['email_60d_graph'] = func_graph.plot_60d(
                             df_res_60d, is_cross_corridor=is_cross_corridor

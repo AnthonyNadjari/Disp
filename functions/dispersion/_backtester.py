@@ -217,7 +217,7 @@ class SwapCalculator:
     Usage:
         calc = SwapCalculator(config)
         pnl_array = calc.compute(prices, strike=0.22)
-        pnl_cross = calc.compute(leg_prices, strike=0.25, corridor_prices=index_prices)
+        pnl_cross = calc.compute(variance_px_col, strike=0.25, corridor_prices=corridor_px_col)
     """
 
     def __init__(self, config: SwapConfig):
