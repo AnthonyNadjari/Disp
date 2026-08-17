@@ -578,6 +578,18 @@ def _prepare_optimization_inputs(
         _end_idx = len(_build_index)
     pnl_matrix = pnl_matrix_full[_start_idx:_end_idx]
 
+    # Adaptive grace mask: built on the FULL history (a name mid-gap at window
+    # start, with pre-window prints, is still in-grace) and sliced together
+    # with the matrix — the backtester sees full history too, so scored and
+    # delivered P&L stay equal at the window boundary. None when inactive.
+    if (config.missing_data_policy == MissingDataPolicy.ADAPTIVE_REWEIGHT
+            and config.reweight_grace_days > 0):
+        from functions.dispersion.scoring.weight_solver import active_mask_with_grace
+        _active_mask = active_mask_with_grace(
+            ~np.isnan(pnl_matrix_full), config.reweight_grace_days)[_start_idx:_end_idx]
+    else:
+        _active_mask = None
+
     # Also keep the date index for the optimizer window (used later for NUMERIC-CHECK alignment)
     _optimizer_dates = _build_index[_start_idx:_end_idx]
     # variance_px = sliced prices (used only for candidate filtering, not PnL computation)
@@ -798,6 +810,7 @@ def _prepare_optimization_inputs(
         "short_valid": short_valid,
         "forced_indices": _forced_indices,
         "optimizer_dates": _optimizer_dates,
+        "active_mask": _active_mask,
     }
 
 
@@ -1015,6 +1028,7 @@ def optimize(
         constraints=constraints,
         missing_data_policy=config.missing_data_policy,
         reweight_grace_days=config.reweight_grace_days,
+        active_mask=prep["active_mask"],
         is_cross_corridor=config.cross_corridor,
         global_cap=config.global_cap,
         global_floor=config.global_floor,
@@ -1043,6 +1057,7 @@ def optimize(
         save_run_bundle(
             save_bundle_path,
             pnl_matrix=optimizer._orig_ts_mat,
+            active_mask=prep["active_mask"],
             column_map=col_map,
             long_candidates=long_valid,
             short_candidates=short_valid,
@@ -1367,6 +1382,7 @@ def optimize_multi(
             constraints=constraints,
             missing_data_policy=config.missing_data_policy,
             reweight_grace_days=config.reweight_grace_days,
+            active_mask=prep["active_mask"],
             is_cross_corridor=config.cross_corridor,
             global_cap=config.global_cap,
             global_floor=config.global_floor,

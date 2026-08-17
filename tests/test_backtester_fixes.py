@@ -291,3 +291,73 @@ def test_zero_price_yields_nan_not_inf():
     prices[100] = 0.0                       # pathological zero close
     out = _rolling_pnl_volswap(prices, 0.10, 20, 2.5)
     assert not np.isinf(out[~np.isnan(out)]).any(), "zero price must yield NaN, never inf"
+
+
+# ── Review fix: grace mask must carry PRE-WINDOW history across the slice ────
+
+def test_optimizer_honors_external_active_mask():
+    """A gap already open at window start (name printed before the window)
+    must stay in-grace: _api builds the mask on FULL history and passes it in;
+    the optimizer must use it verbatim instead of re-deriving from the sliced
+    window (where the name looks 'never started')."""
+    from functions.dispersion._optimizer import DispersionOptimizer
+    from functions.dispersion.scoring import MetricWeights
+    from functions.dispersion.models import OptimizationConstraints
+
+    n_days = 60
+    pnl = np.column_stack([np.full(n_days, 1.0), np.full(n_days, 0.5)])
+    pnl[:2, 1] = np.nan            # B gapped on window rows 0-1 (gap began pre-window)
+    names = ["A", "B"]
+    legs = [DispersionLeg(variance_asset=t, strike_mono_var_swap=0.10,
+                          min_weight=0.05, max_weight=0.95) for t in names]
+    cons = OptimizationConstraints(
+        min_stocks_long=2, max_stocks_long=2, min_stocks_short=0,
+        max_stocks_short=0, max_net_strike=10.0, population_size=10,
+        max_generations=5, time_limit_seconds=5.0, stagnation_limit=5)
+
+    def make(mask):
+        return DispersionOptimizer(
+            long_candidates=legs, short_candidates=[], pnl_matrix=pnl,
+            column_map={t: i for i, t in enumerate(names)}, constraints=cons,
+            missing_data_policy=MissingDataPolicy.ADAPTIVE_REWEIGHT,
+            reweight_grace_days=2, active_mask=mask,
+            metric_weights=MetricWeights({"mean_payoff": 1.0}), seed=0)
+
+    w = np.array([0.5, 0.5])
+    # window-derived (fallback): B 'never started' on rows 0-1 → redistribute → 1.0
+    net_fallback = make(None)._adaptive_net_pnl([0, 1], w)
+    assert net_fallback[0] == pytest.approx(1.0)
+    # full-history mask (as _api now builds): B in-grace → holds weight → 0.5
+    full_mask = np.ones((n_days, 2), dtype=bool)     # pre-window print ⇒ rows 0-1 in-grace
+    net_ext = make(full_mask)._adaptive_net_pnl([0, 1], w)
+    assert net_ext[0] == pytest.approx(0.5)
+    assert net_ext[2] == pytest.approx(0.75)
+
+
+def test_bundle_stores_and_replays_active_mask(tmp_path):
+    from functions.dispersion.run_bundle import load_run_bundle, save_run_bundle
+    from functions.dispersion.models import OptimizationConstraints
+    import os
+
+    rng = np.random.default_rng(6)
+    pnl = rng.normal(0.5, 1.0, (120, 3))
+    pnl[:2, 0] = np.nan
+    names = ["M0", "M1", "M2"]
+    mask = np.ones((120, 3), dtype=bool)             # full-history semantics
+    legs = [DispersionLeg(variance_asset=t, strike_mono_var_swap=0.10,
+                          min_weight=0.05, max_weight=0.95) for t in names]
+    cons = OptimizationConstraints(
+        min_stocks_long=2, max_stocks_long=3, min_stocks_short=0,
+        max_stocks_short=0, max_net_strike=10.0, population_size=12,
+        max_generations=6, time_limit_seconds=5.0, stagnation_limit=5)
+    path = str(tmp_path / "bm")
+    save_run_bundle(
+        path, pnl_matrix=pnl, column_map={t: i for i, t in enumerate(names)},
+        long_candidates=legs, short_candidates=[], constraints=cons,
+        score_weights={"mean_payoff": 1.0}, seed=0,
+        missing_data_policy=MissingDataPolicy.ADAPTIVE_REWEIGHT,
+        reweight_grace_days=2, active_mask=mask)
+    assert os.path.exists(f"{path}/active_mask.parquet")
+    b = load_run_bundle(path)
+    assert b.active_mask is not None and b.active_mask.shape == (120, 3)
+    assert bool(b.active_mask[0, 0]), "carried-in grace row must survive the roundtrip"

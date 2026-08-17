@@ -471,8 +471,6 @@ with tab1:
             n_exp = None  # Placeholder, will be calculated later
     with c5:
         local_cap = st.number_input("Input local cap", value=2.50, key=12001)
-    with c6:
-        local_floor = st.number_input("Input local floor", value=-9999999, key=1200)
     with c7:
         global_cap = st.number_input("Input global cap", value=999999999, key=12005)
     with c8:
@@ -803,7 +801,6 @@ with tab1:
                 st.session_state['is_vol_swap'] = is_vol_swap
                 st.session_state['n_exp'] = n_exp
                 st.session_state['local_cap'] = local_cap
-                st.session_state['local_floor'] = local_floor
                 st.session_state['global_cap'] = global_cap
                 st.session_state['global_floor'] = global_floor
                 st.session_state['ubar'] = ubar
@@ -826,7 +823,6 @@ with tab1:
                 st.session_state['is_vol_swap'] = is_vol_swap
                 st.session_state['n_exp'] = n_exp
                 st.session_state['local_cap'] = local_cap
-                st.session_state['local_floor'] = local_floor
                 st.session_state['global_cap'] = global_cap
                 st.session_state['global_floor'] = global_floor
                 st.session_state['ubar'] = ubar
@@ -1717,8 +1713,6 @@ with tab3:
     col4, col5, col6, col7 = st.columns(4)
     with col4:
         local_cap = st.number_input("Local Cap", value=2.5, key="local_cap")
-    with col5:
-        local_floor = st.number_input("Local Floor", value=-9999999.0, key="local_floor")
     with col6:
         global_cap = st.number_input("Global Cap", value=9999999.0, key="global_cap")
     with col7:
@@ -2176,6 +2170,7 @@ with tab3:
                     global_floor, global_cap, ubar, dbar, adj_divs=adj_divs,
                     start_date=bt_start_date,
                     is_cross_corridor=is_cross_corridor,
+                    missing_data_policy=missing_data_policy,
                     reweight_grace_days=reweight_grace_days
                 )
                 st.session_state['carry_result_series'] = df_res_60d["Result"]
@@ -2219,6 +2214,7 @@ with tab3:
                             global_floor, global_cap, ubar, dbar, adj_divs=adj_divs,
                             start_date=bt_start_date,
                             is_cross_corridor=is_cross_corridor,
+                            missing_data_policy=missing_data_policy,
                             reweight_grace_days=reweight_grace_days
                         )
                         st.session_state['email_60d_graph'] = func_graph.plot_60d(

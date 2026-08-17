@@ -73,6 +73,7 @@ BUNDLE_VERSION = 2
 #:   2 — grace is live (ADAPTIVE_REWEIGHT holds a gapped name's weight for
 #:       <= grace days); the stored value is honoured on replay.
 _MATRIX_FILE = "pnl_matrix.parquet"
+_MASK_FILE = "active_mask.parquet"   # optional: adaptive grace mask (grace > 0 runs)
 _JSON_FILE = "bundle.json"
 
 
@@ -170,6 +171,7 @@ class RunBundle:
     """In-memory representation of a saved optimizer run (see module docstring)."""
 
     pnl_matrix: np.ndarray
+    active_mask: Optional[np.ndarray]
     column_map: Dict[str, int]
     long_candidates: List[DispersionLeg]
     short_candidates: List[DispersionLeg]
@@ -223,6 +225,7 @@ class RunBundle:
             missing_data_policy=self.missing_data_policy,
             adj_divs=self.adj_divs,
             reweight_grace_days=self.reweight_grace_days,
+            active_mask=self.active_mask,
             is_cross_corridor=self.is_cross_corridor,
             seed=self.seed,
             global_cap=self.global_cap,
@@ -259,6 +262,7 @@ def save_run_bundle(
     missing_data_policy: MissingDataPolicy,
     adj_divs: bool = False,
     reweight_grace_days: int = 0,
+    active_mask: Optional[np.ndarray] = None,
     is_cross_corridor: bool = False,
     global_cap: float = 9999999.0,
     global_floor: float = -9999999.0,
@@ -296,6 +300,11 @@ def save_run_bundle(
     index = pd.Index(dates) if dates is not None else pd.RangeIndex(mat.shape[0])
     df = pd.DataFrame(mat, columns=cols_by_idx, index=index)
     df.to_parquet(os.path.join(path, _MATRIX_FILE))
+    if active_mask is not None:
+        # Grace > 0: the mask was built on FULL history before window slicing —
+        # not derivable from the stored window alone, so persist it for exact replay.
+        pd.DataFrame(np.asarray(active_mask, dtype=bool), columns=cols_by_idx,
+                     index=index).to_parquet(os.path.join(path, _MASK_FILE))
 
     # ── Everything else → JSON ──
     payload = {
@@ -357,12 +366,16 @@ def load_run_bundle(path: str) -> RunBundle:
 
     df = pd.read_parquet(mat_path)
     pnl_matrix = df.to_numpy(dtype=np.float64)
+    mask_path = os.path.join(path, _MASK_FILE)
+    active_mask = (pd.read_parquet(mask_path).to_numpy(dtype=bool)
+                   if os.path.exists(mask_path) else None)
     column_map = {str(c): i for i, c in enumerate(df.columns)}
     dates = None if isinstance(df.index, pd.RangeIndex) else list(df.index)
 
     opt = payload["optimizer"]
     return RunBundle(
         pnl_matrix=pnl_matrix,
+        active_mask=active_mask,
         column_map=column_map,
         long_candidates=[_leg_from_dict(d) for d in payload["long_candidates"]],
         short_candidates=[_leg_from_dict(d) for d in payload["short_candidates"]],

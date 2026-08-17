@@ -314,6 +314,7 @@ class DispersionOptimizer:
         missing_data_policy=None,
         adj_divs: bool = False,
         reweight_grace_days: int = 0,
+        active_mask: Optional[np.ndarray] = None,
         is_cross_corridor: bool = False,
         seed: int = 0,
         global_cap: float = 9999999.0,
@@ -386,8 +387,18 @@ class DispersionOptimizer:
         # days). grace=0 returns the validity mask itself — historical
         # behaviour, bit-identical.
         self._valid_mask = ~np.isnan(self._orig_ts_mat)  # [n_rows x n_cols]
-        if (self.missing_data_policy == MissingDataPolicy.ADAPTIVE_REWEIGHT
+        if active_mask is not None:
+            # Externally built (on FULL history, sliced to this window by the
+            # caller) — a gap already open at window start stays in-grace.
+            if active_mask.shape != self._orig_ts_mat.shape:
+                raise ValueError(
+                    f"active_mask shape {active_mask.shape} != pnl_matrix "
+                    f"shape {self._orig_ts_mat.shape}")
+            self._active_mask = active_mask.astype(bool)
+        elif (self.missing_data_policy == MissingDataPolicy.ADAPTIVE_REWEIGHT
                 and self.reweight_grace_days > 0):
+            # Fallback (headless/replay without a stored mask): derive from
+            # this window only — pre-window history is not visible here.
             self._active_mask = active_mask_with_grace(
                 self._valid_mask, self.reweight_grace_days)
         else:

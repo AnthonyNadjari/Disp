@@ -313,6 +313,12 @@ def compute_leg_pnl_columns(
     'variance_asset'} (populated only when capture_cross_legs and cross mode).
     """
     calc = SwapCalculator(config)
+    if corridor_px is not None and not getattr(corridor_px, "empty", True):
+        # Rows are paired positionally below — both series must share one
+        # calendar. The loader union-reindexes already (no-op there); this
+        # guards direct/headless callers passing misaligned frames.
+        if not corridor_px.index.equals(variance_px.index):
+            corridor_px = corridor_px.reindex(variance_px.index)
     leg_map: Dict[str, DispersionLeg] = {}
     column_keys: List[str] = []
     skipped_missing_corr = []
