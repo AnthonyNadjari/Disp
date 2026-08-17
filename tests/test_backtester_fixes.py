@@ -98,3 +98,62 @@ def test_backtest_honors_end_date():
     res_open = bt.run(price_data, legs, weights, start_date=date(2020, 6, 1))
     assert res_open.timeseries.index.max() > pd.Timestamp(end), (
         "sanity: without end_date the curve extends past the cutoff")
+
+
+# ── Short-leg sign: optimizer and backtester must agree in EVERY mode ────────
+
+def test_cross_corridor_short_sign_optimizer_matches_backtester():
+    """A short basket row = a SOLD leg = subtracted, in cross-corridor mode too.
+    The optimizer's net P&L for a fixed (long, short) allocation must equal the
+    backtester's Result curve on the same matrix (FILL_ZERO → no masking noise)."""
+    from functions.dispersion._optimizer import DispersionOptimizer
+    from functions.dispersion.scoring import MetricWeights
+    from functions.dispersion.models import OptimizationConstraints
+
+    rng = np.random.default_rng(11)
+    n_days, names = 300, ["S1 Equity", "S2 Equity", "S3 Equity", "S4 Equity"]
+    pnl = np.column_stack([rng.normal(0.3 * (i + 1), 1.0, n_days) for i in range(4)])
+    col_map = {t: i for i, t in enumerate(names)}
+    legs = [DispersionLeg(variance_asset="IDX Index", corridor_condition_asset=t,
+                          strike_mono_var_swap=0.10, strike_cross_corridor=0.10,
+                          min_weight=0.05, max_weight=0.95) for t in names]
+    long_legs, short_legs = legs[:2], legs[2:]
+    cons = OptimizationConstraints(
+        min_stocks_long=2, max_stocks_long=2, min_stocks_short=2, max_stocks_short=2,
+        max_net_strike=10.0, population_size=20, max_generations=10,
+        time_limit_seconds=5.0, stagnation_limit=5)
+
+    opt = DispersionOptimizer(
+        long_candidates=long_legs, short_candidates=short_legs,
+        pnl_matrix=pnl, column_map=col_map, constraints=cons,
+        missing_data_policy=MissingDataPolicy.FILL_ZERO,
+        metric_weights=MetricWeights({"mean_payoff": 1.0}),
+        is_cross_corridor=True, seed=0)
+
+    long_pos, long_w = [0, 1], np.array([0.5, 0.5])
+    short_pos, short_w = [2, 3], np.array([0.5, 0.5])
+    net_opt = opt._adaptive_net_pnl(long_pos, long_w, short_pos, short_w)
+
+    # Backtester on the same matrix: monkey-free — feed the P&L matrix through
+    # the policy layer directly via run()'s internals is heavier; instead
+    # compute the reference by hand from the SAME convention: net = L − S.
+    expected = pnl[:, [0, 1]] @ long_w - pnl[:, [2, 3]] @ short_w
+    assert np.allclose(net_opt, expected), (
+        "cross-corridor short leg must be SUBTRACTED (sold leg), matching the "
+        "backtester's long_pnl + (negated) short_pnl convention")
+
+
+def test_backtester_short_sign_reference():
+    """Ground truth for the convention: the backtester subtracts a short row."""
+    dates = pd.bdate_range("2021-01-04", periods=200)
+    up = np.full(200, 1.0)      # leg that always pays +1
+    dn = np.full(200, 0.25)     # leg that always pays +0.25
+    pnl = np.column_stack([up, dn])
+
+    cfg = _to_swap_config(DispersionConfig(n_exp=20, missing_data_policy=MissingDataPolicy.FILL_ZERO))
+    bt = DispersionBacktester(cfg)
+    legs = [DispersionLeg(variance_asset="A", strike_mono_var_swap=0.1),
+            DispersionLeg(variance_asset="B", strike_mono_var_swap=0.1)]
+    long_pnl, short_pnl, _, _ = bt._apply_fill_zero_policy(pnl, ["A", "B"], {"A": 1.0, "B": -1.0})
+    net = long_pnl + short_pnl
+    assert np.allclose(net, up - dn), "backtester net must be long − short"

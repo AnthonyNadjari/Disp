@@ -1399,7 +1399,7 @@ class DispersionOptimizer:
                 S = self._orig_ts_mat[valid_rows][:, short_pos] @ short_w
             else:
                 S = np.zeros(int(valid_rows.sum()))
-            net = (L + S) if self.is_cross_corridor else (L - S)
+            net = L - S  # short basket = sold legs, subtracted (same as backtester)
             if self.global_cap < 9999998 or self.global_floor > -9999998:
                 net = np.clip(net, self.global_floor, self.global_cap)
             return net
@@ -1414,9 +1414,11 @@ class DispersionOptimizer:
             else:
                 S = np.zeros(self._n_rows)
 
-        # For cross-corridor: net = L + S (short_weights applied to net-of-legs PnL)
-        # For standard: net = L - S
-        net = (L + S) if self.is_cross_corridor else (L - S)
+        # Short basket = sold legs → subtracted, in EVERY mode (cross-corridor
+        # included: a short cross-corridor row is a sold (mono−cross) leg).
+        # Matches the backtester (run(): result = long_pnl + short_pnl with
+        # short_pnl already negated) and _net_strike (net -= short strikes).
+        net = L - S
         if self.global_cap < 9999998 or self.global_floor > -9999998:
             net = np.clip(net, self.global_floor, self.global_cap)
         return net
@@ -1668,7 +1670,7 @@ class DispersionOptimizer:
             valid_rows = np.ones(self._n_rows, dtype=bool)
         if valid_rows.sum() < TUNING.min_valid_days:
             return None
-        net = (L + S) if self.is_cross_corridor else (L - S)
+        net = L - S  # short basket = sold legs, subtracted (same as backtester)
         if self.global_cap < 9999998 or self.global_floor > -9999998:
             net = np.clip(net, self.global_floor, self.global_cap)
         if not use_drop:
