@@ -164,3 +164,43 @@ def test_cache_prep_skips_reload(monkeypatch):
     api.optimize(long_df, cfg, cons, score_weights={"mean_payoff": 1.0}, seed=0)
     assert calls["n"] == 3
     api._PREP_CACHE.clear()
+
+
+# ── shared calibration: reuse is bit-identical and actually shared ───────────
+
+def test_reference_cache_shared_and_bit_identical():
+    from functions.dispersion._optimizer import DispersionOptimizer
+    from functions.dispersion.scoring import MetricWeights
+    from functions.dispersion.models import OptimizationConstraints
+
+    rng = np.random.default_rng(21)
+    names = [f"R{i}" for i in range(8)]
+    pnl = np.column_stack([rng.normal(0.15 * (i + 1), 0.9, 250) for i in range(8)])
+    col_map = {t: i for i, t in enumerate(names)}
+    legs = [DispersionLeg(variance_asset=t, strike_mono_var_swap=0.12,
+                          min_weight=0.05, max_weight=0.60) for t in names]
+    cons = OptimizationConstraints(
+        min_stocks_long=2, max_stocks_long=3, min_stocks_short=0,
+        max_stocks_short=0, max_net_strike=10.0, population_size=30,
+        max_generations=30, time_limit_seconds=8.0, stagnation_limit=10)
+
+    def run(weights, cache):
+        opt = DispersionOptimizer(
+            long_candidates=legs, short_candidates=[], pnl_matrix=pnl,
+            column_map=col_map, constraints=cons,
+            missing_data_policy=MissingDataPolicy.FILL_ZERO,
+            metric_weights=MetricWeights(weights), seed=0,
+            reference_cache=cache)
+        return opt.run()
+
+    shared = {}
+    r1 = run({"mean_payoff": 1.0}, shared)
+    assert len(shared) == 1, "first config must populate the calibration cache"
+    r2 = run({"hit_ratio": 1.0}, shared)          # same group (no tail metric)
+    assert len(shared) == 1, "same-group config must REUSE the calibration"
+    r2_solo = run({"hit_ratio": 1.0}, None)       # no cache at all
+    assert r2.long_basket == r2_solo.long_basket and r2.score == r2_solo.score, (
+        "cached-calibration run must be bit-identical to a solo run")
+    r3 = run({"min_payoff": 1.0}, shared)          # tail metric → bigger sample
+    assert len(shared) == 2, "tail-metric config needs its own calibration group"
+    assert r3.long_basket, "tail config must still produce a result"

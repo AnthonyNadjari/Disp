@@ -1370,13 +1370,37 @@ with tab1:
         # ═══ 🧪 MULTI-CONFIG COMPARISON (one data load, N weight configs) ═══
         with st.expander("🧪 Compare several weight configs (one data load)"):
             st.caption(
-                "One config per line, metric=weight pairs comma-separated. "
-                "Same seed and constraints as the single run above — each line "
-                "reproduces exactly what a single run with those weights would return.")
-            _mc_text = st.text_area(
-                "Configs", value="mean_payoff=0.5, hit_ratio=0.5\nmin_payoff=1.0",
-                height=80, key="_mc_configs_text")
-            if st.button("Run comparison", key="_mc_run_btn"):
+                "One **row per configuration**, one column per metric (blank/0 = "
+                "inactive; weights are normalized automatically). Data is loaded "
+                "once and the calibration is shared — each row still reproduces "
+                "exactly what a single run with those weights would return.")
+            _mc_metric_cols = ['last_carry', 'mean_payoff', 'hit_ratio', 'min_payoff',
+                               'max_drawdown', 'cvar_5', 'sharpe_payoff', 'weighted_strike']
+            if st.session_state.get('_vega_toggle', False):
+                _mc_metric_cols = _mc_metric_cols + ['axe_book_cleaned', 'axe_package_recycled']
+            _mc_all_cols = ['Config'] + _mc_metric_cols
+            if '_mc_table' not in st.session_state:
+                st.session_state['_mc_table'] = pd.DataFrame([
+                    {'Config': 'balanced', 'last_carry': 0.3, 'mean_payoff': 0.3,
+                     'hit_ratio': 0.3, 'min_payoff': 0.1},
+                    {'Config': 'defensive', 'min_payoff': 1.0},
+                ])
+            _mc_show = st.session_state['_mc_table'].reindex(columns=_mc_all_cols)
+            _mc_show[_mc_metric_cols] = _mc_show[_mc_metric_cols].fillna(0.0)
+            _mc_show['Config'] = _mc_show['Config'].fillna('')
+            _mc_table = st.data_editor(
+                _mc_show, num_rows="dynamic", use_container_width=True,
+                key="_mc_editor")
+            st.session_state['_mc_table'] = _mc_table
+            _mc_c1, _mc_c2 = st.columns([1, 1])
+            if _mc_c1.button("(+) Add current weights as a row", key="_mc_add_current",
+                             help="Appends the single-run weights configured above."):
+                _new = {'Config': f"run {len(_mc_table) + 1}"}
+                _new.update({k: float(score_weights.get(k, 0.0)) for k in _mc_metric_cols})
+                st.session_state['_mc_table'] = pd.concat(
+                    [_mc_table, pd.DataFrame([_new])], ignore_index=True)
+                st.rerun()
+            if _mc_c2.button("Run comparison", key="_mc_run_btn", type="primary"):
                 def _parse_ticker_list_mc(raw_text):
                     out = []
                     for chunk in (raw_text or "").replace(',', '\n').splitlines():
@@ -1385,24 +1409,24 @@ with tab1:
                             out.append(t)
                     return out or None
 
-                def _parse_multi_configs(txt):
-                    out = []
-                    for line in txt.splitlines():
-                        line = line.strip()
-                        if not line:
-                            continue
+                def _parse_multi_configs(table, metric_cols):
+                    out, labels = [], []
+                    for _, r in table.iterrows():
                         cfg_d = {}
-                        for part in line.split(','):
-                            if '=' not in part:
-                                raise ValueError(
-                                    f"Bad config entry: '{part.strip()}' (expected metric=weight)")
-                            k, v = part.split('=', 1)
-                            cfg_d[k.strip()] = float(v)
+                        for m in metric_cols:
+                            try:
+                                v = float(r.get(m) or 0.0)
+                            except (TypeError, ValueError):
+                                v = 0.0
+                            if v > 0:
+                                cfg_d[m] = v
                         if cfg_d:
                             out.append(cfg_d)
-                    return out
+                            labels.append(str(r.get('Config') or f"config {len(out)}"))
+                    return out, labels
                 try:
-                    _mc_configs = _parse_multi_configs(_mc_text)
+                    _mc_configs, _mc_labels = _parse_multi_configs(_mc_table, _mc_metric_cols)
+                    st.session_state['_mc_labels'] = _mc_labels
                     if not _mc_configs:
                         st.warning("No configs to run.")
                     else:
@@ -1468,7 +1492,11 @@ with tab1:
                     st.exception(_mc_e)
             _mc_prev = st.session_state.get('_mc_result')
             if _mc_prev is not None:
-                st.dataframe(_mc_prev.comparison, use_container_width=True)
+                _mc_cmp = _mc_prev.comparison.copy()
+                _lbls = st.session_state.get('_mc_labels')
+                if _lbls and len(_lbls) == len(_mc_cmp):
+                    _mc_cmp.insert(0, 'Config', _lbls)
+                st.dataframe(_mc_cmp, use_container_width=True, hide_index=True)
                 st.caption("pct_<metric> = percentile of the winner's raw value in that "
                            "run's reference distribution (higher = better).")
     # ═══════════════════════════════════════════════════════════════════

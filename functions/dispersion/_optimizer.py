@@ -328,6 +328,7 @@ class DispersionOptimizer:
         n_reference_samples: Optional[int] = None,
         bucket_constraints: Optional[List[BucketConstraint]] = None,
         vega_config: Optional[VegaConfig] = None,
+        reference_cache: Optional[dict] = None,
     ):
         self.long_candidates = long_candidates
         self.short_candidates = short_candidates
@@ -347,6 +348,11 @@ class DispersionOptimizer:
             )
         self._n_reference_samples = (int(n_reference_samples)
                                      if n_reference_samples is not None else None)
+        # Shared-calibration cache (optimize_multi / cache_prep re-runs): maps
+        # (seed, n_samples, extras signature, vega on) → the generated reference
+        # sample + post-generation RNG states. Same universe is the caller's
+        # contract (one prep = one cache). None = no sharing.
+        self._reference_cache = reference_cache
         self.adj_divs = adj_divs
         self.reweight_grace_days = reweight_grace_days
         self.is_cross_corridor = is_cross_corridor
@@ -1717,6 +1723,89 @@ class DispersionOptimizer:
         ref_start = time.time()
         self.log("INFO", f"Building reference sample ({n_samples} baskets)...")
         ctx = ScoreContext(n_days=self._n_rows)
+        # ── Shared-calibration cache: reuse the sampled baskets when another
+        # config with the SAME (seed, sample size, extras, vega-mode) already
+        # generated them, restoring the exact post-generation RNG states so
+        # every downstream draw matches a solo run bit-for-bit. ──
+        _ref_key = None
+        if self._reference_cache is not None:
+            _extras_sig = tuple(sorted(
+                set(self._score_fn.weights.active_names)
+                & {"weighted_strike", "axe_book_cleaned", "axe_package_recycled"}))
+            _ref_key = (int(self.seed), int(n_samples), _extras_sig,
+                        self._vega is not None)
+        _hit = self._reference_cache.get(_ref_key) if _ref_key is not None else None
+        if _hit is not None:
+            sample_pnls = _hit["sample_pnls"]
+            sample_extras = _hit["sample_extras"]
+            attempts = _hit["attempts"]
+            self._rng.setstate(_hit["rng_state"])
+            self._np_rng.bit_generator.state = _hit["np_state"]
+            self._vega_rng.setstate(_hit["vega_state"])
+            self.log("INFO", f"✅ Calibration reused from shared cache ({len(sample_pnls)} baskets)")
+        else:
+            sample_pnls, sample_extras, attempts = self._generate_reference_sample(n_samples, ctx)
+            if _ref_key is not None:
+                self._reference_cache[_ref_key] = {
+                    "sample_pnls": sample_pnls,
+                    "sample_extras": sample_extras,
+                    "attempts": attempts,
+                    "rng_state": self._rng.getstate(),
+                    "np_state": self._np_rng.bit_generator.state,
+                    "vega_state": self._vega_rng.getstate(),
+                }
+        if len(sample_pnls) < TUNING.min_reference_size:
+            self.log("WARN", f"⚠️ Reference sample too small ({len(sample_pnls)}/{n_samples} after {attempts} attempts), falling back to legacy scoring")
+            self._use_new_scoring = False
+            self._scoring_mode = "legacy"
+            return
+        # FIT the score function with collected samples (extras carry per-sample
+        # weighted strikes so the strike objective normalises like any metric)
+        self._score_fn.build_reference(sample_pnls, ctx, sample_extras=sample_extras)
+        # Non-degeneracy for extras-carried ACTIVE metrics (weighted_strike,
+        # axe criteria): a constant reference saturates the rank normalizer
+        # (every candidate scores 0 under strictly-less tie semantics)
+        _active_extras = (set(self._score_fn.weights.active_names)
+                          & {"weighted_strike", "axe_book_cleaned", "axe_package_recycled"})
+        for _name in sorted(_active_extras):
+            _vals = np.array([e[_name] for e in sample_extras if _name in e], dtype=np.float64)
+            _vals = _vals[np.isfinite(_vals)]
+            if len(_vals) > 10 and np.std(_vals) < 1e-10:
+                raise RuntimeError(
+                    f"Reference sample non-degenerate check failed: metric '{_name}' "
+                    f"has zero spread (all values ≈ {_vals[0]:.6f}) across the sampled "
+                    f"baskets — the quantile normalizer would score every candidate 0. "
+                    f"Vary the inputs (targets/caps/strikes) or deactivate the metric."
+                )
+        self._reference_size = len(sample_pnls)
+        self._ref_n_samples = int(n_samples)
+        # Sanity: verify max_drawdown (and all metrics) have non-degenerate spread
+        # If std==0 for any active metric, the quantile normalizer is saturated
+        for m in self._score_fn.metrics:
+            if m.name not in self._score_fn.weights.active_names:
+                continue
+            vals = np.array([m.compute(p, ctx) for p in sample_pnls], dtype=np.float64)
+            vals = vals[np.isfinite(vals)]
+            if len(vals) > 10 and np.std(vals) < 1e-10:
+                # DEBUG: Print first 10 baskets for root cause analysis
+                for i in range(min(10, len(sample_pnls))):
+                    pnl = sample_pnls[i]
+                    last_val = float(np.mean(pnl[-1:]))
+                    mean_ret = float(np.mean(pnl))
+                    cumsum = float(np.sum(pnl))
+                raise RuntimeError(
+                    f"Reference sample non-degenerate check failed: metric '{m.name}' "
+                    f"has zero spread (all values ≈ {vals[0]:.6f}). The quantile normalizer "
+                    f"will saturate and this metric will have no effect on scoring. "
+                    f"Check that the weight strategy mix produces diverse baskets."
+                )
+        ref_elapsed = time.time() - ref_start
+        self.log("INFO", f"✅ Reference sample fitted ({len(sample_pnls)} baskets, {attempts} attempts) → bilevel scoring active [{ref_elapsed:.1f}s]")
+
+
+    def _generate_reference_sample(self, n_samples: int, ctx) -> tuple:
+        """Draw the reference baskets (consumes the run RNG streams).
+        Returns (sample_pnls, sample_extras, attempts)."""
         sample_pnls = []
         sample_extras = []  # aligned with sample_pnls: {"weighted_strike": ...}
         attempts = 0
@@ -1888,54 +1977,7 @@ class DispersionOptimizer:
                 }
                 _extra_e.update(self._reference_axe_extras(long_indices_e, long_w_e))
                 sample_extras.append(_extra_e)
-
-        if len(sample_pnls) < TUNING.min_reference_size:
-            self.log("WARN", f"⚠️ Reference sample too small ({len(sample_pnls)}/{n_samples} after {attempts} attempts), falling back to legacy scoring")
-            self._use_new_scoring = False
-            self._scoring_mode = "legacy"
-            return
-        # FIT the score function with collected samples (extras carry per-sample
-        # weighted strikes so the strike objective normalises like any metric)
-        self._score_fn.build_reference(sample_pnls, ctx, sample_extras=sample_extras)
-        # Non-degeneracy for extras-carried ACTIVE metrics (weighted_strike,
-        # axe criteria): a constant reference saturates the rank normalizer
-        # (every candidate scores 0 under strictly-less tie semantics)
-        _active_extras = (set(self._score_fn.weights.active_names)
-                          & {"weighted_strike", "axe_book_cleaned", "axe_package_recycled"})
-        for _name in sorted(_active_extras):
-            _vals = np.array([e[_name] for e in sample_extras if _name in e], dtype=np.float64)
-            _vals = _vals[np.isfinite(_vals)]
-            if len(_vals) > 10 and np.std(_vals) < 1e-10:
-                raise RuntimeError(
-                    f"Reference sample non-degenerate check failed: metric '{_name}' "
-                    f"has zero spread (all values ≈ {_vals[0]:.6f}) across the sampled "
-                    f"baskets — the quantile normalizer would score every candidate 0. "
-                    f"Vary the inputs (targets/caps/strikes) or deactivate the metric."
-                )
-        self._reference_size = len(sample_pnls)
-        self._ref_n_samples = int(n_samples)
-        # Sanity: verify max_drawdown (and all metrics) have non-degenerate spread
-        # If std==0 for any active metric, the quantile normalizer is saturated
-        for m in self._score_fn.metrics:
-            if m.name not in self._score_fn.weights.active_names:
-                continue
-            vals = np.array([m.compute(p, ctx) for p in sample_pnls], dtype=np.float64)
-            vals = vals[np.isfinite(vals)]
-            if len(vals) > 10 and np.std(vals) < 1e-10:
-                # DEBUG: Print first 10 baskets for root cause analysis
-                for i in range(min(10, len(sample_pnls))):
-                    pnl = sample_pnls[i]
-                    last_val = float(np.mean(pnl[-1:]))
-                    mean_ret = float(np.mean(pnl))
-                    cumsum = float(np.sum(pnl))
-                raise RuntimeError(
-                    f"Reference sample non-degenerate check failed: metric '{m.name}' "
-                    f"has zero spread (all values ≈ {vals[0]:.6f}). The quantile normalizer "
-                    f"will saturate and this metric will have no effect on scoring. "
-                    f"Check that the weight strategy mix produces diverse baskets."
-                )
-        ref_elapsed = time.time() - ref_start
-        self.log("INFO", f"✅ Reference sample fitted ({len(sample_pnls)} baskets, {attempts} attempts) → bilevel scoring active [{ref_elapsed:.1f}s]")
+        return sample_pnls, sample_extras, attempts
 
     def _ws_active(self) -> bool:
         """True when the weighted_strike objective carries a positive weight."""

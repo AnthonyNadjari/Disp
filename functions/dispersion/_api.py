@@ -548,7 +548,9 @@ def _prepare_cached(cache_prep, long_df, config, constraints, *, short_df,
                           end_date, filter_zero_hr, forced_set, excluded_set)
     if _PREP_CACHE.get("key") == key:
         _engine_log.info("prep cache HIT — Bloomberg load + matrix build skipped")
-        return _copy_prep(_PREP_CACHE["prep"])
+        out = _copy_prep(_PREP_CACHE["prep"])
+        out["reference_cache"] = _PREP_CACHE.setdefault("reference_cache", {})
+        return out
     prep = _prepare_optimization_inputs(
         long_df, config, constraints, short_df=short_df,
         start_date=start_date, end_date=end_date, filter_zero_hr=filter_zero_hr,
@@ -556,6 +558,8 @@ def _prepare_cached(cache_prep, long_df, config, constraints, *, short_df,
     if prep["early_result"] is None:
         _PREP_CACHE["key"] = key
         _PREP_CACHE["prep"] = _copy_prep(prep)
+        _PREP_CACHE["reference_cache"] = {}
+        prep["reference_cache"] = _PREP_CACHE["reference_cache"]
     return prep
 
 
@@ -1098,6 +1102,7 @@ def optimize(
         missing_data_policy=config.missing_data_policy,
         reweight_grace_days=config.reweight_grace_days,
         active_mask=prep["active_mask"],
+        reference_cache=prep.get("reference_cache"),
         is_cross_corridor=config.cross_corridor,
         global_cap=config.global_cap,
         global_floor=config.global_floor,
@@ -1448,6 +1453,11 @@ def optimize_multi(
             "(empty prices or too few valid candidates). Run optimize() for "
             "the detailed debug output.")
 
+    # Shared calibration across the batch (persists across calls with cache_prep)
+    _shared_ref_cache = prep.get("reference_cache")
+    if _shared_ref_cache is None:
+        _shared_ref_cache = {}
+
     results: List[OptimizationResult] = []
     rows: List[Dict] = []
     for k, weights_dict in enumerate(configs):
@@ -1461,6 +1471,7 @@ def optimize_multi(
             missing_data_policy=config.missing_data_policy,
             reweight_grace_days=config.reweight_grace_days,
             active_mask=prep["active_mask"],
+            reference_cache=_shared_ref_cache,
             is_cross_corridor=config.cross_corridor,
             global_cap=config.global_cap,
             global_floor=config.global_floor,
