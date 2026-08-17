@@ -496,6 +496,69 @@ def _normalize_vega_arg(vega):
     raise TypeError(f"vega must be a VegaConfig or dict, got {type(vega).__name__}")
 
 
+# ── Prep cache: skip Bloomberg + matrix build when nothing upstream changed ──
+# Single slot, opt-in (cache_prep=True). Key = content hash of every input the
+# pipeline consumes, so any change to the data/config/filters busts it.
+_PREP_CACHE: dict = {}
+
+
+def _prep_cache_key(long_df, config, constraints, short_df, start_date, end_date,
+                    filter_zero_hr, forced_set, excluded_set) -> str:
+    import dataclasses as _dc
+    import hashlib
+    h = hashlib.sha256()
+    for df in (long_df, short_df):
+        if df is None or df.empty:
+            h.update(b"~none~")
+        else:
+            h.update(repr(tuple(df.columns)).encode())
+            h.update(pd.util.hash_pandas_object(df.astype(str), index=True).values.tobytes())
+    h.update(repr(sorted((k, str(v)) for k, v in _dc.asdict(config).items())).encode())
+    h.update(repr((constraints.min_stocks_long, constraints.max_stocks_long,
+                   constraints.min_stocks_short, constraints.max_stocks_short,
+                   constraints.max_net_strike)).encode())
+    h.update(repr((str(start_date), str(end_date), bool(filter_zero_hr),
+                   tuple(sorted(forced_set)), tuple(sorted(excluded_set)))).encode())
+    return h.hexdigest()
+
+
+def _copy_prep(prep: Dict) -> Dict:
+    """Fresh leg objects / arrays so a run can never poison the cached copy."""
+    import dataclasses as _dc
+    out = dict(prep)
+    for k in ("long_valid", "short_valid", "legs"):
+        out[k] = [_dc.replace(l) for l in prep[k]]
+    out["pnl_matrix"] = prep["pnl_matrix"].copy()
+    out["col_map"] = dict(prep["col_map"])
+    out["forced_indices"] = list(prep["forced_indices"])
+    if prep.get("active_mask") is not None:
+        out["active_mask"] = prep["active_mask"].copy()
+    return out
+
+
+def _prepare_cached(cache_prep, long_df, config, constraints, *, short_df,
+                    start_date, end_date, filter_zero_hr, forced_set, excluded_set) -> Dict:
+    """_prepare_optimization_inputs with the opt-in single-slot cache in front."""
+    if not cache_prep:
+        return _prepare_optimization_inputs(
+            long_df, config, constraints, short_df=short_df,
+            start_date=start_date, end_date=end_date, filter_zero_hr=filter_zero_hr,
+            forced_set=forced_set, excluded_set=excluded_set)
+    key = _prep_cache_key(long_df, config, constraints, short_df, start_date,
+                          end_date, filter_zero_hr, forced_set, excluded_set)
+    if _PREP_CACHE.get("key") == key:
+        _engine_log.info("prep cache HIT — Bloomberg load + matrix build skipped")
+        return _copy_prep(_PREP_CACHE["prep"])
+    prep = _prepare_optimization_inputs(
+        long_df, config, constraints, short_df=short_df,
+        start_date=start_date, end_date=end_date, filter_zero_hr=filter_zero_hr,
+        forced_set=forced_set, excluded_set=excluded_set)
+    if prep["early_result"] is None:
+        _PREP_CACHE["key"] = key
+        _PREP_CACHE["prep"] = _copy_prep(prep)
+    return prep
+
+
 def _prepare_optimization_inputs(
     long_df: pd.DataFrame,
     config: DispersionConfig,
@@ -836,6 +899,7 @@ def optimize(
     vega=None,
     robustness_check: bool = False,
     log_level: str = None,
+    cache_prep: bool = False,
 ) -> OptimizationResult:
     """
     Find optimal basket via genetic algorithm.
@@ -901,6 +965,11 @@ def optimize(
         with replacement; winner vs its 10 best refinement challengers) and
         attach it as ``result.robustness`` — {top1_freq, top3_freq,
         winner_raw_ci}.  Deterministic (derived from the run seed).
+    cache_prep : bool
+        Keep the prepared inputs (Bloomberg prices, P&L matrix, filtered
+        universe) in memory and reuse them on the next call whose inputs are
+        content-identical — re-running with different score_weights then skips
+        the whole load/build phase. Off by default.
     log_level : str, optional
         Activate the engine's diagnostic logger ("DEBUG"/"INFO"/...).
         Default None = silent (historical prints now live behind this).
@@ -967,8 +1036,8 @@ def optimize(
     from functions.dispersion._optimizer import DispersionOptimizer
     from functions.dispersion.scoring import MetricWeights
 
-    prep = _prepare_optimization_inputs(
-        long_df, config, constraints,
+    prep = _prepare_cached(
+        cache_prep, long_df, config, constraints,
         short_df=short_df, start_date=start_date, end_date=end_date,
         filter_zero_hr=filter_zero_hr,
         forced_set=_forced_set, excluded_set=_excluded_set,
@@ -1296,6 +1365,7 @@ def optimize_multi(
     bucket_constraints: List = None,
     run_backtests: bool = True,
     progress_callback: Callable[[int, int, float], None] = None,
+    cache_prep: bool = False,
 ) -> MultiOptimizeResult:
     """Run the optimizer for SEVERAL score-weight configs on ONE data load.
 
@@ -1366,8 +1436,8 @@ def optimize_multi(
     from functions.dispersion.scoring import MetricWeights
 
     # ── Load + build + filter ONCE ──
-    prep = _prepare_optimization_inputs(
-        long_df, config, constraints,
+    prep = _prepare_cached(
+        cache_prep, long_df, config, constraints,
         short_df=short_df, start_date=start_date, end_date=end_date,
         filter_zero_hr=filter_zero_hr,
         forced_set=_forced_set, excluded_set=_excluded_set,

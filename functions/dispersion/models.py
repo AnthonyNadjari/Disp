@@ -847,6 +847,109 @@ class BacktestResult:
         }
         return self.metrics
 
+    # ── Per-stock breakdown & clean export (headless-first; the UI calls the
+    #    exact same methods, so both paths can never diverge) ─────────────────
+
+    def per_stock(self, name: str) -> pd.DataFrame:
+        """Daily P&L lines for ONE name: 'net' always; in cross-corridor mode
+        also 'mono_leg' (stock var) and 'cross_leg' (index var in the stock's
+        corridor), with net = mono − cross.
+
+            bt = backtest(df, cfg)
+            bt.per_stock("005930 KP Equity")        # 3-column DataFrame
+        """
+        if self.per_leg_pnl is None or name not in self.per_leg_pnl.columns:
+            avail = list(self.per_leg_pnl.columns)[:10] if self.per_leg_pnl is not None else []
+            raise KeyError(f"'{name}' has no per-leg P&L. Available sample: {avail}")
+        out = pd.DataFrame({"net": self.per_leg_pnl[name]})
+        clp = getattr(self, "cross_leg_pnl", None)
+        if clp is not None and isinstance(clp, pd.DataFrame) and not clp.empty:
+            for col in clp.columns:
+                if col.startswith(f"{name} (mono leg"):
+                    out["mono_leg"] = clp[col]
+                elif col.startswith(f"{name} (cross leg"):
+                    out["cross_leg"] = clp[col]
+        return out
+
+    def per_stock_stats(self, name: str = None) -> pd.DataFrame:
+        """Tidy stats table — one row per (stock, line): mean, hit_ratio (%),
+        last, min, max_drawdown, n_obs. `name=None` = every stock."""
+        names = [name] if name is not None else (
+            list(self.per_leg_pnl.columns) if self.per_leg_pnl is not None else [])
+        rows = []
+        for nm in names:
+            df = self.per_stock(nm)
+            for line in df.columns:
+                v = df[line].dropna()
+                if len(v) == 0:
+                    rows.append({"stock": nm, "line": line, "mean": 0.0, "hit_ratio": 0.0,
+                                 "last": 0.0, "min": 0.0, "max_drawdown": 0.0, "n_obs": 0})
+                    continue
+                cum = v.cumsum()
+                rows.append({
+                    "stock": nm, "line": line,
+                    "mean": float(v.mean()),
+                    "hit_ratio": float((v > 0).sum() / max(1, (v != 0).sum()) * 100),
+                    "last": float(v.iloc[-1]),
+                    "min": float(v.min()),
+                    "max_drawdown": float((cum - cum.cummax()).min()),
+                    "n_obs": int(len(v)),
+                })
+        return pd.DataFrame(rows)
+
+    def to_frames(self) -> Dict[str, pd.DataFrame]:
+        """Every output as tidy DataFrames: {'curve', 'per_leg_net',
+        'mono_cross_legs' (cross mode), 'per_stock_stats', 'summary'}."""
+        frames: Dict[str, pd.DataFrame] = {}
+        curve = self.timeseries.copy()
+        if self.active_legs_count is not None and len(self.active_legs_count) == len(curve):
+            curve["Active Stocks"] = self.active_legs_count.values
+        frames["curve"] = curve
+        if self.per_leg_pnl is not None and not self.per_leg_pnl.empty:
+            frames["per_leg_net"] = self.per_leg_pnl.copy()
+            frames["per_stock_stats"] = self.per_stock_stats()
+        clp = getattr(self, "cross_leg_pnl", None)
+        if clp is not None and isinstance(clp, pd.DataFrame) and not clp.empty:
+            frames["mono_cross_legs"] = clp.copy()
+        m = self.metrics or self.compute_metrics()
+        frames["summary"] = pd.DataFrame([m])
+        return frames
+
+    def export(self, path: str) -> str:
+        """Write everything to ONE file: '.xlsx' (needs openpyxl or xlsxwriter)
+        or '.zip' of CSVs (no extra dependency — always works).
+
+            bt.export("my_backtest.zip")
+        """
+        frames = self.to_frames()
+        if str(path).lower().endswith(".xlsx"):
+            try:
+                with pd.ExcelWriter(path) as xw:
+                    for sheet, df in frames.items():
+                        df.to_excel(xw, sheet_name=sheet[:31])
+            except ImportError as e:
+                raise RuntimeError(
+                    f"Excel export needs 'openpyxl' (or 'xlsxwriter'): {e}. "
+                    f"Use a '.zip' path instead — it has no dependency.") from e
+            return path
+        if str(path).lower().endswith(".zip"):
+            with open(path, "wb") as f:
+                f.write(frames_to_zip_bytes(frames))
+            return path
+        raise ValueError(f"export path must end in .xlsx or .zip, got: {path!r}")
+
+
+def frames_to_zip_bytes(frames: "Dict[str, pd.DataFrame]") -> bytes:
+    """{name: DataFrame} → zip archive of CSVs, as bytes (UI download button
+    and BacktestResult.export('.zip') share this exact function)."""
+    import io
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, df in frames.items():
+            z.writestr(f"{name}.csv", df.to_csv(index=True))
+    return buf.getvalue()
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Helper
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

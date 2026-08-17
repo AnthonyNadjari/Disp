@@ -129,6 +129,7 @@ def _run_bt(src_df, is_vol_swap, n_exp, local_cap,
         'short_tickers': [t for t, w in zip(all_tickers, all_weights) if w < 0],
         'long_weights': [abs(w) for w in all_weights if w > 0],
         'short_weights': [abs(w) for w in all_weights if w < 0],
+        'bt_result': bt_result,
         'raw_data': bt_result.per_leg_pnl if bt_result.per_leg_pnl is not None else pd.DataFrame(),
         'unweighted_data': bt_result.per_leg_pnl if bt_result.per_leg_pnl is not None else pd.DataFrame(),
     }
@@ -300,6 +301,15 @@ def _render_optimization_result(result, is_cross, debug_info=None):
                     {"Metric": m, "2.5%": c["lo"], "Mean": c["mean"], "97.5%": c["hi"]}
                     for m, c in _rb['winner_raw_ci'].items()
                 ]), use_container_width=True)
+    # ⬇️ Clean export — same to_frames()/zip as BacktestResult.export(".zip")
+    if result.backtest is not None and getattr(result.backtest, "timeseries", None) is not None \
+            and len(result.backtest.timeseries) > 0:
+        from functions.dispersion.models import frames_to_zip_bytes
+        st.download_button(
+            "⬇️ Download backtest data (zip of CSVs)",
+            data=frames_to_zip_bytes(result.backtest.to_frames()),
+            file_name="optimizer_backtest_data.zip", mime="application/zip",
+            key="dl_opt_bt_zip")
     # Scoring signature — reproducibility fingerprint of the run
     if getattr(result, 'scoring_signature', None):
         with st.expander("🧾 Scoring signature (debug)", expanded=False):
@@ -1269,6 +1279,7 @@ with tab1:
                                     vega=({"v_min": float(vega_v_min), "v_max": float(vega_v_max)}
                                           if vega_on else None),
                                     robustness_check=robustness_check,
+                                    cache_prep=True,
                                 )
                             except Exception as _e:
                                 _opt_error = _e
@@ -1449,6 +1460,7 @@ with tab1:
                                 seed=int(seed),
                                 forced_tickers=_parse_ticker_list_mc(forced_tickers_raw),
                                 bucket_constraints=_build_group_constraints(),
+                                cache_prep=True,
                             )
                         st.session_state['_mc_result'] = _mc
                 except Exception as _mc_e:
@@ -1883,6 +1895,7 @@ with tab3:
                 st.session_state.raw_data = backtest_metadata['raw_data']
                 st.session_state.unweighted_data = backtest_metadata['unweighted_data']
                 st.session_state.cross_leg_data = backtest_metadata.get('cross_leg_data', None)
+                st.session_state['bt_result_obj'] = backtest_metadata.get('bt_result')
                 # Store main graph
                 if graph_data:
                     st.session_state['graph_backtest'] = graph_data
@@ -1926,6 +1939,7 @@ with tab3:
                 st.session_state.raw_data = backtest_metadata['raw_data']
                 st.session_state.unweighted_data = backtest_metadata['unweighted_data']
                 st.session_state.cross_leg_data = backtest_metadata.get('cross_leg_data', None)
+                st.session_state['bt_result_obj'] = backtest_metadata.get('bt_result')
                 # Store main graph
                 if graph_data:
                     st.session_state['graph_backtest'] = graph_data
@@ -2016,6 +2030,14 @@ with tab3:
         # Per-stock individual time series breakdown
         _unweighted = st.session_state.get('unweighted_data', pd.DataFrame())
         if _unweighted is not None and isinstance(_unweighted, pd.DataFrame) and not _unweighted.empty:
+            _bt_dl = st.session_state.get('bt_result_obj')
+            if _bt_dl is not None:
+                from functions.dispersion.models import frames_to_zip_bytes
+                st.download_button(
+                    "⬇️ Download backtest data (zip of CSVs)",
+                    data=frames_to_zip_bytes(_bt_dl.to_frames()),
+                    file_name="backtest_data.zip", mime="application/zip",
+                    key="dl_bt_zip")
             with st.expander("📈 Per-Stock Time Series (Raw Data)"):
                 if is_cross_corridor:
                     # Cross corridor: show stock leg and index leg separately
@@ -2065,6 +2087,14 @@ with tab3:
                                         "Cross Leg (index)": _cross_legs_2[index_leg_col],
                                     }).dropna()
                                     st.line_chart(legs_df, use_container_width=True)
+                            # Per-stock stats — same numbers as bt_result.per_stock_stats(name)
+                            _bt_obj = st.session_state.get('bt_result_obj')
+                            if _bt_obj is not None:
+                                try:
+                                    st.dataframe(_bt_obj.per_stock_stats(col),
+                                                 use_container_width=True, hide_index=True)
+                                except KeyError:
+                                    pass
         # ✅ NEW: Conditional plotting based on toggle
         show_individual = st.session_state.get('show_individual_legs', False)
         if show_individual:
