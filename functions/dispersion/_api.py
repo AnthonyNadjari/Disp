@@ -79,6 +79,7 @@ def _to_swap_config(cfg: DispersionConfig, **overrides) -> SwapConfig:
         barrier_up=cfg.barrier_up,
         adj_divs=cfg.adj_divs,
         missing_data_policy=cfg.missing_data_policy,
+        reweight_grace_days=cfg.reweight_grace_days,
         lookback_years=cfg.lookback_years,
         global_cap=cfg.global_cap,
         global_floor=cfg.global_floor,
@@ -986,7 +987,7 @@ def optimize(
         column_map=col_map,
         constraints=constraints,
         missing_data_policy=config.missing_data_policy,
-        reweight_grace_days=3,
+        reweight_grace_days=config.reweight_grace_days,
         is_cross_corridor=config.cross_corridor,
         global_cap=config.global_cap,
         global_floor=config.global_floor,
@@ -1023,7 +1024,7 @@ def optimize(
             seed=seed,
             missing_data_policy=config.missing_data_policy,
             adj_divs=config.adj_divs,
-            reweight_grace_days=3,
+            reweight_grace_days=config.reweight_grace_days,
             is_cross_corridor=config.cross_corridor,
             global_cap=config.global_cap,
             global_floor=config.global_floor,
@@ -1047,7 +1048,7 @@ def optimize(
     # ── Persist smoothing state for interactive post-smoothing in UI ──
     opt_result._smooth_state = {
         "ts_mat": optimizer._ts_mat,             # nan_to_num'd matrix (zeros where NaN) — for evaluation + smooth_weights
-        "valid_mask": optimizer._valid_mask,      # ~isnan(orig_ts_mat) — for adaptive renorm
+        "active_mask": optimizer._active_mask,   # participation mask (validity ∪ grace) — for adaptive renorm
         "col_pos": optimizer._col_pos,           # key -> column index mapping (same as FINAL-RAW uses)
         "n_rows": optimizer._n_rows,
         "weight_solver": optimizer._weight_solver,
@@ -1338,7 +1339,7 @@ def optimize_multi(
             column_map=prep["col_map"],
             constraints=constraints,
             missing_data_policy=config.missing_data_policy,
-            reweight_grace_days=3,
+            reweight_grace_days=config.reweight_grace_days,
             is_cross_corridor=config.cross_corridor,
             global_cap=config.global_cap,
             global_floor=config.global_floor,

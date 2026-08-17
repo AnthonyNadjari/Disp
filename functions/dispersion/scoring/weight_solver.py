@@ -42,6 +42,36 @@ from scipy.sparse import csr_matrix
 # SHARED: Canonical adaptive PnL evaluation (single source of truth)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def active_mask_with_grace(is_valid: np.ndarray, grace: int) -> np.ndarray:
+    """Canonical ADAPTIVE_REWEIGHT participation mask (both engines use this).
+
+    A name is ACTIVE on day t once it has printed its first valid observation,
+    and stays active through a data gap of <= ``grace`` consecutive days — an
+    in-grace day keeps the name's weight allocated (it contributes 0 P&L via
+    the nan_to_num'd matrix) instead of redistributing it immediately.
+
+    grace <= 0 returns ``is_valid`` itself: exactly the historical behaviour
+    (every gap day redistributes at once), bit-identical by construction.
+
+    Parameters
+    ----------
+    is_valid : (T, C) bool — True where the P&L observation exists (not NaN)
+    grace : int — max gap length (days) a name keeps its slot
+
+    Returns
+    -------
+    (T, C) bool — the mask to feed ``adaptive_pnl`` / the weight solver
+    """
+    if grace <= 0:
+        return is_valid
+    T = is_valid.shape[0]
+    pos = np.arange(T)[:, np.newaxis]
+    last_valid = np.where(is_valid, pos, -1)
+    last_valid = np.maximum.accumulate(last_valid, axis=0)
+    started = last_valid >= 0
+    return started & ((pos - last_valid) <= grace)
+
+
 def adaptive_pnl(pnl_matrix: np.ndarray, stock_indices: np.ndarray, w: np.ndarray,
                  active_mask: np.ndarray = None) -> np.ndarray:
     """Compute adaptive-renormalized net PnL for a long-only weight vector.
@@ -56,7 +86,10 @@ def adaptive_pnl(pnl_matrix: np.ndarray, stock_indices: np.ndarray, w: np.ndarra
     pnl_matrix : (T, C) array — nan_to_num'd (zeros where NaN)
     stock_indices : (n,) int array — column indices into pnl_matrix
     w : (n,) float array — weight vector (sums to 1)
-    active_mask : (T, C) bool array — True where observation is valid (not NaN).
+    active_mask : (T, C) bool array — participation mask: the plain validity
+                  mask, or `active_mask_with_grace(...)` when a reweight grace
+                  is set (an active-but-gap day keeps its weight in the
+                  denominator while the nan_to_num'd matrix contributes 0).
                   If None, plain matmul (no adaptive renorm).
 
     Returns

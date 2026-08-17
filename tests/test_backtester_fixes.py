@@ -157,3 +157,104 @@ def test_backtester_short_sign_reference():
     long_pnl, short_pnl, _, _ = bt._apply_fill_zero_policy(pnl, ["A", "B"], {"A": 1.0, "B": -1.0})
     net = long_pnl + short_pnl
     assert np.allclose(net, up - dn), "backtester net must be long − short"
+
+
+# ── reweight_grace_days: live semantics, shared by both engines ──────────────
+
+def test_active_mask_with_grace_semantics():
+    from functions.dispersion.scoring.weight_solver import active_mask_with_grace
+    v = np.array([[0, 1, 1, 0, 0, 1, 0, 0, 0, 1]], dtype=bool).T.repeat(1, axis=1)
+    is_valid = v.reshape(-1, 1)
+    # grace=0 → identical to validity (bit-identical historical behaviour)
+    assert np.array_equal(active_mask_with_grace(is_valid, 0), is_valid)
+    m2 = active_mask_with_grace(is_valid, 2)[:, 0]
+    # not started yet (row 0 invalid, no prior valid) → inactive
+    assert not m2[0]
+    # 2-day gap (rows 3,4) bridged by grace=2
+    assert m2[3] and m2[4]
+    # 3-day gap (rows 6,7,8): first 2 in grace, 3rd beyond → inactive
+    assert m2[6] and m2[7] and not m2[8]
+    # trading day after the gap → active again
+    assert m2[9]
+
+
+def test_grace_holds_weight_backtester_and_optimizer_agree():
+    """A 2-day gap with grace=3: the gapped name KEEPS its weight (basket
+    under-invested those days) instead of redistributing. Backtester policy
+    and optimizer adaptive P&L must produce the SAME curve."""
+    from functions.dispersion._optimizer import DispersionOptimizer
+    from functions.dispersion.scoring import MetricWeights
+    from functions.dispersion.models import OptimizationConstraints
+
+    n_days = 120
+    pnl = np.column_stack([np.full(n_days, 1.0), np.full(n_days, 0.5)])
+    pnl[60:62, 1] = np.nan                    # 2-day gap on name B
+    names = ["A", "B"]
+    col_map = {t: i for i, t in enumerate(names)}
+    legs = [DispersionLeg(variance_asset=t, strike_mono_var_swap=0.10,
+                          min_weight=0.05, max_weight=0.95) for t in names]
+    w = {"A": 0.5, "B": 0.5}
+
+    for grace, gap_expect in [(0, 1.0), (3, 0.5)]:
+        # grace=0: B's weight redistributes to A on gap days → net = 1.0
+        # grace=3: B keeps its slot, contributes 0 → net = 0.5·1 + 0.5·0 = 0.5
+        cfg = _to_swap_config(DispersionConfig(
+            n_exp=20, missing_data_policy=MissingDataPolicy.ADAPTIVE_REWEIGHT,
+            reweight_grace_days=grace))
+        bt = DispersionBacktester(cfg)
+        long_pnl, short_pnl, active, _ = bt._apply_adaptive_policy(pnl, names, w)
+        net_bt = long_pnl + short_pnl
+        assert net_bt[59] == pytest.approx(0.75)          # normal day
+        assert net_bt[60] == pytest.approx(gap_expect), f"grace={grace}"
+        assert net_bt[62] == pytest.approx(0.75)          # back to normal
+
+        cons = OptimizationConstraints(
+            min_stocks_long=2, max_stocks_long=2, min_stocks_short=0,
+            max_stocks_short=0, max_net_strike=10.0, population_size=10,
+            max_generations=5, time_limit_seconds=5.0, stagnation_limit=5)
+        opt = DispersionOptimizer(
+            long_candidates=legs, short_candidates=[], pnl_matrix=pnl,
+            column_map=col_map, constraints=cons,
+            missing_data_policy=MissingDataPolicy.ADAPTIVE_REWEIGHT,
+            reweight_grace_days=grace,
+            metric_weights=MetricWeights({"mean_payoff": 1.0}), seed=0)
+        net_opt = opt._adaptive_net_pnl([0, 1], np.array([0.5, 0.5]))
+        assert np.allclose(net_opt, net_bt), (
+            f"grace={grace}: optimizer and backtester adaptive curves diverge")
+
+
+def test_bundle_v1_replays_with_grace_zero(tmp_path):
+    """Old (v1) bundles stored grace=3 while it was a NO-OP — replay must force
+    0 so their results reproduce. New (v2) bundles honour the stored value."""
+    import json
+    from functions.dispersion.run_bundle import load_run_bundle, save_run_bundle
+    from functions.dispersion.models import OptimizationConstraints
+
+    rng = np.random.default_rng(3)
+    pnl = rng.normal(0.5, 1.0, (150, 4))
+    names = [f"G{i}" for i in range(4)]
+    legs = [DispersionLeg(variance_asset=t, strike_mono_var_swap=0.10,
+                          min_weight=0.05, max_weight=0.95) for t in names]
+    cons = OptimizationConstraints(
+        min_stocks_long=2, max_stocks_long=3, min_stocks_short=0,
+        max_stocks_short=0, max_net_strike=10.0, population_size=16,
+        max_generations=8, time_limit_seconds=5.0, stagnation_limit=5)
+    path = str(tmp_path / "b")
+    save_run_bundle(
+        path, pnl_matrix=pnl, column_map={t: i for i, t in enumerate(names)},
+        long_candidates=legs, short_candidates=[], constraints=cons,
+        score_weights={"mean_payoff": 1.0}, seed=0,
+        missing_data_policy=MissingDataPolicy.ADAPTIVE_REWEIGHT,
+        reweight_grace_days=4)
+    # v2 bundle: stored grace honoured
+    b2 = load_run_bundle(path)
+    assert b2.reweight_grace_days == 4
+    # simulate a v1 bundle: rewrite version + stored (inert) grace
+    with open(f"{path}/bundle.json") as f:
+        payload = json.load(f)
+    payload["bundle_version"] = 1
+    payload["optimizer"]["reweight_grace_days"] = 3
+    with open(f"{path}/bundle.json", "w") as f:
+        json.dump(payload, f)
+    b1 = load_run_bundle(path)
+    assert b1.reweight_grace_days == 0, "v1 bundles must replay with grace=0 (it was inert)"

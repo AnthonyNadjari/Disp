@@ -46,6 +46,7 @@ from datetime import date, datetime, timedelta
 from dateutil.relativedelta import relativedelta
 from typing import Dict, List, Optional, Tuple, Any
 
+from functions.dispersion.scoring.weight_solver import active_mask_with_grace
 from functions.dispersion.models import (
     SwapConfig,
     BacktestResult,
@@ -375,36 +376,6 @@ def compute_leg_pnl_columns(
 # Dispersion Backtester
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def _build_active_mask(is_valid: np.ndarray, weighted_idx: List[int],
-                       n_rows: int, n_cols: int, grace: int) -> np.ndarray:
-    """
-    Build active mask: a leg is active once it has its first valid data point,
-    and stays active unless consecutive NaN exceeds grace days.
-    Vectorized per-column (one loop over columns, not rows).
-    """
-    active_mask = np.zeros((n_rows, n_cols), dtype=bool)
-    for j in weighted_idx:
-        col_valid = is_valid[:, j]  # bool array length n_rows
-        # Find first valid index — leg not active before this
-        first_valid_indices = np.where(col_valid)[0]
-        if len(first_valid_indices) == 0:
-            continue
-        first_valid = first_valid_indices[0]
-        # From first_valid onward, compute consecutive NaN stretches
-        # A leg is active on day i if:
-        #   - it has valid data on day i, OR
-        #   - it started AND consecutive NaN count <= grace
-        consecutive_nan = 0
-        for i in range(first_valid, n_rows):
-            if col_valid[i]:
-                consecutive_nan = 0
-                active_mask[i, j] = True
-            else:
-                consecutive_nan += 1
-                if consecutive_nan <= grace:
-                    active_mask[i, j] = True
-    return active_mask
-
 class DispersionBacktester:
     """
     Runs basket-level backtests.
@@ -503,15 +474,16 @@ class DispersionBacktester:
             else:
                 actual_active = np.zeros(len(dates), dtype=int)
         else:
-            # ADAPTIVE_REWEIGHT: count legs that are both active AND valid on each row
+            # ADAPTIVE_REWEIGHT: a name counts as active while it holds weight —
+            # including in-grace gap days (its weight stays allocated then).
             grace = self.config.reweight_grace_days
             is_valid = ~np.isnan(pnl_matrix)
-            active_mask = _build_active_mask(is_valid, all_weighted_idx, pnl_matrix.shape[0], pnl_matrix.shape[1], grace)
+            active_mask = active_mask_with_grace(is_valid, grace)
             if valid_mask is not None:
-                usable = active_mask[valid_mask][:, all_weighted_idx] & is_valid[valid_mask][:, all_weighted_idx]
+                active_sub = active_mask[valid_mask][:, all_weighted_idx]
             else:
-                usable = active_mask[:, all_weighted_idx] & is_valid[:, all_weighted_idx]
-            actual_active = usable.sum(axis=1)
+                active_sub = active_mask[:, all_weighted_idx]
+            actual_active = active_sub.sum(axis=1)
         active_series = pd.Series(actual_active, index=dates, name="Active Stocks")
 
         # Build per-leg P&L DataFrame for individual contributions view
@@ -705,10 +677,10 @@ class DispersionBacktester:
         if not all_weighted_idx:
             return np.zeros(n_rows), np.zeros(n_rows), np.zeros(n_rows), np.ones(n_rows, dtype=bool)
 
-        # Build "active" mask using vectorized numpy operations
-        # A leg is "active" once it has produced its first valid data point.
-        # After first valid data: active unless consecutive NaN > grace.
-        active_mask = _build_active_mask(is_valid, all_weighted_idx, n_rows, pnl_matrix.shape[1], grace)
+        # Canonical participation mask (shared with the optimizer): a name is
+        # active from its first valid print, and keeps its weight through gaps
+        # <= grace days (contributing 0 on those days). grace=0 == validity.
+        active_mask = active_mask_with_grace(is_valid, grace)
         # Compute long leg with adaptive reweighting (redistribution, not normalization)
         long_pnl = np.zeros(n_rows)
         short_pnl = np.zeros(n_rows)
@@ -718,34 +690,31 @@ class DispersionBacktester:
         # weight to active legs. Use FILL_ZERO policy to get old nan→0 behavior.
         if long_idx:
             long_pnl_cols = pnl_matrix[:, long_idx]
-            long_valid = ~np.isnan(long_pnl_cols)  # True where data exists
-            # Build active mask with grace days
-            long_active = active_mask[:, long_idx]
-            usable = long_active & long_valid  # [n_rows x n_long]
+            long_active = active_mask[:, long_idx]   # holds weight (incl. in-grace gap days)
             pnl_filled = np.nan_to_num(long_pnl_cols, nan=0.0)
             total_long_weight = long_abs_weights.sum()
-            active_weight_sum = (long_abs_weights[np.newaxis, :] * usable).sum(axis=1)
-            # Scale factor: redistribute missing weight to active legs
+            # Denominator over ACTIVE names: an in-grace name keeps its weight
+            # (and contributes 0 that day); only a name beyond grace — or not
+            # yet started — has its weight redistributed.
+            active_weight_sum = (long_abs_weights[np.newaxis, :] * long_active).sum(axis=1)
             with np.errstate(divide='ignore', invalid='ignore'):
                 scale = np.where(active_weight_sum > 0, total_long_weight / active_weight_sum, 0.0)
             weighted = pnl_filled * long_abs_weights[np.newaxis, :]
-            weighted_masked = weighted * usable
+            weighted_masked = weighted * long_active
             long_pnl = weighted_masked.sum(axis=1) * scale
-            active_count += usable.sum(axis=1)
+            active_count += long_active.sum(axis=1)
         if short_idx:
             short_pnl_cols = pnl_matrix[:, short_idx]
-            short_valid = ~np.isnan(short_pnl_cols)
             short_active = active_mask[:, short_idx]
-            usable_s = short_active & short_valid
             pnl_filled_s = np.nan_to_num(short_pnl_cols, nan=0.0)
             total_short_weight = short_abs_weights.sum()
-            active_weight_sum_s = (short_abs_weights[np.newaxis, :] * usable_s).sum(axis=1)
+            active_weight_sum_s = (short_abs_weights[np.newaxis, :] * short_active).sum(axis=1)
             with np.errstate(divide='ignore', invalid='ignore'):
                 scale_s = np.where(active_weight_sum_s > 0, total_short_weight / active_weight_sum_s, 0.0)
             weighted_s = pnl_filled_s * short_abs_weights[np.newaxis, :]
-            weighted_masked_s = weighted_s * usable_s
+            weighted_masked_s = weighted_s * short_active
             short_pnl = -(weighted_masked_s.sum(axis=1) * scale_s)
-            active_count += usable_s.sum(axis=1)
+            active_count += short_active.sum(axis=1)
         # All rows are kept (scale=0 already produces pnl=0 for fully-inactive days).
         # Return None as valid_mask so downstream uses the full dates_index.
         return long_pnl, short_pnl, active_count, None

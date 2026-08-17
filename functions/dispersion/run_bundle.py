@@ -66,7 +66,12 @@ __all__ = [
     "load_run_bundle",
 ]
 
-BUNDLE_VERSION = 1
+BUNDLE_VERSION = 2
+#: Version history:
+#:   1 — reweight_grace_days was stored but INERT (a no-op knob); replaying a v1
+#:       bundle forces grace=0 to reproduce its true historical behaviour.
+#:   2 — grace is live (ADAPTIVE_REWEIGHT holds a gapped name's weight for
+#:       <= grace days); the stored value is honoured on replay.
 _MATRIX_FILE = "pnl_matrix.parquet"
 _JSON_FILE = "bundle.json"
 
@@ -173,7 +178,7 @@ class RunBundle:
     seed: int
     missing_data_policy: MissingDataPolicy
     adj_divs: bool = False
-    reweight_grace_days: int = 3
+    reweight_grace_days: int = 0
     is_cross_corridor: bool = False
     global_cap: float = 9999999.0
     global_floor: float = -9999999.0
@@ -253,7 +258,7 @@ def save_run_bundle(
     seed: int,
     missing_data_policy: MissingDataPolicy,
     adj_divs: bool = False,
-    reweight_grace_days: int = 3,
+    reweight_grace_days: int = 0,
     is_cross_corridor: bool = False,
     global_cap: float = 9999999.0,
     global_floor: float = -9999999.0,
@@ -344,10 +349,10 @@ def load_run_bundle(path: str) -> RunBundle:
         payload = json.load(f)
 
     version = payload.get("bundle_version")
-    if version != BUNDLE_VERSION:
+    if version not in (1, BUNDLE_VERSION):
         raise ValueError(
             f"load_run_bundle: unsupported bundle_version={version!r} "
-            f"(this engine reads version {BUNDLE_VERSION})"
+            f"(this engine reads versions 1 and {BUNDLE_VERSION})"
         )
 
     df = pd.read_parquet(mat_path)
@@ -366,7 +371,9 @@ def load_run_bundle(path: str) -> RunBundle:
         seed=int(payload["seed"]),
         missing_data_policy=MissingDataPolicy(opt["missing_data_policy"]),
         adj_divs=bool(opt.get("adj_divs", False)),
-        reweight_grace_days=int(opt.get("reweight_grace_days", 3)),
+        # v1 bundles: grace was an inert knob when they were written — force 0
+        # so replay reproduces their true behaviour. v2+: honour the stored value.
+        reweight_grace_days=(int(opt.get("reweight_grace_days", 0)) if version >= 2 else 0),
         is_cross_corridor=bool(opt.get("is_cross_corridor", False)),
         global_cap=float(opt.get("global_cap", 9999999.0)),
         global_floor=float(opt.get("global_floor", -9999999.0)),

@@ -102,6 +102,7 @@ class DispersionConfig:
 
     # ── Data handling (backtest/optimize) ──
     missing_data_policy: MissingDataPolicy = MissingDataPolicy.ADAPTIVE_REWEIGHT
+    reweight_grace_days: int = 0         # ADAPTIVE only: gap days a name keeps its weight (0 = redistribute at once)
     adj_divs: bool = False               # Use total return index
     lookback_years: int = 5              # Default history if no start_date given
 
@@ -148,7 +149,11 @@ class SwapConfig:
     barrier_up: float = 1.30    # Upper corridor: 1.30 = 130% of spot
     adj_divs: bool = False
     missing_data_policy: MissingDataPolicy = MissingDataPolicy.ADAPTIVE_REWEIGHT
-    reweight_grace_days: int = 3
+    #: ADAPTIVE_REWEIGHT only — a name whose data gap lasts <= this many days
+    #: KEEPS its weight (contributing 0 on gap days) instead of having it
+    #: redistributed immediately. 0 (default) = historical behaviour: any gap
+    #: day redistributes at once.
+    reweight_grace_days: int = 0
     lookback_years: int = 5
     start_date: Optional[date] = None       # Backtest start date (optional, overrides lookback)
     end_date: Optional[date] = None         # Backtest end date (optional)

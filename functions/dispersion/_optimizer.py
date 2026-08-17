@@ -204,6 +204,7 @@ from functions.dispersion.scoring import (
 from functions.dispersion.scoring.weight_solver import (
     VegaSpec,
     adaptive_pnl,
+    active_mask_with_grace,
     concave_blend_lambdas,
     concave_blend_value,
     project_to_bounded_simplex,
@@ -312,7 +313,7 @@ class DispersionOptimizer:
         logger: Optional[Callable[[str, str], None]] = None,
         missing_data_policy=None,
         adj_divs: bool = False,
-        reweight_grace_days: int = 3,
+        reweight_grace_days: int = 0,
         is_cross_corridor: bool = False,
         seed: int = 0,
         global_cap: float = 9999999.0,
@@ -380,8 +381,17 @@ class DispersionOptimizer:
         self._ts_mat = np.nan_to_num(self._orig_ts_mat, nan=0.0)
         self._col_pos = dict(column_map)
         self._n_rows = self._ts_mat.shape[0]
-        # Precompute validity mask for adaptive reweight (True where data exists)
+        # Precompute the adaptive participation mask: raw validity, widened by
+        # the reweight grace (a name keeps its weight through gaps <= grace
+        # days). grace=0 returns the validity mask itself — historical
+        # behaviour, bit-identical.
         self._valid_mask = ~np.isnan(self._orig_ts_mat)  # [n_rows x n_cols]
+        if (self.missing_data_policy == MissingDataPolicy.ADAPTIVE_REWEIGHT
+                and self.reweight_grace_days > 0):
+            self._active_mask = active_mask_with_grace(
+                self._valid_mask, self.reweight_grace_days)
+        else:
+            self._active_mask = self._valid_mask
         self._long_only = len(self.short_candidates) == 0
         # Rejection tracking
         self._rejection_reasons = {
@@ -1025,7 +1035,7 @@ class DispersionOptimizer:
                 stock_indices=long_pos,
                 strikes=strikes if _pass_strikes else None,
                 per_stock_bounds=per_stock_bounds,
-                active_mask=self._valid_mask,
+                active_mask=self._active_mask,
                 group_bounds=self._bucket_groups_for(ind.long_indices[:n_long]),
                 vega=self._vega_spec_for(ind.long_indices[:n_long]),
             )
@@ -1158,7 +1168,7 @@ class DispersionOptimizer:
             res = self._weight_solver.solve(
                 pnl_matrix=self._ts_mat, stock_indices=pos,
                 strikes=strikes if _pass_strikes else None,
-                per_stock_bounds=bounds, active_mask=self._valid_mask,
+                per_stock_bounds=bounds, active_mask=self._active_mask,
                 group_bounds=self._bucket_groups_for(indices),
                 vega=self._vega_spec_for(indices),
             )
@@ -1377,13 +1387,13 @@ class DispersionOptimizer:
 
         if use_adaptive:
             # Shared canonical function (operates on nan_to_num'd matrix + valid_mask)
-            L = adaptive_pnl(self._ts_mat, long_pos, long_w, self._valid_mask)
+            L = adaptive_pnl(self._ts_mat, long_pos, long_w, self._active_mask)
 
             # Short leg adaptive (if any)
             if short_pos is not None and len(short_pos) > 0:
                 short_pos = np.asarray(short_pos, dtype=int)
                 short_w = np.asarray(short_w, dtype=np.float64)
-                S = adaptive_pnl(self._ts_mat, short_pos, short_w, self._valid_mask)
+                S = adaptive_pnl(self._ts_mat, short_pos, short_w, self._active_mask)
             else:
                 S = np.zeros(self._n_rows)
 
@@ -1495,7 +1505,7 @@ class DispersionOptimizer:
                 stock_indices=long_pos,
                 strikes=strikes if _pass_strikes else None,
                 per_stock_bounds=per_stock_bounds,
-                active_mask=self._valid_mask,
+                active_mask=self._active_mask,
                 group_bounds=_groups,
                 vega=_vega_sp,
             )
@@ -1637,7 +1647,7 @@ class DispersionOptimizer:
         use_drop = (self.missing_data_policy == MissingDataPolicy.DROP_INCOMPLETE_DAYS)
         if use_adaptive:
             L_mat = self._orig_ts_mat[:, long_pos]
-            L_nan = np.isnan(L_mat)
+            L_nan = ~self._active_mask[:, long_pos]   # inactive = out of the denominator
             L_w_matrix = np.tile(long_w, (self._n_rows, 1))
             L_w_matrix[L_nan] = 0.0
             L_w_sums = L_w_matrix.sum(axis=1, keepdims=True)
@@ -1646,7 +1656,7 @@ class DispersionOptimizer:
             L = (np.nan_to_num(L_mat, nan=0.0) * L_w_matrix).sum(axis=1)
             if len(short_pos) > 0:
                 S_mat = self._orig_ts_mat[:, short_pos]
-                S_nan = np.isnan(S_mat)
+                S_nan = ~self._active_mask[:, short_pos]
                 S_w_matrix = np.tile(short_w, (self._n_rows, 1))
                 S_w_matrix[S_nan] = 0.0
                 S_w_sums = S_w_matrix.sum(axis=1, keepdims=True)
@@ -2219,7 +2229,7 @@ class DispersionOptimizer:
                 resolv = self._weight_solver.solve(
                     pnl_matrix=self._ts_mat,
                     stock_indices=np.array(long_pos_final, dtype=int),
-                    active_mask=self._valid_mask,
+                    active_mask=self._active_mask,
                     tol="fine",
                     group_bounds=self._bucket_groups_for(best.long_indices),
                 )
@@ -2343,7 +2353,7 @@ class DispersionOptimizer:
                     w_star=w_star,
                     pnl_matrix=self._ts_mat,
                     stock_indices=np.array(long_pos_sm, dtype=int),
-                    active_mask=self._valid_mask,
+                    active_mask=self._active_mask,
                     eps_min=self._smooth_eps,
                 )
                 # Log comparison

@@ -84,7 +84,8 @@ def _convert_bt_df_cross(df):
 
 def _run_bt(src_df, is_vol_swap, n_exp, local_cap,
             global_floor, global_cap, ubar, dbar, adj_divs="No",
-            start_date=None, is_cross_corridor=False, missing_data_policy="Adaptive Reweight"):
+            start_date=None, is_cross_corridor=False, missing_data_policy="Adaptive Reweight",
+            reweight_grace_days=0):
     """Run backtest via new API, return (timeseries_df, metadata_dict, figure, None)."""
     # Vol-swap UI uses product-specific labels ('Underlying' / 'Strike (%)') —
     # normalise to the canonical names up front so BOTH the conversion below and
@@ -103,6 +104,7 @@ def _run_bt(src_df, is_vol_swap, n_exp, local_cap,
         adj_divs=(adj_divs == "Yes"),
         missing_data_policy=_parse_policy(missing_data_policy) if isinstance(missing_data_policy,
                                                                              str) else missing_data_policy,
+        reweight_grace_days=int(reweight_grace_days),
         global_cap=global_cap,
         global_floor=global_floor,
     )
@@ -740,12 +742,14 @@ with tab1:
         )
         if missing_data_policy == "Adaptive Reweight":
             reweight_grace_days = st.number_input(
-                "Grace days (reweight)", min_value=0, max_value=30, value=3,
+                "Grace days (reweight)", min_value=0, max_value=30, value=0,
                 key="grace_days_tab1",
-                help="Consecutive missing days before stock excluded from reweighting"
+                help="A name whose data gap lasts \u2264 this many days KEEPS its weight "
+                     "(contributing 0 on gap days) instead of redistributing it at once. "
+                     "0 = historical behaviour (immediate redistribution)."
             )
         else:
-            reweight_grace_days = 3
+            reweight_grace_days = 0
     with col21:
         adj_divs = st.selectbox(
             "Adjust for Dividends",
@@ -1197,6 +1201,7 @@ with tab1:
                             local_cap=st.session_state.get('local_cap', 2.5),
                             is_capped=True,
                             missing_data_policy=_parse_policy(missing_data_policy),
+                            reweight_grace_days=int(reweight_grace_days),
                             adj_divs=(st.session_state.get('adj_divs', 'No') == "Yes"),
                             lookback_years=5,
                             global_cap=st.session_state.get('global_cap', 9999999.0),
@@ -1414,6 +1419,7 @@ with tab1:
                             local_cap=st.session_state.get('local_cap', 2.5),
                             is_capped=True,
                             missing_data_policy=_parse_policy(missing_data_policy),
+                            reweight_grace_days=int(reweight_grace_days),
                             adj_divs=(st.session_state.get('adj_divs', 'No') == "Yes"),
                             lookback_years=5,
                             global_cap=st.session_state.get('global_cap', 9999999.0),
@@ -1467,7 +1473,7 @@ with tab1:
     _last_run = st.session_state.get('gaia_last_run')
     if _last_run is not None and getattr(_last_run, '_smooth_state', None) is not None:
         _ss = _last_run._smooth_state
-        if 'ts_mat' not in _ss or 'valid_mask' not in _ss:
+        if 'ts_mat' not in _ss or 'active_mask' not in _ss:
             st.info("Result from an older version — re-run the optimization to enable smoothing.")
         else:
             st.markdown("---")
@@ -1495,13 +1501,13 @@ with tab1:
                 _col_pos = _ss["col_pos"]
                 _is_xc = _ss["is_cross_corridor"]
                 _ts_mat = _ss["ts_mat"]  # nan_to_num'd (zeros where NaN)
-                _valid_mask = _ss["valid_mask"]  # bool mask for adaptive renorm
+                _active_mask = _ss["active_mask"]  # participation mask (validity ∪ grace)
                 # Build stock_indices exactly as FINAL-RAW does (col_pos maps keys → column indices)
                 _stock_indices = _np.array([_col_pos[k] for k in _basket_keys if k in _col_pos], dtype=int)
                 if len(_stock_indices) == len(_w_star):
                     _ws = _ss["weight_solver"]
                     # ── ASSERTION: verify w_star reproduces FINAL-RAW min ──
-                    _star_pnl = _adaptive_pnl_fn(_ts_mat, _stock_indices, _w_star, _valid_mask)
+                    _star_pnl = _adaptive_pnl_fn(_ts_mat, _stock_indices, _w_star, _active_mask)
                     _star_min = float(_np.min(_star_pnl))
                     _expected_min = getattr(_last_run, '_final_raw_min', None)
                     if _expected_min is not None and abs(_star_min - _expected_min) > 1e-4:
@@ -1536,13 +1542,13 @@ with tab1:
                             w_star=_w_star.copy(),
                             pnl_matrix=_ts_mat,
                             stock_indices=_stock_indices,
-                            active_mask=_valid_mask,
+                            active_mask=_active_mask,
                             eps_min=_ps_eps,
                             per_stock_bounds=_bounds_vec,
                             strikes=_strikes_vec,
                         )
                         # Evaluate both PnL series via shared canonical function
-                        _sm_pnl = _adaptive_pnl_fn(_ts_mat, _stock_indices, _w_smooth, _valid_mask)
+                        _sm_pnl = _adaptive_pnl_fn(_ts_mat, _stock_indices, _w_smooth, _active_mask)
 
                         # Compute stats table rows
                         def _stats_row(pnl, w):
@@ -1692,12 +1698,14 @@ with tab3:
                                            help="Adaptive Reweight: redistribute weights for missing stocks. Fill Zero: original Gaia_PP behavior.")
         if missing_data_policy == "Adaptive Reweight":
             reweight_grace_days = st.number_input(
-                "Grace days (reweight)", min_value=0, max_value=30, value=3,
+                "Grace days (reweight)", min_value=0, max_value=30, value=0,
                 key="grace_days_tab3",
-                help="Number of consecutive missing days before a stock is excluded from reweighting"
+                help="A name whose data gap lasts \u2264 this many days KEEPS its weight "
+                     "(contributing 0 on gap days) instead of redistributing it at once. "
+                     "0 = historical behaviour."
             )
         else:
-            reweight_grace_days = 3
+            reweight_grace_days = 0
     col4, col5, col6, col7 = st.columns(4)
     with col4:
         local_cap = st.number_input("Local Cap", value=2.5, key="local_cap")
@@ -1860,7 +1868,8 @@ with tab3:
                     global_floor, global_cap, ubar, dbar, adj_divs=adj_divs,
                     start_date=bt_start_date,
                     is_cross_corridor=True,
-                    missing_data_policy=missing_data_policy
+                    missing_data_policy=missing_data_policy,
+                    reweight_grace_days=reweight_grace_days
                 )
                 st.session_state['is_cross_corridor'] = True
                 # Store backtest results
@@ -1902,7 +1911,8 @@ with tab3:
                     global_floor, global_cap, ubar, dbar, adj_divs=adj_divs,
                     start_date=bt_start_date,
                     is_cross_corridor=False,
-                    missing_data_policy=missing_data_policy
+                    missing_data_policy=missing_data_policy,
+                    reweight_grace_days=reweight_grace_days
                 )
                 st.session_state['is_cross_corridor'] = False
                 # Store backtest results
