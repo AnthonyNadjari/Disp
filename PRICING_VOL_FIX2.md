@@ -120,23 +120,51 @@ unwrapping, so the non-scenario branch is covered too.)
 
 ## Edit 3 — only if you applied Fix 1: make its getter bump-aware too
 
-In `_get_metric_list_for_instrument` (added by `PRICING_VOL_FIX.md`), replace
-the Format-B body — everything between `if key in raw:` and the Format-A
-fallback — with:
+REPLACE the whole `_get_metric_list_for_instrument` (added by
+`PRICING_VOL_FIX.md`, next to `_extract_vol`) with this complete version.
+Only one line differs from Fix 1: in the Format-B branch, `QueryLocalCcyVol`
+goes through `_unwrap_vol_list(entry)` so bump-wrapped (scenario) responses
+are handled; everything else is byte-identical. Requires Edit 0's helper to
+be defined ABOVE it.
 
 ```python
+        def _get_metric_list_for_instrument(idx, metric_name, results):
+            """Full metric LIST for instrument at global idx (every entry,
+            not just [0]) — QueryLocalCcyVol goes through _unwrap_vol_list
+            so bump-wrapped (scenario) responses are handled too."""
+            running_idx = 0
+            for chunk_start in sorted(results.keys()):
+                chunk_data = results[chunk_start]
+                chunk_size = chunk_data["chunk_size"]
+                if idx < running_idx + chunk_size:
+                    local_idx = idx - running_idx
+                    raw = chunk_data["raw"]
+                    key = "Price" if local_idx == 0 else f"Price_{local_idx}"
+                    # Format B: one "Price_N" key per instrument
                     if key in raw:
                         entry = raw[key]
                         if metric_name == "QueryLocalCcyVol":
-                            return _unwrap_vol_list(entry)
+                            return _unwrap_vol_list(entry)          # ← the change
                         if isinstance(entry, dict):
                             metric_list = entry.get(metric_name, [])
                             if isinstance(metric_list, list) and metric_list:
                                 return metric_list
                         return []
+                    # Format A fallback: single "Price" key, one entry per
+                    # instrument — wrapped so the caller can still match by
+                    # PrimaryAssetRef (None instead of a wrong asset).
+                    if "Price" in raw:
+                        entry = raw["Price"]
+                        if isinstance(entry, dict):
+                            metric_list = entry.get(metric_name, [])
+                            if (isinstance(metric_list, list)
+                                    and local_idx < len(metric_list)
+                                    and isinstance(metric_list[local_idx], dict)):
+                                return [metric_list[local_idx]]
+                    return []
+                running_idx += chunk_size
+            return []
 ```
-
-(Requires Edit 0's helper to be defined before it.)
 
 ---
 
