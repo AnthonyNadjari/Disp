@@ -234,7 +234,6 @@ def _df_to_backtest_inputs(df: pd.DataFrame, is_cross_corridor: bool) -> Tuple[L
             warnings.warn(f"'{var_asset}': 'Weight (%)' is blank/NaN — leg skipped.",
                           stacklevel=2)
             continue
-        side = str(row.get('Side', 'long')).strip().lower()
 
         # Strike: percentage → decimal
         strike_pct = float(row.get('Strike Mono Var Swap (%)', 0))
@@ -254,8 +253,15 @@ def _df_to_backtest_inputs(df: pd.DataFrame, is_cross_corridor: bool) -> Tuple[L
                 raise ValueError(f"Cross-corridor backtest requires 'Strike Cross Corridor (%)' for '{var_asset}'.")
             cross_strike = cross_strike_pct / 100.0
 
-        # Weight: percentage → decimal, signed by side
-        signed_weight = weight_pct / 100.0 if side == 'long' else -(weight_pct / 100.0)
+        # Weight: percentage → decimal. With a Side column, the sign is
+        # side × abs(weight) (robust to already-signed inputs); without it,
+        # the weight's own sign decides (+ = long, − = short).
+        side_raw = row.get('Side', None)
+        if side_raw is None or (isinstance(side_raw, float) and pd.isna(side_raw)):
+            signed_weight = weight_pct / 100.0
+        else:
+            side = str(side_raw).strip().lower()
+            signed_weight = abs(weight_pct) / 100.0 * (1.0 if side == 'long' else -1.0)
 
         # For cross-corridor, weights must be keyed by Corridor Condition Asset
         # to match pnl_column_keys and avoid zero-weight P&L when Variance Asset is shared
@@ -1579,7 +1585,9 @@ def backtest(
     Parameters
     ----------
     df : DataFrame
-        Columns: Variance Asset, Weight (%), Strike Mono Var Swap (%), Side
+        Columns: Variance Asset, Weight (%), Strike Mono Var Swap (%)
+        Optional: Side (long/short). Without Side, the sign of Weight (%) decides
+        (+ = long, − = short).
         If cross_corridor: also Corridor Condition Asset, Strike Cross Corridor (%)
     config : DispersionConfig
     start_date : date, optional
@@ -1591,7 +1599,9 @@ def backtest(
         .timeseries, .hit_ratio, .mean_return, .last_value, .max_drawdown
     """
     df = _normalize_df_columns(df)
-    required = ['Variance Asset', 'Weight (%)', 'Strike Mono Var Swap (%)', 'Side']
+    # 'Side' is optional: when absent, the SIGN of 'Weight (%)' decides
+    # (+ = long, − = short). When present, Side sets the sign as before.
+    required = ['Variance Asset', 'Weight (%)', 'Strike Mono Var Swap (%)']
     if config.cross_corridor:
         required.append('Strike Cross Corridor (%)')
         required.append('Corridor Condition Asset')
