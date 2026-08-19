@@ -185,6 +185,8 @@ def _fetch_sector_data(tickers_key: str, tickers: list):
 def _warmup_numba():
     """Trigger numba JIT compilation on app load (runs once per session)."""
     try:
+        from functions.dispersion._backtester import (
+            _vol_swap_window, _corridor_varswap_window)
         dummy = np.array([100.0, 101.0, 100.5, 102.0, 101.5])
         _vol_swap_window(dummy, 0.2, 4, 2.5)
         _corridor_varswap_window(dummy, dummy, 0.2, 1.3, 0.7, 4, 2.5)
