@@ -179,6 +179,23 @@ def _fetch_sector_data(tickers_key: str, tickers: list):
     return df
 
 
+def _frames_to_xlsx_bytes(frames: dict) -> bytes:
+    """Serialize {name: DataFrame} to ONE multi-sheet xlsx workbook (zip-free
+    alternative for machines that can't handle zip archives)."""
+    buf = io.BytesIO()
+    seen = set()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+        for name, df in frames.items():
+            sheet = str(name)[:31] or "sheet"
+            base, k = sheet, 1
+            while sheet in seen:  # sheet names must be unique
+                k += 1
+                sheet = f"{base[:28]}_{k}"
+            seen.add(sheet)
+            df.to_excel(writer, sheet_name=sheet, index=True)
+    return buf.getvalue()
+
+
 def _df_from_paste(text: str, cols) -> pd.DataFrame:
     """Parse pasted tab/comma-separated basket data into a DataFrame.
 
@@ -308,9 +325,25 @@ def _render_optimization_result(result, is_cross, debug_info=None):
             "candidates (a mismatch warning is shown above the run).")
         if result.vega_basket:
             with st.expander("⚡ Vega allocation (absolute)", expanded=False):
-                st.dataframe(pd.DataFrame(
+                _va_df = pd.DataFrame(
                     [{"Stock": t, "Vega": v, "Weight %": v / result.total_vega * 100}
-                     for t, v in result.vega_basket]), use_container_width=True)
+                     for t, v in result.vega_basket])
+                # Highlight names that carry an axe target (recycling inventory)
+                _inv = st.session_state.get('_vega_inv_df')
+                _inv_names = (set(str(n).strip().casefold() for n in _inv['Name'])
+                              if _inv is not None and not _inv.empty and 'Name' in _inv.columns
+                              else set())
+
+                def _hl_axe(row):
+                    return (['background-color: #fff3cd'] * len(row)
+                            if str(row['Stock']).strip().casefold() in _inv_names
+                            else [''] * len(row))
+
+                st.dataframe(
+                    _va_df.style.apply(_hl_axe, axis=1) if _inv_names else _va_df,
+                    use_container_width=True)
+                if _inv_names:
+                    st.caption("Highlighted = in the axe-target (recycling) list.")
     # 🧪 Bootstrap robustness diagnostic (only present when requested)
     _rb = getattr(result, 'robustness', None)
     if _rb:
@@ -326,31 +359,20 @@ def _render_optimization_result(result, is_cross, debug_info=None):
                     {"Metric": m, "2.5%": c["lo"], "Mean": c["mean"], "97.5%": c["hi"]}
                     for m, c in _rb['winner_raw_ci'].items()
                 ]), use_container_width=True)
-    # ⬇️ Clean export — same to_frames()/zip as BacktestResult.export(".zip")
+    # ⬇️ Clean export — single multi-sheet Excel (zip-free)
     if result.backtest is not None and getattr(result.backtest, "timeseries", None) is not None \
             and len(result.backtest.timeseries) > 0:
-        from functions.dispersion.models import frames_to_zip_bytes
-        # Memoize the zip per result object — rebuilding it on every rerun
-        # (any widget interaction) is pure waste.
-        _zip_key = f"_zip_bytes_opt_{id(result)}"
-        if _zip_key not in st.session_state:
-            st.session_state[_zip_key] = frames_to_zip_bytes(result.backtest.to_frames())
+        # Memoize the workbook per result object — rebuilding it on every
+        # rerun (any widget interaction) is pure waste.
+        _xls_key = f"_xls_bytes_opt_{id(result)}"
+        if _xls_key not in st.session_state:
+            st.session_state[_xls_key] = _frames_to_xlsx_bytes(result.backtest.to_frames())
         st.download_button(
-            "⬇️ Download backtest data (zip of CSVs)",
-            data=st.session_state[_zip_key],
-            file_name="optimizer_backtest_data.zip", mime="application/zip",
-            key="dl_opt_bt_zip")
-    # Scoring signature — reproducibility fingerprint of the run
-    if getattr(result, 'scoring_signature', None):
-        with st.expander("🧾 Scoring signature (debug)", expanded=False):
-            st.markdown(
-                f"- **Signature:** `{result.scoring_signature}`\n"
-                f"- **Seed:** `{result.seed}`\n"
-                f"- **Reference sample size:** `{result.reference_size}` baskets\n"
-                f"- **Scoring mode:** `{result.scoring_mode}`")
-            st.caption(
-                "Same signature = same objective (active metrics + weights), same seed "
-                "and same reference geometry — scores are directly comparable.")
+            "⬇️ Download backtest data (Excel)",
+            data=st.session_state[_xls_key],
+            file_name="optimizer_backtest_data.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_opt_bt_xlsx")
     # Show backtest if available
     if result.backtest and result.backtest.timeseries is not None and not result.backtest.timeseries.empty:
         with st.expander("📈 Backtest", expanded=True):
@@ -388,54 +410,6 @@ def _render_optimization_result(result, is_cross, debug_info=None):
                     f"Min: {_valid.min():.4f} | Max: {_valid.max():.4f} | Last: {_valid.iloc[-1]:.4f} | "
                     f"Obs: {len(_valid)} | Flat: {int((_valid == 0).sum())} | Hit: {_hit:.4f} | {_ac_info}"
                 )
-        # ── Runtime Validation: prove optimizer backtest matches standalone path ──
-        with st.expander("🔬 Backtest Input/Output Validation", expanded=False):
-            # A) Displayed portfolio table
-            st.markdown("**A) Displayed Portfolio Table**")
-            _a_rows = len(result.long_basket) + len(result.short_basket)
-            _a_wsum = sum(abs(w) for _, w in result.long_basket) + sum(abs(w) for _, w in result.short_basket)
-            st.markdown(f"- Rows: **{_a_rows}** | Weight sum: **{_a_wsum * 100:.2f}%**")
-            if is_cross and result.long_cross_corridor:
-                _var_assets = set(t for t, _, _ in result.long_cross_corridor)
-                _corr_assets = set(idx for _, idx, _ in result.long_cross_corridor)
-                st.markdown(
-                    f"- Variance Assets: `{_var_assets}` | Corridor Condition Assets: **{len(_corr_assets)}** unique")
-            # B) What was passed to backtest (run_from_optimization uses same long_basket/short_basket)
-            st.markdown("**B) Backtest Input (run_from_optimization)**")
-            _bt_keys_long = [k for k, _ in result.long_basket]
-            _bt_keys_short = [k for k, _ in result.short_basket]
-            _bt_weights = {k: w for k, w in result.long_basket}
-            _bt_weights.update({k: -w for k, w in result.short_basket})
-            st.markdown(
-                f"- Long keys ({len(_bt_keys_long)}): `{_bt_keys_long[:10]}{'...' if len(_bt_keys_long) > 10 else ''}`")
-            st.markdown(
-                f"- Short keys ({len(_bt_keys_short)}): `{_bt_keys_short[:5]}{'...' if len(_bt_keys_short) > 5 else ''}`")
-            st.markdown(
-                f"- Weights dict entries: **{len(_bt_weights)}** | sum(abs): **{sum(abs(v) for v in _bt_weights.values()) * 100:.2f}%**")
-            # Confirm display table matches backtest input
-            _bt_df_keys = set(bt_df[
-                                  'Corridor Condition Asset'].values) if is_cross and 'Corridor Condition Asset' in bt_df.columns else set(
-                bt_df['Variance Asset'].values) if 'Variance Asset' in bt_df.columns else set()
-            _bt_input_keys = set(_bt_keys_long + _bt_keys_short)
-            _keys_match = _bt_df_keys == _bt_input_keys
-            st.markdown(f"- Display table keys == Backtest input keys: **{'✅ YES' if _keys_match else '❌ NO'}**")
-            if not _keys_match:
-                st.warning(
-                    f"Mismatch! Display: {_bt_df_keys - _bt_input_keys} | Backtest: {_bt_input_keys - _bt_df_keys}")
-            # C) Backtest output
-            st.markdown("**C) Backtest Result**")
-            _ts = result.backtest.timeseries
-            _ac = result.backtest.active_legs_count
-            st.markdown(f"- timeseries.shape: **{_ts.shape}** | columns: `{list(_ts.columns)}`")
-            st.markdown(f"- index: {_ts.index.min().strftime('%Y-%m-%d')} → {_ts.index.max().strftime('%Y-%m-%d')}")
-            _r = _ts['Result']
-            st.markdown(f"- Result: min={_r.min():.4f} | max={_r.max():.4f} | last={_r.iloc[-1]:.4f}")
-            st.markdown(f"- First 5: `{[f'{v:.4f}' for v in _r.iloc[:5].values]}`")
-            st.markdown(f"- Last 5: `{[f'{v:.4f}' for v in _r.iloc[-5:].values]}`")
-            if _ac is not None and len(_ac) > 0:
-                st.markdown(
-                    f"- active_legs_count: min={int(_ac.min())} | max={int(_ac.max())} | last={int(_ac.iloc[-1])}")
-            st.markdown(f"- Chart function: `func_graph.plot_main_backtest` ✅ (same as standalone)")
 
 def streamlit_log_callback(log_entry):
     """Handle logs from optimization functions"""
@@ -1111,6 +1085,11 @@ with tab1:
             help="Remove long stocks with 0% hit ratio and short stocks with 100% hit ratio before optimization. Only applies if remaining candidates >= min stocks.",
             key="filter_zero_hr"
         )
+        st.caption(
+            "**Precedence:** excluded names are always removed → 0%-HR filter → forced "
+            "names are restored (**forced beats the filter**). ⚠️ Axe-target names are "
+            "**not** protected: a 0%-HR name in your recycling list is dropped unless "
+            "you also put it in Forced names.")
         with st.expander("🔬 Advanced · certification & diagnostics"):
             robustness_check = st.checkbox(
                 "🧪 Robustness check (bootstrap)", value=False,
@@ -1901,16 +1880,16 @@ with tab3:
         if _unweighted is not None and isinstance(_unweighted, pd.DataFrame) and not _unweighted.empty:
             _bt_dl = st.session_state.get('bt_result_obj')
             if _bt_dl is not None:
-                from functions.dispersion.models import frames_to_zip_bytes
                 # Memoize per backtest-result object (rebuilt only on a new backtest)
-                _zip_key = f"_zip_bytes_bt_{id(_bt_dl)}"
-                if _zip_key not in st.session_state:
-                    st.session_state[_zip_key] = frames_to_zip_bytes(_bt_dl.to_frames())
+                _xls_key = f"_xls_bytes_bt_{id(_bt_dl)}"
+                if _xls_key not in st.session_state:
+                    st.session_state[_xls_key] = _frames_to_xlsx_bytes(_bt_dl.to_frames())
                 st.download_button(
-                    "⬇️ Download backtest data (zip of CSVs)",
-                    data=st.session_state[_zip_key],
-                    file_name="backtest_data.zip", mime="application/zip",
-                    key="dl_bt_zip")
+                    "⬇️ Download backtest data (Excel)",
+                    data=st.session_state[_xls_key],
+                    file_name="backtest_data.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_bt_xlsx")
             with st.expander("📈 Per-Stock Time Series (Raw Data)"):
                 if is_cross_corridor:
                     # Cross corridor: show stock leg and index leg separately
