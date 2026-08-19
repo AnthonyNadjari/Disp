@@ -1141,6 +1141,7 @@ with tab1:
             bisect_in_ga = st.checkbox("🎯 Exact solver in GA (slow, certification runs)", value=False)
             st.session_state['_bisect_in_ga'] = bisect_in_ga
             enable_profiling = st.checkbox("📊 Enable Performance Profiling", value=False, key="enable_profiling")
+        st.caption("♻️ Re-runs are fast: tweaked weights/GA settings reuse the loaded data and calibration — only the search itself re-runs. Changing universe, dates, policy or basket-size bounds reloads.")
         if st.button("🚀 Run Genetic Algorithm Optimization", type="primary", use_container_width=True):
             is_long_only = st.session_state.get('is_long_only', False)
             if max_strike <= 0:
@@ -1371,138 +1372,6 @@ with tab1:
                     except Exception as e:
                         st.error(f"Optimization failed: {str(e)}")
                         st.exception(e)
-        # ═══ 🧪 MULTI-CONFIG COMPARISON (one data load, N weight configs) ═══
-        with st.expander("🧪 Compare several weight configs (one data load)"):
-            st.caption(
-                "One **row per configuration**, one column per metric (blank/0 = "
-                "inactive; weights are normalized automatically). Data is loaded "
-                "once and the calibration is shared — each row still reproduces "
-                "exactly what a single run with those weights would return.")
-            _mc_metric_cols = ['last_carry', 'mean_payoff', 'hit_ratio', 'min_payoff',
-                               'max_drawdown', 'cvar_5', 'sharpe_payoff', 'weighted_strike']
-            if st.session_state.get('_vega_toggle', False):
-                _mc_metric_cols = _mc_metric_cols + ['axe_book_cleaned', 'axe_package_recycled']
-            _mc_all_cols = ['Config'] + _mc_metric_cols
-            if '_mc_table' not in st.session_state:
-                st.session_state['_mc_table'] = pd.DataFrame([
-                    {'Config': 'balanced', 'last_carry': 0.3, 'mean_payoff': 0.3,
-                     'hit_ratio': 0.3, 'min_payoff': 0.1},
-                    {'Config': 'defensive', 'min_payoff': 1.0},
-                ])
-            _mc_show = st.session_state['_mc_table'].reindex(columns=_mc_all_cols)
-            _mc_show[_mc_metric_cols] = _mc_show[_mc_metric_cols].fillna(0.0)
-            _mc_show['Config'] = _mc_show['Config'].fillna('')
-            _mc_table = st.data_editor(
-                _mc_show, num_rows="dynamic", use_container_width=True,
-                key="_mc_editor")
-            st.session_state['_mc_table'] = _mc_table
-            _mc_c1, _mc_c2 = st.columns([1, 1])
-            if _mc_c1.button("(+) Add current weights as a row", key="_mc_add_current",
-                             help="Appends the single-run weights configured above."):
-                _new = {'Config': f"run {len(_mc_table) + 1}"}
-                _new.update({k: float(score_weights.get(k, 0.0)) for k in _mc_metric_cols})
-                st.session_state['_mc_table'] = pd.concat(
-                    [_mc_table, pd.DataFrame([_new])], ignore_index=True)
-                st.rerun()
-            if _mc_c2.button("Run comparison", key="_mc_run_btn", type="primary"):
-                def _parse_ticker_list_mc(raw_text):
-                    out = []
-                    for chunk in (raw_text or "").replace(',', '\n').splitlines():
-                        t = chunk.strip()
-                        if t:
-                            out.append(t)
-                    return out or None
-
-                def _parse_multi_configs(table, metric_cols):
-                    out, labels = [], []
-                    for _, r in table.iterrows():
-                        cfg_d = {}
-                        for m in metric_cols:
-                            try:
-                                v = float(r.get(m) or 0.0)
-                            except (TypeError, ValueError):
-                                v = 0.0
-                            if v > 0:
-                                cfg_d[m] = v
-                        if cfg_d:
-                            out.append(cfg_d)
-                            labels.append(str(r.get('Config') or f"config {len(out)}"))
-                    return out, labels
-                try:
-                    _mc_configs, _mc_labels = _parse_multi_configs(_mc_table, _mc_metric_cols)
-                    st.session_state['_mc_labels'] = _mc_labels
-                    if not _mc_configs:
-                        st.warning("No configs to run.")
-                    else:
-                        from functions.dispersion._api import optimize_multi
-                        # Mirror of the single-run cfg/constraints construction
-                        _is_xc_mc = st.session_state.get('is_cross_corridor', False)
-                        if _is_xc_mc:
-                            _mc_long = st.session_state.get('long_df_cross', pd.DataFrame())
-                            _mc_short = st.session_state.get('short_df_cross', pd.DataFrame())
-                        else:
-                            _mc_long = st.session_state.get('long_df', pd.DataFrame()).copy()
-                            _mc_short = st.session_state.get('short_df', pd.DataFrame()).copy()
-                            if st.session_state.get('is_vol_swap', False):
-                                _vs_rn = {'Underlying': 'Variance Asset',
-                                          'Strike (%)': 'Strike Mono Var Swap (%)'}
-                                if 'Underlying' in _mc_long.columns:
-                                    _mc_long.rename(columns=_vs_rn, inplace=True)
-                                if 'Underlying' in _mc_short.columns:
-                                    _mc_short.rename(columns=_vs_rn, inplace=True)
-                        _mc_cfg = DispersionConfig(
-                            product_type=ProductType.VOL_SWAP if st.session_state.get('is_vol_swap', False)
-                            else ProductType.VAR_SWAP_CORRIDOR,
-                            cross_corridor=_is_xc_mc,
-                            n_exp=st.session_state.get('n_exp', 252),
-                            barrier_up=st.session_state.get('ubar', 1.30),
-                            barrier_down=st.session_state.get('dbar', 0.70),
-                            local_cap=st.session_state.get('local_cap', 2.5),
-                            is_capped=True,
-                            missing_data_policy=_parse_policy(missing_data_policy),
-                            reweight_grace_days=int(reweight_grace_days),
-                            adj_divs=(st.session_state.get('adj_divs', 'No') == "Yes"),
-                            lookback_years=5,
-                            global_cap=st.session_state.get('global_cap', 9999999.0),
-                            global_floor=st.session_state.get('global_floor', -9999999.0),
-                        )
-                        _mc_cons = OptimizationConstraints(
-                            min_stocks_long=min_stocks_long,
-                            max_stocks_long=max_stocks_long,
-                            min_stocks_short=0 if st.session_state.get('is_long_only', False) else min_stocks_short,
-                            max_stocks_short=0 if st.session_state.get('is_long_only', False) else max_stocks_short,
-                            max_net_strike=max_strike / 100.0,
-                            time_limit_seconds=float(time_limit),
-                        )
-                        # Attach group tags (Sector) + per-name Vega inventory from the dedicated widgets
-                        _mc_long, _mc_warns = _inject_axes_groups(_mc_long, _is_xc_mc)
-                        for _w in _mc_warns:
-                            st.warning(_w)
-                        with st.spinner(f"Running {len(_mc_configs)} configs on one data load..."):
-                            _mc = optimize_multi(
-                                _mc_long, _mc_cfg, _mc_cons,
-                                configs=_mc_configs,
-                                short_df=_mc_short if len(_mc_short) > 0 else None,
-                                start_date=st.session_state.get('_opt_start_date_value'),
-                                filter_zero_hr=filter_zero_hr,
-                                seed=int(seed),
-                                forced_tickers=_parse_ticker_list_mc(forced_tickers_raw),
-                                bucket_constraints=_build_group_constraints(),
-                                cache_prep=True,
-                            )
-                        st.session_state['_mc_result'] = _mc
-                except Exception as _mc_e:
-                    st.error(f"Multi-config run failed: {_mc_e}")
-                    st.exception(_mc_e)
-            _mc_prev = st.session_state.get('_mc_result')
-            if _mc_prev is not None:
-                _mc_cmp = _mc_prev.comparison.copy()
-                _lbls = st.session_state.get('_mc_labels')
-                if _lbls and len(_lbls) == len(_mc_cmp):
-                    _mc_cmp.insert(0, 'Config', _lbls)
-                st.dataframe(_mc_cmp, use_container_width=True, hide_index=True)
-                st.caption("pct_<metric> = percentile of the winner's raw value in that "
-                           "run's reference distribution (higher = better).")
     # ═══════════════════════════════════════════════════════════════════
     # PERSISTENT RESULT DISPLAY (survives slider reruns)
     # ═══════════════════════════════════════════════════════════════════
