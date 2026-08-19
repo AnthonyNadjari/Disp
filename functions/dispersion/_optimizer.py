@@ -305,8 +305,8 @@ class DispersionOptimizer:
     """
     def __init__(
         self,
-        long_candidates: List[Stock],
-        short_candidates: List[Stock],
+        long_candidates: List[DispersionLeg],
+        short_candidates: List[DispersionLeg],
         pnl_matrix: np.ndarray,
         column_map: Dict[str, int],
         constraints: Optional[OptimizationConstraints] = None,
@@ -2252,8 +2252,8 @@ class DispersionOptimizer:
     def _to_result(self, best: _Individual, gens: int) -> OptimizationResult:
         """Convert best individual to OptimizationResult.
         
-        CRITICAL: For cross-corridor, Stock.variance_asset is shared (e.g. 'SPX Index') across
-        all candidates. Must use _candidate_key (= Stock.corridor_condition_asset) as the unique basket key
+        CRITICAL: For cross-corridor, DispersionLeg.variance_asset is shared (e.g. 'SPX Index') across
+        all candidates. Must use _candidate_key (= DispersionLeg.corridor_condition_asset) as the unique basket key
         to avoid dict collapse.
         
         ORDER: Safety-net runs FIRST (may update best.long_weights/fitness),
