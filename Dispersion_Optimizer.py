@@ -210,10 +210,13 @@ def _df_from_paste(text: str, cols) -> pd.DataFrame:
         return pd.DataFrame({col: [values[i] if i < len(values) else '']
                              for i, col in enumerate(cols)})
     df = pd.read_csv(io.StringIO(text), sep='\t' if '\t' in text else ',', header=None)
-    first_cell = str(df.iloc[0, 0]).strip().lower()
-    header_candidates = ['tickers', 'variance asset', 'underlying', 'index', 'strike',
-                         'min weight', 'max weight', 'weight', 'ric']
-    if any(c in first_cell for c in header_candidates):
+    # Header row: first cell IS a column name (exact match, case-insensitive)
+    # or a generic label. Substring matching is NOT safe — a real ticker like
+    # "SPX Index" contains "index" and must never be dropped as a header.
+    first_cell = str(df.iloc[0, 0]).strip().casefold()
+    _col_names = {str(c).strip().casefold() for c in cols}
+    _generic_labels = {'tickers', 'ticker', 'name', 'names', 'ric', 'rics'}
+    if first_cell in _col_names or first_cell in _generic_labels:
         df = df.iloc[1:].reset_index(drop=True)
         st.toast("⚠️ Header row detected and skipped", icon="ℹ️")
     new_data = pd.DataFrame()
