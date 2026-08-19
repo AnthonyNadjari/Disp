@@ -46,7 +46,8 @@ from datetime import date, datetime, timedelta
 from dateutil.relativedelta import relativedelta
 from typing import Dict, List, Optional, Tuple, Any
 
-from functions.dispersion.scoring.weight_solver import active_mask_with_grace
+from functions.dispersion.scoring.weight_solver import (
+    active_mask_with_grace, carry_pnl_within_grace)
 from functions.dispersion.models import (
     SwapConfig,
     BacktestResult,
@@ -680,9 +681,13 @@ class DispersionBacktester:
         if not all_weighted_idx:
             return np.zeros(n_rows), np.zeros(n_rows), np.zeros(n_rows), np.ones(n_rows, dtype=bool)
 
+        # In-grace gap days carry the name's last mark: its rolling window is
+        # unchanged while it doesn't print, so the carried value is exact.
+        # grace=0 returns the matrix untouched (historical behaviour).
+        pnl_matrix = carry_pnl_within_grace(pnl_matrix, is_valid, grace)
         # Canonical participation mask (shared with the optimizer): a name is
         # active from its first valid print, and keeps its weight through gaps
-        # <= grace days (contributing 0 on those days). grace=0 == validity.
+        # <= grace days (carrying its last mark on those days). grace=0 == validity.
         active_mask = active_mask_with_grace(is_valid, grace)
         # Compute long leg with adaptive reweighting (redistribution, not normalization)
         long_pnl = np.zeros(n_rows)
@@ -697,8 +702,8 @@ class DispersionBacktester:
             pnl_filled = np.nan_to_num(long_pnl_cols, nan=0.0)
             total_long_weight = long_abs_weights.sum()
             # Denominator over ACTIVE names: an in-grace name keeps its weight
-            # (and contributes 0 that day); only a name beyond grace — or not
-            # yet started — has its weight redistributed.
+            # (and contributes its carried mark); only a name beyond grace —
+            # or not yet started — has its weight redistributed.
             active_weight_sum = (long_abs_weights[np.newaxis, :] * long_active).sum(axis=1)
             with np.errstate(divide='ignore', invalid='ignore'):
                 scale = np.where(active_weight_sum > 0, total_long_weight / active_weight_sum, 0.0)

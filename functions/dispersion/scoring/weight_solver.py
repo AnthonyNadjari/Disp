@@ -47,8 +47,9 @@ def active_mask_with_grace(is_valid: np.ndarray, grace: int) -> np.ndarray:
 
     A name is ACTIVE on day t once it has printed its first valid observation,
     and stays active through a data gap of <= ``grace`` consecutive days — an
-    in-grace day keeps the name's weight allocated (it contributes 0 P&L via
-    the nan_to_num'd matrix) instead of redistributing it immediately.
+    in-grace day keeps the name's weight allocated and contributes its last
+    valid payoff (see ``carry_pnl_within_grace``) instead of being
+    redistributed immediately.
 
     grace <= 0 returns ``is_valid`` itself: exactly the historical behaviour
     (every gap day redistributes at once), bit-identical by construction.
@@ -72,6 +73,33 @@ def active_mask_with_grace(is_valid: np.ndarray, grace: int) -> np.ndarray:
     return started & ((pos - last_valid) <= grace)
 
 
+def carry_pnl_within_grace(pnl_matrix: np.ndarray, is_valid: np.ndarray,
+                           grace: int) -> np.ndarray:
+    """Fill in-grace gap days with the name's LAST VALID payoff.
+
+    A rolling swap's window does not move on a day its name does not print
+    (exchange holiday), so the carried mark is the exact payoff for that
+    day — not an approximation. Cells beyond the grace horizon (gap > grace
+    days) and cells before a name's first print stay NaN; the mask from
+    ``active_mask_with_grace`` redistributes those weights instead.
+
+    grace <= 0 returns the matrix unchanged: bit-identical historical
+    behaviour (every gap day redistributes at once). Both engines apply this
+    at the same point they build the participation mask, from the RAW
+    validity — never re-carry an already-carried matrix.
+    """
+    if grace <= 0:
+        return pnl_matrix
+    T = pnl_matrix.shape[0]
+    pos = np.arange(T)[:, np.newaxis]
+    last_valid = np.maximum.accumulate(np.where(is_valid, pos, -1), axis=0)
+    in_grace = (last_valid >= 0) & ((pos - last_valid) <= grace) & ~is_valid
+    carried = np.take_along_axis(pnl_matrix, np.clip(last_valid, 0, None), axis=0)
+    out = pnl_matrix.copy()
+    out[in_grace] = carried[in_grace]
+    return out
+
+
 def adaptive_pnl(pnl_matrix: np.ndarray, stock_indices: np.ndarray, w: np.ndarray,
                  active_mask: np.ndarray = None) -> np.ndarray:
     """Compute adaptive-renormalized net PnL for a long-only weight vector.
@@ -89,7 +117,9 @@ def adaptive_pnl(pnl_matrix: np.ndarray, stock_indices: np.ndarray, w: np.ndarra
     active_mask : (T, C) bool array — participation mask: the plain validity
                   mask, or `active_mask_with_grace(...)` when a reweight grace
                   is set (an active-but-gap day keeps its weight in the
-                  denominator while the nan_to_num'd matrix contributes 0).
+                  denominator; feed a matrix pre-filled by
+                  ``carry_pnl_within_grace`` so an in-grace day contributes
+                  the name's last mark).
                   If None, plain matmul (no adaptive renorm).
 
     Returns

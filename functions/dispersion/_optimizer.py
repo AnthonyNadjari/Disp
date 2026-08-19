@@ -205,6 +205,7 @@ from functions.dispersion.scoring.weight_solver import (
     VegaSpec,
     adaptive_pnl,
     active_mask_with_grace,
+    carry_pnl_within_grace,
     concave_blend_lambdas,
     concave_blend_value,
     project_to_bounded_simplex,
@@ -407,6 +408,13 @@ class DispersionOptimizer:
             # this window only — pre-window history is not visible here.
             self._active_mask = active_mask_with_grace(
                 self._valid_mask, self.reweight_grace_days)
+            # In-grace gap cells carry the name's last mark so the adaptive
+            # numerator matches the backtester. (External masks come with a
+            # matrix already carried on FULL history by _api's prep — never
+            # re-carry a carried matrix.)
+            self._ts_mat = np.nan_to_num(carry_pnl_within_grace(
+                self._orig_ts_mat, self._valid_mask,
+                self.reweight_grace_days), nan=0.0)
         else:
             self._active_mask = self._valid_mask
         self._long_only = len(self.short_candidates) == 0

@@ -59,9 +59,10 @@ class MissingDataPolicy(Enum):
     ADAPTIVE_REWEIGHT ("reweight")  — default
         Redistribute a gapped name's weight to the active names, day by day
         (constant-vega exposure). With ``reweight_grace_days`` > 0, a gap of
-        <= grace days keeps the name's weight allocated (contributing 0) —
-        the basket runs under-invested for those days instead of being
-        recomposed. Tracks the active-name count.
+        <= grace days keeps the name's weight allocated and carries its last
+        payoff (the rolling window does not move while a name does not
+        print, so the carried mark is exact) — the basket is recomposed only
+        when a gap exceeds the grace. Tracks the active-name count.
 
     FILL_ZERO ("fill_zero")
         Legacy Gaia_PP: a gap day contributes 0 for that name — the basket is
@@ -122,7 +123,7 @@ class DispersionConfig:
 
     # ── Data handling (backtest/optimize) ──
     missing_data_policy: MissingDataPolicy = MissingDataPolicy.ADAPTIVE_REWEIGHT
-    reweight_grace_days: int = 0         # ADAPTIVE only: gap days a name keeps its weight (0 = redistribute at once)
+    reweight_grace_days: int = 0         # ADAPTIVE only: gap days a name keeps weight + last mark (0 = redistribute at once)
     adj_divs: bool = False               # Use total return index
     lookback_years: int = 5              # Default history if no start_date given
 

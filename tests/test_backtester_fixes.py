@@ -179,9 +179,10 @@ def test_active_mask_with_grace_semantics():
 
 
 def test_grace_holds_weight_backtester_and_optimizer_agree():
-    """A 2-day gap with grace=3: the gapped name KEEPS its weight (basket
-    under-invested those days) instead of redistributing. Backtester policy
-    and optimizer adaptive P&L must produce the SAME curve."""
+    """A 2-day gap with grace=3: the gapped name KEEPS its weight and carries
+    its LAST MARK (its rolling window is unchanged while it doesn't print),
+    so the curve is continuous through the gap. Backtester policy and
+    optimizer adaptive P&L must produce the SAME curve."""
     from functions.dispersion._optimizer import DispersionOptimizer
     from functions.dispersion.scoring import MetricWeights
     from functions.dispersion.models import OptimizationConstraints
@@ -195,9 +196,10 @@ def test_grace_holds_weight_backtester_and_optimizer_agree():
                           min_weight=0.05, max_weight=0.95) for t in names]
     w = {"A": 0.5, "B": 0.5}
 
-    for grace, gap_expect in [(0, 1.0), (3, 0.5)]:
+    for grace, gap_expect in [(0, 1.0), (3, 0.75)]:
         # grace=0: B's weight redistributes to A on gap days → net = 1.0
-        # grace=3: B keeps its slot, contributes 0 → net = 0.5·1 + 0.5·0 = 0.5
+        # grace=3: B keeps its slot and carries its last mark 0.5
+        #          → net = 0.5·1 + 0.5·0.5 = 0.75 (== the normal day)
         cfg = _to_swap_config(DispersionConfig(
             n_exp=20, missing_data_policy=MissingDataPolicy.ADAPTIVE_REWEIGHT,
             reweight_grace_days=grace))
@@ -221,6 +223,63 @@ def test_grace_holds_weight_backtester_and_optimizer_agree():
         net_opt = opt._adaptive_net_pnl([0, 1], np.array([0.5, 0.5]))
         assert np.allclose(net_opt, net_bt), (
             f"grace={grace}: optimizer and backtester adaptive curves diverge")
+
+
+def test_carry_pnl_within_grace_pattern():
+    from functions.dispersion.scoring.weight_solver import carry_pnl_within_grace
+
+    pnl = np.array([[np.nan], [2.0], [np.nan], [np.nan], [5.0],
+                    [np.nan], [np.nan], [np.nan]])
+    v = ~np.isnan(pnl)
+    c = carry_pnl_within_grace(pnl, v, 2)[:, 0]
+    assert np.isnan(c[0])                        # before first print: NaN
+    np.testing.assert_array_equal(c[1:7], [2, 2, 2, 5, 5, 5])  # gaps carried
+    assert np.isnan(c[7])                        # beyond grace: NaN again
+    # grace=0 → the very same object, bit-identical historical behaviour
+    assert carry_pnl_within_grace(pnl, v, 0) is pnl
+
+
+def test_grace_carry_then_redistribute():
+    """5-day gap with grace=2: first 2 gap days carry B's last mark (curve
+    continuous at 0.75), days 3-5 redistribute onto A (net 1.0). Both engines
+    must agree."""
+    from functions.dispersion._optimizer import DispersionOptimizer
+    from functions.dispersion.scoring import MetricWeights
+    from functions.dispersion.models import OptimizationConstraints
+
+    n_days = 120
+    pnl = np.column_stack([np.full(n_days, 1.0), np.full(n_days, 0.5)])
+    pnl[60:65, 1] = np.nan                    # 5-day gap on name B
+    names = ["A", "B"]
+    col_map = {t: i for i, t in enumerate(names)}
+    legs = [DispersionLeg(variance_asset=t, strike_mono_var_swap=0.10,
+                          min_weight=0.05, max_weight=0.95) for t in names]
+
+    cfg = _to_swap_config(DispersionConfig(
+        n_exp=20, missing_data_policy=MissingDataPolicy.ADAPTIVE_REWEIGHT,
+        reweight_grace_days=2))
+    bt = DispersionBacktester(cfg)
+    long_pnl, short_pnl, active, _ = bt._apply_adaptive_policy(
+        pnl, names, {"A": 0.5, "B": 0.5})
+    net_bt = long_pnl + short_pnl
+    np.testing.assert_allclose(net_bt[60:62], 0.75)   # in grace: carried mark
+    np.testing.assert_allclose(net_bt[62:65], 1.0)    # beyond: redistributed
+    np.testing.assert_allclose(net_bt[65], 0.75)      # back to normal
+    np.testing.assert_array_equal(active[59:66], [2, 2, 2, 1, 1, 1, 2])
+
+    cons = OptimizationConstraints(
+        min_stocks_long=2, max_stocks_long=2, min_stocks_short=0,
+        max_stocks_short=0, max_net_strike=10.0, population_size=10,
+        max_generations=5, time_limit_seconds=5.0, stagnation_limit=5)
+    opt = DispersionOptimizer(
+        long_candidates=legs, short_candidates=[], pnl_matrix=pnl,
+        column_map=col_map, constraints=cons,
+        missing_data_policy=MissingDataPolicy.ADAPTIVE_REWEIGHT,
+        reweight_grace_days=2,
+        metric_weights=MetricWeights({"mean_payoff": 1.0}), seed=0)
+    net_opt = opt._adaptive_net_pnl([0, 1], np.array([0.5, 0.5]))
+    assert np.allclose(net_opt, net_bt), (
+        "optimizer and backtester diverge on carry-then-redistribute")
 
 
 def test_bundle_v1_replays_with_grace_zero(tmp_path):

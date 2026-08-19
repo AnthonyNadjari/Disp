@@ -758,11 +758,13 @@ with tab1:
         )
         if str(missing_data_policy).startswith("Adaptive"):
             reweight_grace_days = st.number_input(
-                "Grace days (reweight)", min_value=0, max_value=30, value=0,
+                "Grace days (reweight)", min_value=0, max_value=30, value=3,
                 key="grace_days_tab1",
-                help="A name whose data gap lasts \u2264 this many days KEEPS its weight "
-                     "(contributing 0 on gap days) instead of redistributing it at once. "
-                     "0 = historical behaviour (immediate redistribution)."
+                help="A name whose data gap lasts \u2264 this many days keeps its weight "
+                     "and carries its last payoff (an exchange holiday does not move its "
+                     "rolling window). Beyond that, its weight is redistributed to the "
+                     "active names. 0 = redistribute immediately (historical behaviour, "
+                     "recomposes the basket on every one-day holiday)."
             )
         else:
             reweight_grace_days = 0
@@ -1744,11 +1746,12 @@ with tab3:
                                            help="Adaptive Reweight: redistribute weights for missing stocks. Fill Zero: original Gaia_PP behavior.")
         if str(missing_data_policy).startswith("Adaptive"):
             reweight_grace_days = st.number_input(
-                "Grace days (reweight)", min_value=0, max_value=30, value=0,
+                "Grace days (reweight)", min_value=0, max_value=30, value=3,
                 key="grace_days_tab3",
-                help="A name whose data gap lasts \u2264 this many days KEEPS its weight "
-                     "(contributing 0 on gap days) instead of redistributing it at once. "
-                     "0 = historical behaviour."
+                help="A name whose data gap lasts \u2264 this many days keeps its weight "
+                     "and carries its last payoff (an exchange holiday does not move its "
+                     "rolling window). Beyond that, its weight is redistributed. "
+                     "0 = redistribute immediately (historical behaviour)."
             )
         else:
             reweight_grace_days = 0

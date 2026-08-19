@@ -651,9 +651,18 @@ def _prepare_optimization_inputs(
     # delivered P&L stay equal at the window boundary. None when inactive.
     if (config.missing_data_policy == MissingDataPolicy.ADAPTIVE_REWEIGHT
             and config.reweight_grace_days > 0):
-        from functions.dispersion.scoring.weight_solver import active_mask_with_grace
+        from functions.dispersion.scoring.weight_solver import (
+            active_mask_with_grace, carry_pnl_within_grace)
+        _isvalid_full = ~np.isnan(pnl_matrix_full)
         _active_mask = active_mask_with_grace(
-            ~np.isnan(pnl_matrix_full), config.reweight_grace_days)[_start_idx:_end_idx]
+            _isvalid_full, config.reweight_grace_days)[_start_idx:_end_idx]
+        # In-grace gap days carry the name's last mark — computed on FULL
+        # history then sliced, same boundary rule as the mask. The optimizer
+        # receives this matrix together with the external mask and does not
+        # re-carry it.
+        pnl_matrix = carry_pnl_within_grace(
+            pnl_matrix_full, _isvalid_full,
+            config.reweight_grace_days)[_start_idx:_end_idx]
     else:
         _active_mask = None
 
