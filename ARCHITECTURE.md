@@ -65,7 +65,102 @@ results) carry decimals. All conversions happen in `_api.py`, nowhere else.
 
 ---
 
-## 2. The algorithm
+## 2. The algorithms, in brief
+
+Each stage uses the cheapest standard tool that is **exact** for its problem
+class. The map first, then each tool in a few lines:
+
+| Problem | Tool | Where |
+|---|---|---|
+| Choose the subset of names (combinatorial, non-convex) | GA + local search — exhaustive enumeration when the universe is small | `_optimizer.py` |
+| Weights for a given subset, linear objective | LP (HiGHS) | `scoring/weight_solver.py` |
+| Weights maximizing the worst day | bisection on LP feasibility | `scoring/weight_solver.py` |
+| Weights for non-smooth blends (hit ratio, drawdown, CVaR…) | SLSQP multi-start + deterministic sweep | `scoring/weight_solver.py` |
+| Diversified calibration draws | QP | `_optimizer.py` |
+| Put all metrics on one scale | empirical CDF (quantile rank) | `scoring/normalizers.py` |
+| Prove the maximin winner exactly optimal | MILP (branch-and-bound) | `milp_benchmark` |
+| Test the winner's rank stability | bootstrap resampling | `bootstrap_robustness` |
+
+**GA — genetic algorithm** *(outer search)*. Population-based search for
+problems with no useful gradient: keep a pool of candidate subsets; each
+round, copy the best few unchanged (*elitism*), breed new candidates by
+recombining two good parents (*crossover*) and randomly perturbing them
+(*mutation*), and inject fresh random subsets (*immigrants*) so the pool
+never collapses onto one region. It fits this problem because the objective
+— a rank score over discrete subsets — is non-convex and non-differentiable,
+and because feasibility (sizes, bounds, strike cap, buckets, forced names)
+is easier to *repair* inside the operators than to encode in any solver.
+The genome is the subset only; weights are never searched (next paragraph).
+Exact loop in §3.5.
+
+**WeightSolver — the inner dispatcher.** Given a subset, weights are not
+searched but **derived**: `WeightSolver.solve()` inspects the active metric
+blend and routes to the cheapest method that is exact for it — LP when
+everything is linear, bisection for the maximin part, SLSQP only where no
+exact reformulation exists — all under one shared constraint block
+(`Σw = 1`, per-name bounds, net-strike cap, bucket rows, vega caps).
+Results are memoized per sorted subset, so a subset's fitness is a pure
+function and the GA's search space collapses to subsets alone. Dispatch
+detail in §3.4.
+
+**LP — linear programming.** Optimize a linear objective under linear
+equalities/inequalities — the one optimization class solved *globally,
+exactly and in microseconds* at these sizes: no starting point, no local
+optima. Solved via `scipy.optimize.linprog` backed by **HiGHS**, the
+open-source simplex / interior-point engine. Every hard weight constraint in
+this engine is linear, so any linear objective (mean payoff, carry, net
+strike, pure axe) gets its true optimum from a single LP call.
+
+**Bisection maximin.** *Maximin* = maximize the floor, i.e. the worst daily
+P&L. Under adaptive reweighting the daily P&L is a ratio in `w`, so the
+maximin is not itself an LP — but the question *"is floor f achievable?"*
+is an LP feasibility check (§3.4 gives the linearization). Bisection halves
+the bracket on `f` each step — feasible → raise the floor, infeasible →
+lower it — pinning the optimum to `(hi − lo)/2^k` after `k` oracle calls:
+coarse inside the GA, 1e-6 at the final polish. Exact because the oracle is
+exact; fast because convergence is logarithmic.
+
+**SLSQP — Sequential Least Squares Programming.** scipy's standard solver
+for smooth constrained non-linear problems: at each iterate it builds a
+quadratic model of the objective with linearized constraints and solves that
+least-squares subproblem (hence the name). It is a *local* method that
+assumes smoothness — and metrics like hit ratio or drawdown are
+piecewise-constant with zero gradient almost everywhere — so it runs
+multi-start on a smoothed surrogate and is always followed by a
+deterministic sweep of structured candidate vectors ranked on the true
+objective: the sweep, not the gradient, is what moves across plateaus. Used
+only for blends with no exact reformulation.
+
+**QP — quadratic programming.** LP's sibling with a quadratic objective.
+Used in calibration: maximizing `Σ meanᵢ·wᵢ − λ·Σwᵢ²` under the constraint
+block yields return-aware but corner-averse weights — one of the four draw
+styles (equal, QP-diversified, greedy-spread, Dirichlet) that make the
+reference sample span the same weight region the search itself visits.
+
+**MILP — mixed-integer linear programming.** An LP in which some variables
+are integer — here binaries `zᵢ ∈ {0,1}` selecting the names, tied to the
+weights by `minwᵢ·zᵢ ≤ wᵢ ≤ maxwᵢ·zᵢ`. HiGHS solves it by
+*branch-and-bound*: a tree of LP relaxations in which any branch whose bound
+cannot beat the incumbent is pruned — exponential in the worst case, quick
+at these sizes. Selection and weighting collapse into one **globally,
+provably optimal** solve, which is why it serves as the independent
+certificate of the GA answer on the maximin configuration (`run_milp=True`)
+— and why it cannot be the production path: rank-normalized blends have no
+linear form.
+
+**Empirical CDF — quantile normalization.** `Φ(x)` = share of a calibration
+sample strictly below `x`: the candidate's *rank* among random feasible
+baskets. Ranks are scale-free and outlier-robust, which is what makes a
+weighted blend of heterogeneous metrics meaningful. Full rationale in §3.3.
+
+**Bootstrap.** Resample the day axis with replacement (300 draws), re-rank
+the winner against its challengers on every resample, and report how often
+it stays top-1 / top-3 plus confidence intervals on its metrics. A ranking
+that survives resampling does not hinge on a handful of lucky days. §3.7.
+
+---
+
+## 3. The algorithm, end to end
 
 ```mermaid
 flowchart TD
@@ -80,12 +175,13 @@ flowchart TD
     I --> J["Winner backtest (basket legs only)<br/>same builder, same window"]
 ```
 
-### 2.1 P&L construction
+### 3.1 P&L construction
 
 For each date, the rolling window takes the last `n_exp + 1` **valid**
 observations of the underlying series; a day where the name did not trade
 emits NaN — never a stale value carried forward. Two product kernels, both
-numba-compiled, both O(n) via a cumulative valid-count:
+numba-compiled (JIT-translated to machine code, so the rolling loops run at
+C speed), both O(n) via a cumulative valid-count:
 
 - **Vol swap** (`_rolling_pnl_volswap`): realized vol over the window vs the
   strike, payoff `min(σ, cap·K) − K`. The window's first daily return is
@@ -107,7 +203,7 @@ swap); a duplicate per-name key raises rather than misaligning columns.
 Both kernels are verified against naive loop-based reference implementations
 at 1e-12, NaN pattern included (`tests/test_kernel_reference.py`).
 
-### 2.2 Missing-data policies
+### 3.2 Missing-data policies
 
 How a gap day (no observation for a name) enters the basket P&L. One
 implementation is shared by the scoring side and the backtester, so the
@@ -136,7 +232,7 @@ the analysis window, so a gap already open at the window start behaves
 identically in the optimizer and the backtester. `grace = 0` reproduces the
 historical behaviour bit-for-bit and is the default.
 
-### 2.3 Score function
+### 3.3 Score function
 
 ```mermaid
 flowchart LR
@@ -196,7 +292,7 @@ active-extras) signature and shared across configurations; on reuse the RNG
 streams are restored to their post-generation state, so any run remains
 bit-identical to a solo run.
 
-### 2.4 The inner weight solver
+### 3.4 The inner weight solver
 
 Weights are **not** free genes. Given a subset, `WeightSolver.solve()`
 derives the weights by a deterministic rule, memoized per sorted subset, so
@@ -252,7 +348,7 @@ Inside the GA, LP paths restrict day constraints to full-active rows (where
 adaptive renormalization is the identity, so the linear form is exact); the
 bisection paths handle partial-activity days exactly via the mask.
 
-### 2.5 The outer search
+### 3.5 The outer search
 
 The genome is the subset alone. Per generation: sort by fitness → copy the
 elite fraction unchanged → fill by tournament selection, feasibility-repairing
@@ -287,7 +383,7 @@ Above the threshold no polynomial method can certify the global optimum of a
 non-convex rank objective; the descent plus 400 random restarts is
 best-effort by construction, and the certificates below exist to measure it.
 
-### 2.6 Why a bespoke GA and not DEAP / pygad
+### 3.6 Why a bespoke GA and not DEAP / pygad
 
 The generic GA frameworks supply the loop shell — population container,
 selection operators, hall of fame — which is the trivial 5 % of this problem.
@@ -304,7 +400,7 @@ dependency to validate and per-individual object overhead on the hot path
 (the fitness works on views of one shared P&L matrix), while removing
 nothing. The ~200 lines of loop are the cheapest part of the file.
 
-### 2.7 Certificates & validation
+### 3.7 Certificates & validation
 
 - **MILP exact bound** (`run_milp=True`, `min_payoff = 1` configurations):
   variables `w ∈ ℝⁿ`, `z ∈ {0,1}ⁿ`, floor `t`; maximize `t` subject to
@@ -324,7 +420,7 @@ nothing. The ~200 lines of loop are the cheapest part of the file.
   backtester equality on sign, policies, grace and window boundary; golden
   runs bit-frozen.
 
-### 2.8 Determinism & reproducibility
+### 3.8 Determinism & reproducibility
 
 Same inputs + same seed ⇒ same basket, score and weights, GA included. The
 run RNG is a single seeded stream (plus a dedicated stream for vega draws so
@@ -339,7 +435,7 @@ tests.
 
 ---
 
-## 3. Module reference
+## 4. Module reference
 
 ### `functions/dispersion/_api.py` — public API (single conversion layer)
 
@@ -357,12 +453,12 @@ tests.
 
 | Symbol | Role |
 |---|---|
-| `_rolling_pnl_volswap` / `_rolling_pnl_corridor` | numba rolling P&L kernels (§2.1) |
+| `_rolling_pnl_volswap` / `_rolling_pnl_corridor` | numba rolling P&L kernels (§3.1) |
 | `_vol_swap_window` / `_corridor_varswap_window` | single-window payoffs |
 | `compute_leg_pnl_columns(variance_px, corridor_px, legs, cfg)` | **the** per-leg P&L builder used by both engines; drops cross legs with missing corridor prices (warn), raises on duplicate keys |
 | `_leg_pnl_cross_corridor()` | one cross-corridor leg → `(pnl_mono, pnl_cross)` |
 | `DispersionBacktester.run(variance_px, legs, weights, corridor_px, start_date, end_date)` | basket backtest: matrix → policy → curve bounded to `[start, end]`, per-leg and mono/cross breakdowns, active-name count |
-| `_apply_fill_zero/_drop/_adaptive_policy` | the three gap-day policies (§2.2) |
+| `_apply_fill_zero/_drop/_adaptive_policy` | the three gap-day policies (§3.2) |
 | `DispersionDataLoader.load(basket)` | Bloomberg fetch (`variance_px`, `corridor_px`); infra failures raise |
 | `SwapCalculator.compute()` | product dispatch for a single series |
 
@@ -374,8 +470,8 @@ tests.
 | `_fitness` / `_compute_net_pnl` / `_adaptive_net_pnl` | subset → weights → net P&L → score (policy-aware, `L − S`) |
 | `_generate_reference_sample` / `_build_reference_sample` | calibration draws + normalizer fit; shared via `reference_cache` |
 | `_exact_swap_local_search` | post-GA polish; exhaustive under 2000 feasible subsets |
-| `milp_benchmark` | exact MILP bound for the maximin configuration (§2.7) |
-| `bootstrap_robustness` | day-resampling stability diagnostic (§2.7) |
+| `milp_benchmark` | exact MILP bound for the maximin configuration (§3.7) |
+| `bootstrap_robustness` | day-resampling stability diagnostic (§3.7) |
 | `_net_strike` / `_solver_strikes` | net-strike constraint (XC: mono − cross spread per leg) |
 | `TUNING` (`_TuningConstants`) | every GA magic number, named and documented |
 
@@ -386,7 +482,7 @@ tests.
 | `metrics.py` | metric classes + `@register_metric` registry; `ScoreContext` |
 | `normalizers.py` | `QuantileNormalizer` (empirical CDF, strictly-less ties), z-score / min-max variants |
 | `score.py` | `MetricWeights` (validates names against the registry), `ScoreFunction` (fit reference, score candidates) |
-| `weight_solver.py` | the inner solver of §2.4 (`WeightSolver`, LP / bisection / SLSQP / sweep, bucket & vega rows), `adaptive_pnl` and `active_mask_with_grace` (canonical policy math shared with the backtester), `SOLVER_TUNING`, `project_to_bounded_simplex` |
+| `weight_solver.py` | the inner solver of §3.4 (`WeightSolver`, LP / bisection / SLSQP / sweep, bucket & vega rows), `adaptive_pnl` and `active_mask_with_grace` (canonical policy math shared with the backtester), `SOLVER_TUNING`, `project_to_bounded_simplex` |
 | `aggregators.py` | series aggregation helpers used by metrics |
 
 ### Others
@@ -394,29 +490,6 @@ tests.
 | File | Role |
 |---|---|
 | `models.py` | dataclasses (`DispersionConfig`, `SwapConfig`, `DispersionLeg`, `OptimizationConstraints`, `BucketConstraint`, `VegaConfig`, `MissingDataPolicy`) and `BacktestResult` — including `per_stock()`, `per_stock_stats()`, `to_frames()`, `export()` |
-| `run_bundle.py` | save / load / `replay()` of runs (§2.8) |
+| `run_bundle.py` | save / load / `replay()` of runs (§3.8) |
 | `Dispersion_Optimizer.py` | the Streamlit page — input tables, widgets, charts; calls the API above and nothing else |
 | `tests/` | 86 tests: kernel-vs-reference, engine-equality (sign, policies, grace, window boundary), corner extremality end-to-end, golden regressions, API pipeline (offline monkeypatched loader), bundles, exports |
-
----
-
-## 4. Guarantees (test-pinned)
-
-- **Kernels = the math**: both rolling kernels match naive reference
-  implementations at 1e-12, NaN pattern included; the vol-swap first-return
-  skip is pinned.
-- **One builder**: optimizer matrix ≡ backtester matrix (same function,
-  asserted equal element-wise).
-- **Short = minus** in every mode; optimizer net equals the hand-computed
-  `L − S` reference.
-- **Grace symmetric**: optimizer and backtester produce the same adaptive
-  curve on gapped data, window boundary included; `grace = 0` is
-  bit-identical to the historical behaviour.
-- **Corner extremality**: weight 1 on a metric ⇒ the returned basket
-  maximizes that metric end-to-end (exhaustively certified on small
-  universes; MILP-checkable on the maximin configuration).
-- **Reproducible**: golden runs bit-frozen; bundles replay exactly; shared
-  calibration and prep caching provably do not alter results.
-- **Fail-loud**: blank mono strike, duplicate name, Bloomberg failure,
-  non-positive price, degenerate reference → clear errors, never silent
-  fallbacks.
