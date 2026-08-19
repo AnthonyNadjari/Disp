@@ -1252,10 +1252,9 @@ with tab1:
                         for _w in _inj_warns:
                             st.warning(_w)
                         with st.spinner(
-                                f"Loading Bloomberg data + fitting the reference for "
-                                f"{len(_long_src)} names, then running the GA… "
-                                f"(the Time Limit bounds the GA search only — data load, "
-                                f"reference fitting and the final polish are extra)"):
+                                f"Optimizing {len(_long_src)} names… first run loads "
+                                f"Bloomberg data + fits the reference; re-runs reuse them. "
+                                f"(the Time Limit bounds the GA search only)"):
                             _opt_error = None
                             result = None
                             def _parse_ticker_list(raw_text):
@@ -1359,6 +1358,11 @@ with tab1:
                             # ── Clear stale smoothing state (new run invalidates old smooth) ──
                             st.session_state.pop('gaia_smooth_result', None)
                             # Build display from OptimizationResult directly
+                            from functions.dispersion._api import _PREP_CACHE as _pc
+                            if _pc.get("last_was_hit"):
+                                st.caption("\u26a1 Re-run: reused the cached data & calibration \u2014 only the search re-ran.")
+                            elif _pc.get("last_was_hit") is False:
+                                st.caption("\U0001f4e1 Fresh Bloomberg load (first run, or an input that busts the cache changed).")
                             _render_optimization_result(result, _is_xc)
                             # ── Persist state for interactive post-smoothing ──
                             st.session_state['gaia_last_run'] = result

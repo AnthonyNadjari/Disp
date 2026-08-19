@@ -548,9 +548,11 @@ def _prepare_cached(cache_prep, long_df, config, constraints, *, short_df,
                           end_date, filter_zero_hr, forced_set, excluded_set)
     if _PREP_CACHE.get("key") == key:
         _engine_log.info("prep cache HIT — Bloomberg load + matrix build skipped")
+        _PREP_CACHE["last_was_hit"] = True
         out = _copy_prep(_PREP_CACHE["prep"])
         out["reference_cache"] = _PREP_CACHE.setdefault("reference_cache", {})
         return out
+    _PREP_CACHE["last_was_hit"] = False
     prep = _prepare_optimization_inputs(
         long_df, config, constraints, short_df=short_df,
         start_date=start_date, end_date=end_date, filter_zero_hr=filter_zero_hr,
