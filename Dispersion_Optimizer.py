@@ -513,8 +513,10 @@ with tab1:
     with c5:
         local_cap = st.number_input("Input local cap", value=2.50, key=12001)
         is_capped_opt = st.toggle(
-            "Capped legs (note-style)", value=True, key='opt_is_capped',
-            help="ON = local cap applies (note-style capped variance). OFF = uncapped OTC swap legs.")
+            "Capped legs (local cap)", value=True, key='opt_is_capped',
+            help="Per-leg cap only: ON = each leg's realized variance is capped at local_cap × strike; "
+                 "OFF = uncapped legs. Independent of the note/OTC structure — that is set by the "
+                 "global cap/floor inputs (e.g. +10/−10 = note, ±9999999 = OTC).")
     with c7:
         global_cap = st.number_input("Input global cap", value=999999999, key=12005)
     with c8:

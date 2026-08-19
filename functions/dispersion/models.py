@@ -116,10 +116,10 @@ class DispersionConfig:
     n_exp: int = 252                      # Product tenor in business days. 252=1Y, 126=6M, 63=3M.
     barrier_up: float = 1.3              # Upper corridor (1.3 = 130% spot)
     barrier_down: float = 0.7            # Lower corridor (0.7 = 70% spot)
-    local_cap: float = 2.5              # Variance payoff cap: max realized = local_cap × strike vol
-    is_capped: bool = True               # Capped variance legs (note-style). False = uncapped (OTC swap)
-    global_cap: float = 9999999.0        # Total basket cap (vol swap only)
-    global_floor: float = -9999999.0     # Total basket floor (vol swap only)
+    local_cap: float = 2.5              # Per-leg variance payoff cap: max realized = local_cap × strike vol
+    is_capped: bool = True               # Per-leg local cap on/off (independent of note/OTC — that's global_cap/floor)
+    global_cap: float = 9999999.0        # Total basket cap (vol swap only) — set e.g. +10 for note, leave for OTC
+    global_floor: float = -9999999.0     # Total basket floor (vol swap only) — set e.g. -10 for note, leave for OTC
 
     # ── Data handling (backtest/optimize) ──
     missing_data_policy: MissingDataPolicy = MissingDataPolicy.ADAPTIVE_REWEIGHT
