@@ -116,7 +116,7 @@ def test_cache_prep_skips_reload(monkeypatch):
     price_df = pd.DataFrame(100.0, index=dates, columns=tickers)
     calls = {"n": 0}
 
-    def fake_load(self, basket):
+    def fake_load(self, basket, **kwargs):
         calls["n"] += 1
         legs = list(basket.long_candidates) + list(basket.short_candidates)
         return {"variance_px": price_df, "corridor_px": None, "legs": legs,

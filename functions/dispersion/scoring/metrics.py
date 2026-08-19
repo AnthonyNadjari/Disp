@@ -21,7 +21,7 @@ Usage
 -----
 >>> import numpy as np
 >>> from functions.dispersion.scoring.metrics import (
-...     ScoreContext, MetricRegistry, Sharpe, MeanPayoff
+...     ScoreContext, MetricRegistry, SharpePayoff, MeanPayoff
 ... )
 >>> rng = np.random.default_rng(0)
 >>> pnl = rng.normal(0.001, 0.02, 252)
@@ -257,10 +257,13 @@ class HitRatio:
         Returns
         -------
         float
-            Value in ``[0, 1]``.
+            Value in ``[0, 1]``.  Returns ``np.nan`` for an empty series or
+            one containing non-finite values (consistent with MeanPayoff /
+            MinPayoff / SharpePayoff — NaN days are never silently counted
+            as misses).
         """
         arr = np.asarray(net_pnl, dtype=float)
-        if arr.size == 0:
+        if arr.size == 0 or not np.all(np.isfinite(arr)):
             return math.nan
         return float(np.mean(arr > self.threshold))
 
@@ -339,8 +342,8 @@ class MeanPayoff:
         net_pnl:
             Raw net-P&L series (1-D float array), oldest -> newest.
         ctx:
-            Score context (used for a fallback window equal to ``ctx.n_days``
-            when ``self.window`` is *None*).
+            Score context (unused by this metric but required by the
+            protocol).
 
         Returns
         -------
@@ -399,7 +402,7 @@ class CVaR5:
         -------
         float
             CVaR value (typically negative for a loss-making tail).
-            Returns ``np.nan`` when the series is too short to estimate a tail.
+            Returns ``np.nan`` only for an empty series.
         """
         arr = np.asarray(net_pnl, dtype=float)
         n = arr.size
@@ -415,14 +418,17 @@ class CVaR5:
 
 @register_metric()
 class MaxDrawdown:
-    """Maximum peak-to-trough drawdown of the net P&L series.
+    """Maximum peak-to-trough drawdown of the cumulative net-P&L (equity) curve.
 
     Computed on the **date-ordered** (chronological) series — never sorted.
+    The running maximum and the drawdown are measured on the equity curve
+    ``E_t = Σ_{s ≤ t} r_s``, consistent with the backtester leg metrics and
+    the portfolio-level ``max_drawdown`` property.
 
     .. math::
 
-        \\text{peak}_t = \\max_{s \\le t} r_s
-        \\text{MaxDrawdown} = \\max_t (\\text{peak}_t - r_t)
+        \\text{peak}_t = \\max_{s \\le t} E_s
+        \\text{MaxDrawdown} = \\max_t (\\text{peak}_t - E_t)
 
     ``higher_is_better = False`` because a smaller drawdown is preferred.
     ``is_linear = False`` because running-max is non-smooth.
@@ -438,7 +444,7 @@ class MaxDrawdown:
     is_tail_metric: ClassVar[bool] = False
 
     def compute(self, net_pnl: np.ndarray, ctx: ScoreContext) -> float:
-        """Return the maximum peak-to-trough drop in the ordered series.
+        """Return the maximum peak-to-trough drop of the equity curve.
 
         Parameters
         ----------
@@ -451,15 +457,16 @@ class MaxDrawdown:
         Returns
         -------
         float
-            Non-negative magnitude of the worst peak-to-trough drop.
-            Returns 0.0 if the series is monotonically increasing.
-            Returns ``np.nan`` for empty input.
+            Non-negative magnitude of the worst peak-to-trough drop of the
+            cumulative P&L curve.  Returns 0.0 if the equity curve is
+            monotonically non-decreasing.  Returns ``np.nan`` for empty input.
         """
         arr = np.asarray(net_pnl, dtype=float)
         if arr.size == 0:
             return math.nan
-        peak = np.maximum.accumulate(arr)
-        drawdown = peak - arr
+        equity = np.cumsum(arr)
+        peak = np.maximum.accumulate(equity)
+        drawdown = peak - equity
         return float(np.max(drawdown))
 
 

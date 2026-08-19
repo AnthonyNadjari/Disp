@@ -16,7 +16,9 @@ Public surface
 Design notes
 ------------
 * ``fit`` must be called before any ``transform*`` call.
-* All ``transform*`` methods clamp output to [0, 1].
+* ``transform`` methods clamp output to [0, 1].  QuantileNormalizer's
+  ``transform_smooth`` linearly extrapolates beyond the reference support to
+  preserve gradient signal, clamped to [-0.05, 1.05].
 * ``transform`` is intended for final scoring (can be step-wise / piecewise).
 * ``transform_smooth`` is intended for scipy-based weight optimisation and must
   be continuously differentiable wherever the optimiser queries it.
@@ -136,7 +138,9 @@ class QuantileNormalizer:
         ``scipy.optimize``.
 
     Both variants are strictly monotone on the support of the reference
-    sample and clamp to ``[0, 1]`` outside it.
+    sample.  ``transform`` clamps to ``[0, 1]`` outside it, while
+    ``transform_smooth`` linearly extrapolates (clamped to
+    ``[-0.05, 1.05]``) to preserve gradient signal.
 
     Examples
     --------
@@ -151,6 +155,8 @@ class QuantileNormalizer:
     def __init__(self) -> None:
         # metric_name → sorted 1-D ndarray of reference values
         self._sorted: dict[str, np.ndarray] = {}
+        # metric_name → cached empirical-CDF grid linspace(0, 1, n)
+        self._cdf_grid: dict[str, np.ndarray] = {}
 
     # ------------------------------------------------------------------
     # fit
@@ -164,8 +170,15 @@ class QuantileNormalizer:
         raw_by_metric:
             Mapping of metric name → 1-D array of raw reference values.
             NaN / inf values are silently dropped before sorting.
+
+        Raises
+        ------
+        ValueError
+            If the finite sample is empty or contains fewer than 2
+            *distinct* values (the empirical-CDF grid would be degenerate).
         """
         self._sorted.clear()
+        self._cdf_grid.clear()
         for name, arr in raw_by_metric.items():
             a = np.asarray(arr, dtype=float).ravel()
             a = a[np.isfinite(a)]
@@ -174,12 +187,14 @@ class QuantileNormalizer:
                     f"QuantileNormalizer.fit: metric '{name}' produced an "
                     "empty finite array."
                 )
-            if a.size < 2:
+            n_distinct = int(np.unique(a).size)
+            if n_distinct < 2:
                 raise ValueError(
                     f"QuantileNormalizer.fit: metric '{name}' needs at least 2 "
-                    f"distinct reference values, got {a.size}."
+                    f"distinct reference values, got {n_distinct}."
                 )
             self._sorted[name] = np.sort(a)
+            self._cdf_grid[name] = np.linspace(0.0, 1.0, a.size)
 
     # ------------------------------------------------------------------
     # transform  (step-function empirical CDF)
@@ -240,7 +255,10 @@ class QuantileNormalizer:
 
         * ``raw < x[0]``   → extrapolated below 0.0
         * ``raw > x[-1]``  → extrapolated above 1.0
-        (then clipped to [0, 1] at the end)
+
+        The extrapolated value is clamped to ``[-0.05, 1.05]`` so that a
+        wildly out-of-support raw value cannot dominate the aggregate
+        (interior interpolation is untouched and stays in ``[0, 1]``).
 
         Parameters
         ----------
@@ -263,18 +281,31 @@ class QuantileNormalizer:
         # Use numpy's linear interpolation on the empirical CDF grid.
         # xp: order statistics  yp: CDF values at those points [0/(n-1) … 1]
         xp = arr
-        yp = np.linspace(0.0, 1.0, n)
+        yp = self._cdf_grid[name]
 
-        # Linear extrapolation beyond reference range to preserve gradient
+        # Linear extrapolation beyond reference range to preserve gradient.
+        # Boundary segments may have zero width when the reference sample
+        # contains ties; fall back to the first non-zero-width segment slope
+        # (fit guarantees at least 2 distinct values, so one always exists).
         if n >= 2:
             if raw < arr[0]:
-                # Below min: use slope from first segment
-                slope = (yp[1] - yp[0]) / (arr[1] - arr[0])
-                cdf_value = yp[0] + (raw - arr[0]) * slope
+                # Below min: use slope from first non-zero-width segment
+                i = 0
+                while arr[i + 1] == arr[i]:
+                    i += 1
+                slope = (yp[i + 1] - yp[i]) / (arr[i + 1] - arr[i])
+                cdf_value = float(
+                    np.clip(yp[0] + (raw - arr[0]) * slope, -0.05, 1.05)
+                )
             elif raw > arr[-1]:
-                # Above max: use slope from last segment
-                slope = (yp[-1] - yp[-2]) / (arr[-1] - arr[-2])
-                cdf_value = yp[-1] + (raw - arr[-1]) * slope
+                # Above max: use slope from last non-zero-width segment
+                j = n - 2
+                while arr[j] == arr[j + 1]:
+                    j -= 1
+                slope = (yp[j + 1] - yp[j]) / (arr[j + 1] - arr[j])
+                cdf_value = float(
+                    np.clip(yp[-1] + (raw - arr[-1]) * slope, -0.05, 1.05)
+                )
             else:
                 # Inside range: use linear interpolation
                 cdf_value = float(np.interp(raw, xp, yp))
@@ -285,7 +316,8 @@ class QuantileNormalizer:
         if not higher_is_better:
             cdf_value = 1.0 - cdf_value
 
-        # No clip — linear extrapolation beyond [0,1] is the intended gradient signal
+        # Extrapolated values are already clamped to [-0.05, 1.05]; interior
+        # interpolation stays within [0, 1] — no final clip.
         return float(cdf_value)
 
     # ------------------------------------------------------------------

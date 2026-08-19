@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as _dt
+import hashlib
 import json
 import os
 from dataclasses import dataclass, field
@@ -159,6 +160,15 @@ def _json_default(o):
     if isinstance(o, np.ndarray):
         return o.tolist()
     raise TypeError(f"run_bundle: cannot serialize {type(o).__name__} to JSON")
+
+
+def _file_sha256(path: str) -> str:
+    """Short sha256 fingerprint of a file (integrity tag stored in bundle.json)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()[:16]
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +300,26 @@ def save_run_bundle(
             f"save_run_bundle: column_map values must be exactly 0..{n_cols - 1} "
             f"(matrix has {n_cols} columns), got {sorted(column_map.values())}"
         )
+    # Every candidate's lookup key (mirrors _optimizer._candidate_key: the
+    # corridor condition asset in cross-corridor mode, else the variance
+    # asset) must have a matrix column, or the bundle cannot replay.
+    missing_keys = sorted({
+        (l.corridor_condition_asset if (is_cross_corridor and l.corridor_condition_asset)
+         else l.variance_asset)
+        for l in long_candidates + short_candidates
+    } - set(column_map))
+    if missing_keys:
+        raise ValueError(
+            f"save_run_bundle: candidate tickers missing from column_map: {missing_keys}"
+        )
+    if forced_long_indices:
+        bad_idx = sorted({int(i) for i in forced_long_indices if not 0 <= int(i) < n_cols})
+        if bad_idx:
+            raise ValueError(
+                f"save_run_bundle: forced_long_indices out of range [0, {n_cols}): {bad_idx}"
+            )
+    if not score_weights:
+        raise ValueError("save_run_bundle: score_weights must be non-empty")
 
     os.makedirs(path, exist_ok=True)
 
@@ -300,11 +330,18 @@ def save_run_bundle(
     index = pd.Index(dates) if dates is not None else pd.RangeIndex(mat.shape[0])
     df = pd.DataFrame(mat, columns=cols_by_idx, index=index)
     df.to_parquet(os.path.join(path, _MATRIX_FILE))
+    mask_path = os.path.join(path, _MASK_FILE)
+    mask_info: Dict = {"present": False, "sha256": None}
     if active_mask is not None:
         # Grace > 0: the mask was built on FULL history before window slicing —
         # not derivable from the stored window alone, so persist it for exact replay.
         pd.DataFrame(np.asarray(active_mask, dtype=bool), columns=cols_by_idx,
-                     index=index).to_parquet(os.path.join(path, _MASK_FILE))
+                     index=index).to_parquet(mask_path)
+        mask_info = {"present": True, "sha256": _file_sha256(mask_path)}
+    elif os.path.exists(mask_path):
+        # Re-saving a bundle without a mask: drop any stale mask left by a
+        # previous save so the JSON flag and the directory can never disagree.
+        os.remove(mask_path)
 
     # ── Everything else → JSON ──
     payload = {
@@ -332,6 +369,7 @@ def save_run_bundle(
         },
         "long_candidates": [_leg_to_dict(l) for l in long_candidates],
         "short_candidates": [_leg_to_dict(l) for l in short_candidates],
+        "active_mask": mask_info,
         "config": config,
         "provenance": dict(provenance or {}),
         "result": _result_to_dict(result) if result is not None else None,
@@ -367,8 +405,26 @@ def load_run_bundle(path: str) -> RunBundle:
     df = pd.read_parquet(mat_path)
     pnl_matrix = df.to_numpy(dtype=np.float64)
     mask_path = os.path.join(path, _MASK_FILE)
+    mask_exists = os.path.exists(mask_path)
+    mask_info = payload.get("active_mask")
+    if mask_info is not None:
+        # Bundles written with mask bookkeeping: JSON and directory must agree.
+        if bool(mask_info.get("present")) != mask_exists:
+            raise ValueError(
+                f"load_run_bundle: bundle.json says active_mask present="
+                f"{mask_info.get('present')} but {_MASK_FILE} "
+                f"{'exists' if mask_exists else 'is missing'} — corrupt bundle"
+            )
+        recorded_sha = mask_info.get("sha256")
+        if mask_exists and recorded_sha:
+            actual_sha = _file_sha256(mask_path)
+            if actual_sha != recorded_sha:
+                raise ValueError(
+                    f"load_run_bundle: {_MASK_FILE} sha256 mismatch "
+                    f"(bundle.json {recorded_sha} vs file {actual_sha}) — corrupt bundle"
+                )
     active_mask = (pd.read_parquet(mask_path).to_numpy(dtype=bool)
-                   if os.path.exists(mask_path) else None)
+                   if mask_exists else None)
     column_map = {str(c): i for i, c in enumerate(df.columns)}
     dates = None if isinstance(df.index, pd.RangeIndex) else list(df.index)
 

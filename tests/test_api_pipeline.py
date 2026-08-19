@@ -43,7 +43,7 @@ def api_offline(monkeypatch):
         dates = pd.bdate_range("2024-01-02", periods=pnl.shape[0])
         price_df = pd.DataFrame(100.0, index=dates, columns=tickers)
 
-        def fake_load(self, basket):
+        def fake_load(self, basket, **kwargs):
             legs = list(basket.long_candidates) + list(basket.short_candidates)
             return {
                 "variance_px": price_df,
@@ -235,3 +235,54 @@ def test_api_mono_force_bogus_message(api_offline):
         api.optimize(long_df, cfg, _cons(), score_weights={"mean_payoff": 1.0},
                      seed=0, forced_tickers=["nope zz equity"])
     assert "Variance Asset" in str(ei.value)
+
+
+# ── End-to-end through optimize(): scored == delivered, window-aligned ──────
+
+def test_e2e_scored_equals_delivered_window(monkeypatch):
+    """Full offline pipeline with ONLY the Bloomberg fetch faked — the real
+    matrix builder, GA, and winner backtest all run. Pins (a) the delivered
+    backtest covers exactly the optimizer's scoring window (previously it
+    silently included ~2 extra years of full history) and (b) the delivered
+    Result min equals the optimizer's scored min of the winner."""
+    import functions.dispersion._backtester as bt
+    import functions.dispersion._api as api
+
+    rng = np.random.default_rng(31)
+    n_hist, n_exp, lookback_years = 3 * 252, 40, 1
+    dates = pd.bdate_range("2021-01-04", periods=n_hist)
+    tickers = [f"T{i}" for i in range(6)]
+    rets = rng.normal(0.0003, 0.012, (n_hist, len(tickers)))
+    price_df = pd.DataFrame(100.0 * np.exp(np.cumsum(rets, axis=0)),
+                            index=dates, columns=tickers)
+
+    def fake_fetch(self, legs, start):
+        return price_df
+    monkeypatch.setattr(bt.DispersionDataLoader, "_fetch_standard", fake_fetch)
+
+    cfg = DispersionConfig(n_exp=n_exp, lookback_years=lookback_years,
+                           missing_data_policy=MissingDataPolicy.FILL_ZERO)
+    long_df = pd.DataFrame({
+        "Variance Asset": tickers,
+        "Strike Mono Var Swap (%)": [12.0 + i for i in range(6)],
+        "Min Weight": 5.0,
+        "Max Weight": 60.0,
+    })
+    cons = _cons(min_stocks_long=2, max_stocks_long=3)
+    res = api.optimize(long_df, cfg, cons,
+                       score_weights={"mean_payoff": 1.0}, seed=0)
+
+    ts = res.backtest.timeseries
+    assert not ts.empty, "E2E run must deliver a backtest curve"
+    # (a) window alignment: delivered span == optimizer window
+    # (lookback_years*252 + n_exp rows), ending on the last price date.
+    expected_rows = int(lookback_years * 252) + n_exp
+    assert len(ts) == expected_rows, (
+        f"delivered curve must cover the optimizer window ({expected_rows} rows), "
+        f"got {len(ts)} — out-of-window contamination is back")
+    assert ts.index[-1].normalize() == dates[-1].normalize()
+    assert ts.index[0].normalize() == dates[-expected_rows].normalize()
+    # (b) scored == delivered: same min on the same window
+    assert res._final_raw_min is not None
+    assert abs(float(ts["Result"].min()) - res._final_raw_min) < 1e-8, (
+        "delivered Result min != optimizer's scored min of the winner")

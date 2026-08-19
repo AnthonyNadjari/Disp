@@ -350,6 +350,15 @@ def test_zero_price_yields_nan_not_inf():
     prices[100] = 0.0                       # pathological zero close
     out = _rolling_pnl_volswap(prices, 0.10, 20, 2.5)
     assert not np.isinf(out[~np.isnan(out)]).any(), "zero price must yield NaN, never inf"
+    # Every window at/after the zero close contains it → those rows must be NaN
+    # (the pre-fix code capped inf at local_cap·K and produced a FINITE value,
+    # which the old isinf-only assertion could not catch).
+    assert np.isnan(out[100:]).all(), "windows containing the zero price must be NaN"
+    # Expected-Var mode (strike=0) has no cap to swallow the inf — the guard
+    # must hold there too.
+    out_ev = _rolling_pnl_volswap(prices, 0.0, 20, 2.5)
+    assert not np.isinf(out_ev[~np.isnan(out_ev)]).any()
+    assert np.isnan(out_ev[100:]).all()
 
 
 # ── Review fix: grace mask must carry PRE-WINDOW history across the slice ────
@@ -420,3 +429,54 @@ def test_bundle_stores_and_replays_active_mask(tmp_path):
     b = load_run_bundle(path)
     assert b.active_mask is not None and b.active_mask.shape == (120, 3)
     assert bool(b.active_mask[0, 0]), "carried-in grace row must survive the roundtrip"
+
+
+# ── DROP_INCOMPLETE_DAYS: optimizer and backtester must agree ───────────────
+
+def test_drop_policy_optimizer_matches_backtester():
+    """DROP_INCOMPLETE_DAYS keeps only days where EVERY weighted name trades.
+    Previously zero coverage: pin that both engines drop the same rows and
+    produce the identical net curve on the same matrix."""
+    from functions.dispersion._optimizer import DispersionOptimizer
+    from functions.dispersion.scoring import MetricWeights
+    from functions.dispersion.models import OptimizationConstraints
+
+    rng = np.random.default_rng(21)
+    n_days = 300
+    names = ["A", "B", "C"]
+    pnl = np.column_stack([rng.normal(0.4 * (i + 1), 1.0, n_days) for i in range(3)])
+    pnl[50:60, 1] = np.nan     # name B gap
+    pnl[100, 2] = np.nan       # name C single missing day
+
+    col_map = {t: i for i, t in enumerate(names)}
+    legs = [DispersionLeg(variance_asset=t, strike_mono_var_swap=0.10,
+                          min_weight=0.05, max_weight=0.95) for t in names]
+    cons = OptimizationConstraints(
+        min_stocks_long=2, max_stocks_long=3, min_stocks_short=0, max_stocks_short=0,
+        max_net_strike=10.0, population_size=10, max_generations=2,
+        time_limit_seconds=5.0, stagnation_limit=2)
+    opt = DispersionOptimizer(
+        long_candidates=legs, short_candidates=[],
+        pnl_matrix=pnl, column_map=col_map, constraints=cons,
+        missing_data_policy=MissingDataPolicy.DROP_INCOMPLETE_DAYS,
+        metric_weights=MetricWeights({"mean_payoff": 1.0}), seed=0)
+
+    long_w = np.array([0.5, 0.3, 0.2])
+    net_opt = opt._adaptive_net_pnl([0, 1, 2], long_w)
+
+    cfg = _to_swap_config(DispersionConfig(
+        n_exp=20, missing_data_policy=MissingDataPolicy.DROP_INCOMPLETE_DAYS))
+    bt = DispersionBacktester(cfg)
+    long_pnl, short_pnl, _, valid_mask = bt._apply_drop_policy(
+        pnl, names, {"A": 0.5, "B": 0.3, "C": 0.2})
+    # long/short come back already restricted to the kept rows
+    net_bt = long_pnl + short_pnl
+
+    # The kept rows are exactly those untouched by the NaN pattern
+    expected_valid = np.ones(n_days, dtype=bool)
+    expected_valid[50:60] = False
+    expected_valid[100] = False
+    assert len(net_opt) == int(expected_valid.sum()), (
+        "optimizer must drop exactly the days where any weighted name is NaN")
+    assert np.allclose(net_opt, net_bt), (
+        "DROP policy: optimizer and backtester must produce the identical curve")

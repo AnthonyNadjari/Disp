@@ -166,7 +166,7 @@ class MetricWeights:
         max_drawdown: float = 0.1,
         hit_ratio: float = 0.3,
     ) -> "MetricWeights":
-        """Create MetricWeights from old ScoreWeights fields.
+        """Create MetricWeights from the legacy (pre-MetricWeights) weight fields.
 
         Mapping:
             last_value  → last_carry
@@ -214,6 +214,8 @@ class ScoreFunction:
         weights: Optional[MetricWeights] = None,
     ) -> None:
         self._metrics = list(metrics)
+        if not self._metrics:
+            raise ValueError("ScoreFunction requires at least one metric.")
         self._normalizer = normalizer or QuantileNormalizer()
         self._aggregator = aggregator or WeightedSum()
 
@@ -351,7 +353,7 @@ class ScoreFunction:
         if not self._fitted:
             raise RuntimeError("ScoreFunction not fitted. Call build_reference() first.")
 
-        raw = self._compute_raw(net_pnl, ctx)
+        raw = self._compute_raw(net_pnl, ctx, active_only=True)
         normalized = self._normalize(raw, smooth=False)
         return self._aggregator.aggregate(normalized, self._weights.to_dict())
 
@@ -376,7 +378,7 @@ class ScoreFunction:
         if not self._fitted:
             raise RuntimeError("ScoreFunction not fitted. Call build_reference() first.")
 
-        raw = self._compute_raw(net_pnl, ctx)
+        raw = self._compute_raw(net_pnl, ctx, active_only=True)
         normalized = self._normalize(raw, smooth=True)
         return self._aggregator.aggregate(normalized, self._weights.to_dict())
 
@@ -414,8 +416,28 @@ class ScoreFunction:
 
     # --- Internals ---
 
-    def _compute_raw(self, net_pnl: np.ndarray, ctx: ScoreContext) -> Dict[str, float]:
-        """Evaluate all metrics on the given P&L series."""
+    def _compute_raw(
+        self,
+        net_pnl: np.ndarray,
+        ctx: ScoreContext,
+        active_only: bool = False,
+    ) -> Dict[str, float]:
+        """Evaluate metrics on the given P&L series.
+
+        Parameters
+        ----------
+        active_only:
+            When True, metrics with weight 0 are skipped — the aggregator
+            ignores them, so computing them would be wasted work.  Entries
+            missing from the returned dict score 0.0 in :meth:`_normalize`.
+        """
+        if active_only:
+            active = set(self._weights.active_names)
+            return {
+                m.name: m.compute(net_pnl, ctx)
+                for m in self._metrics
+                if m.name in active
+            }
         return {m.name: m.compute(net_pnl, ctx) for m in self._metrics}
 
     def _normalize(self, raw: Dict[str, float], smooth: bool) -> Dict[str, float]:
@@ -426,9 +448,11 @@ class ScoreFunction:
             if m.name in unfitted:
                 normalized[m.name] = 0.0  # no reference — inactive by construction
                 continue
-            val = raw[m.name]
-            if np.isnan(val):
-                normalized[m.name] = 0.0  # NaN → worst possible score
+            val = raw.get(m.name)
+            if val is None or not np.isfinite(val):
+                # Missing (weight 0 — not computed) or non-finite (NaN / ±inf)
+                # raw value → worst possible score.
+                normalized[m.name] = 0.0
                 continue
             if smooth:
                 normalized[m.name] = self._normalizer.transform_smooth(
@@ -485,7 +509,9 @@ def make_default_score_function(
 
     # Core metrics + optional ones (weight 0 by default).  Optional metrics
     # are still part of the reference build, so giving them a weight later
-    # activates them instantly without any code change.
+    # needs no code change — but context-injected metrics (weighted_strike,
+    # axe_*) activate only when per-sample values are supplied via
+    # sample_extras at build time; otherwise build_reference raises.
     metrics: List[Metric] = [
         LastCarry(k=last_carry_k),
         HitRatio(),

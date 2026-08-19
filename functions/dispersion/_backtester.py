@@ -66,7 +66,7 @@ from functions.dispersion.models import (
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @nb.jit(nopython=True, cache=True)
-def _vol_swap_window(prices: np.ndarray, strike: float, n_exp: int, local_cap: float) -> float:
+def _vol_swap_window(prices: np.ndarray, strike: float, n_exp: int, local_cap: float, capped: bool = True) -> float:
     """Vol swap P&L for a single rolling window. Skips first return to match original."""
     if np.isnan(prices).any():
         return np.nan
@@ -79,7 +79,8 @@ def _vol_swap_window(prices: np.ndarray, strike: float, n_exp: int, local_cap: f
     # Original Gaia_PP uses sq_logs[1:] — skips the first daily return in window
     realized = np.sqrt(np.sum(sq_logs[1:]) * 252.0 / n_exp)
     if strike != 0:
-        return min(realized, local_cap * strike) - strike
+        # capped=False = uncapped OTC swap: no local_cap on the realized leg
+        return min(realized, local_cap * strike) - strike if capped else realized - strike
     return realized
 
 @nb.jit(nopython=True, cache=True)
@@ -91,6 +92,7 @@ def _corridor_varswap_window(
     dbar: float,
     n_exp: int,
     local_cap: float,
+    capped: bool = True,
 ) -> float:
     """Corridor variance swap P&L. Corridor observed on prices_corr, variance on prices_var."""
     if np.isnan(prices_var).any() or np.isnan(prices_corr).any():
@@ -118,12 +120,14 @@ def _corridor_varswap_window(
         # Expected Var mode: strike=0 means return realized variance (no cap, no P&L)
         if strike == 0.0:
             return 252.0 / n_exp * corridor_sum
-        capped = min(252.0 / M * corridor_sum, (strike * local_cap) ** 2)
-        return ((capped - strike ** 2) * M / n_exp) / (2.0 * strike)
+        # capped=False = uncapped OTC swap: no local_cap on realized variance
+        cap_bound = (strike * local_cap) ** 2 if capped else np.inf
+        capped_var = min(252.0 / M * corridor_sum, cap_bound)
+        return ((capped_var - strike ** 2) * M / n_exp) / (2.0 * strike)
     return 0.0
 
 @nb.jit(nopython=True, cache=True)
-def _rolling_pnl_volswap(prices: np.ndarray, strike: float, n_exp: int, local_cap: float) -> np.ndarray:
+def _rolling_pnl_volswap(prices: np.ndarray, strike: float, n_exp: int, local_cap: float, capped: bool = True) -> np.ndarray:
     """
     Full rolling vol swap P&L array with skip-NaN windowing.
     Matches original Gaia_PP behavior: for each date, take the last n_exp+1 VALID
@@ -161,7 +165,7 @@ def _rolling_pnl_volswap(prices: np.ndarray, strike: float, n_exp: int, local_ca
         start_v = c - (n_exp + 1)
         for k in range(n_exp + 1):
             window[k] = prices[valid_indices[start_v + k]]
-        out[i] = _vol_swap_window(window, strike, n_exp, local_cap)
+        out[i] = _vol_swap_window(window, strike, n_exp, local_cap, capped)
     return out
 
 @nb.jit(nopython=True, cache=True)
@@ -173,6 +177,7 @@ def _rolling_pnl_corridor(
     dbar: float,
     n_exp: int,
     local_cap: float,
+    capped: bool = True,
 ) -> np.ndarray:
     """
     Full rolling corridor var swap P&L array with skip-NaN windowing.
@@ -205,7 +210,7 @@ def _rolling_pnl_corridor(
             idx = valid_indices[start_v + k]
             w_var[k] = prices_var[idx]
             w_corr[k] = prices_corr[idx]
-        out[i] = _corridor_varswap_window(w_var, w_corr, strike, ubar, dbar, n_exp, local_cap)
+        out[i] = _corridor_varswap_window(w_var, w_corr, strike, ubar, dbar, n_exp, local_cap, capped)
     return out
 
 class SwapCalculator:
@@ -240,20 +245,20 @@ class SwapCalculator:
         # Expected Var mode: strike=0, compute realized variance/vol (no P&L)
         if strike == 0.0:
             if c.is_vol_swap:
-                return _rolling_pnl_volswap(prices, 0.0, c.n_exp, c.local_cap)
+                return _rolling_pnl_volswap(prices, 0.0, c.n_exp, c.local_cap, c.capped)
             elif corridor_prices is not None:
-                return _rolling_pnl_corridor(prices, corridor_prices, 0.0, c.barrier_up, c.barrier_down, c.n_exp, c.local_cap)
+                return _rolling_pnl_corridor(prices, corridor_prices, 0.0, c.barrier_up, c.barrier_down, c.n_exp, c.local_cap, c.capped)
             else:
-                return _rolling_pnl_corridor(prices, prices, 0.0, c.barrier_up, c.barrier_down, c.n_exp, c.local_cap)
+                return _rolling_pnl_corridor(prices, prices, 0.0, c.barrier_up, c.barrier_down, c.n_exp, c.local_cap, c.capped)
 
         if c.is_vol_swap:
-            return _rolling_pnl_volswap(prices, strike, c.n_exp, c.local_cap)
+            return _rolling_pnl_volswap(prices, strike, c.n_exp, c.local_cap, c.capped)
         elif corridor_prices is not None:
             # Cross-corridor: variance from `prices`, corridor from `corridor_prices`
-            return _rolling_pnl_corridor(prices, corridor_prices, strike, c.barrier_up, c.barrier_down, c.n_exp, c.local_cap)
+            return _rolling_pnl_corridor(prices, corridor_prices, strike, c.barrier_up, c.barrier_down, c.n_exp, c.local_cap, c.capped)
         else:
             # Standard corridor: same asset for both
-            return _rolling_pnl_corridor(prices, prices, strike, c.barrier_up, c.barrier_down, c.n_exp, c.local_cap)
+            return _rolling_pnl_corridor(prices, prices, strike, c.barrier_up, c.barrier_down, c.n_exp, c.local_cap, c.capped)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Shared leg-P&L builders — ONE source of truth for the optimizer matrix
@@ -275,19 +280,19 @@ def _leg_pnl_cross_corridor(
     Returns (pnl_mono, pnl_cross), rolling P&L arrays in decimal (×100 is
     applied by the caller). The leg P&L is pnl_mono − pnl_cross.
     """
-    strike_cross = leg.strike_cross_corridor if leg.strike_cross_corridor else leg.strike_mono_var_swap
+    strike_cross = leg.strike_cross_corridor if leg.strike_cross_corridor is not None else leg.strike_mono_var_swap
     if config.is_vol_swap:
         pnl_mono = _rolling_pnl_volswap(
-            corridor_px_col, leg.strike_mono_var_swap, config.n_exp, config.local_cap)
+            corridor_px_col, leg.strike_mono_var_swap, config.n_exp, config.local_cap, config.capped)
         pnl_cross = _rolling_pnl_volswap(
-            variance_px_col, strike_cross, config.n_exp, config.local_cap)
+            variance_px_col, strike_cross, config.n_exp, config.local_cap, config.capped)
     else:
         pnl_mono = _rolling_pnl_corridor(
             corridor_px_col, corridor_px_col, leg.strike_mono_var_swap,
-            config.barrier_up, config.barrier_down, config.n_exp, config.local_cap)
+            config.barrier_up, config.barrier_down, config.n_exp, config.local_cap, config.capped)
         pnl_cross = _rolling_pnl_corridor(
             variance_px_col, corridor_px_col, strike_cross,
-            config.barrier_up, config.barrier_down, config.n_exp, config.local_cap)
+            config.barrier_up, config.barrier_down, config.n_exp, config.local_cap, config.capped)
     return pnl_mono, pnl_cross
 
 
@@ -320,10 +325,12 @@ def compute_leg_pnl_columns(
     leg_map: Dict[str, DispersionLeg] = {}
     column_keys: List[str] = []
     skipped_missing_corr = []
+    skipped_missing_var = []
     corr_cols = set(corridor_px.columns) if (
         corridor_px is not None and not getattr(corridor_px, "empty", True)) else set()
     for leg in legs:
         if leg.variance_asset not in variance_px.columns:
+            skipped_missing_var.append(leg.variance_asset)
             continue
         if config.is_cross_corridor:
             if not leg.corridor_condition_asset or leg.corridor_condition_asset not in corr_cols:
@@ -347,6 +354,14 @@ def compute_leg_pnl_columns(
             f"stock price did not load from Bloomberg, so no valid cross-corridor P&L can "
             f"be computed (no silent fall-back to an index swap). "
             f"Sample: {sorted(set(map(str, skipped_missing_corr)))[:10]}",
+            stacklevel=2,
+        )
+    if skipped_missing_var:
+        # A dropped leg's weight silently vanishes from the basket — never mute.
+        warnings.warn(
+            f"{len(skipped_missing_var)} leg(s) dropped — their variance price did not "
+            f"load from Bloomberg; any weight on them is undeployed. "
+            f"Sample: {sorted(set(map(str, skipped_missing_var)))[:10]}",
             stacklevel=2,
         )
 
@@ -376,6 +391,15 @@ def compute_leg_pnl_columns(
     return pnl_matrix, column_keys, cross_legs
 
 
+def series_key(leg: DispersionLeg, is_cross_corridor: bool) -> str:
+    """Canonical weights/indices key for a leg: Corridor Condition Asset in
+    cross-corridor mode, else variance_asset. Single source of truth — the
+    backtester method and the _api helpers both delegate here."""
+    if is_cross_corridor and leg.corridor_condition_asset:
+        return leg.corridor_condition_asset
+    return leg.variance_asset
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Dispersion Backtester
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -399,9 +423,7 @@ class DispersionBacktester:
 
     def _series_key(self, leg: DispersionLeg) -> str:
         """Return key for weights/indices: Corridor Condition Asset for cross-corridor, else variance_asset."""
-        if self.config.is_cross_corridor and leg.corridor_condition_asset:
-            return leg.corridor_condition_asset
-        return leg.variance_asset
+        return series_key(leg, self.config.is_cross_corridor)
 
     def run(
         self,
@@ -419,7 +441,7 @@ class DispersionBacktester:
             legs: List of DispersionLeg objects
             weights: {ticker: weight} — positive=long, negative=short
             corridor_px: Corridor Condition Asset (stock) prices — cross-corridor only
-            start_date: Filter output from this date (default: 5 years ago)
+            start_date: Filter output from this date (default: 20 years ago — fetch max available history)
             end_date: Filter output up to this date inclusive (default: no upper bound).
                 Must match the optimizer's scoring window so reported metrics don't
                 include post-cutoff (out-of-sample) data.
@@ -434,6 +456,17 @@ class DispersionBacktester:
             key = self._series_key(leg)
             if key in weights:
                 weights_by_key[key] = weights[key]
+        # A weighted leg whose P&L column was never built (price load failed)
+        # silently undeploys its weight — surface it loudly.
+        _dropped_weighted = [k for k, w in weights_by_key.items()
+                             if w != 0 and k not in set(pnl_column_keys)]
+        if _dropped_weighted:
+            warnings.warn(
+                f"{len(_dropped_weighted)} weighted leg(s) have no P&L column "
+                f"(price data missing) — their weight is NOT deployed in this "
+                f"backtest: {sorted(map(str, _dropped_weighted))[:10]}",
+                stacklevel=2,
+            )
         # Step 2: Apply missing data policy (all numpy)
         policy = self.config.missing_data_policy
         if policy == MissingDataPolicy.FILL_ZERO:
@@ -799,9 +832,17 @@ class DispersionDataLoader:
         self._calc = SwapCalculator(config)
         self._logger = logger or (lambda level, msg: None)
 
-    def load(self, basket: BasketInput) -> Dict:
+    def load(self, basket: BasketInput, end_date: Optional[date] = None,
+             compute_leg_metrics: bool = True) -> Dict:
         """
         Load all data needed for optimization and backtesting.
+        Args:
+            end_date: optional cutoff for the per-leg metadata stats (the
+                optimizer passes its window end so leg.metrics never embeds
+                post-cutoff data). Does not truncate the returned price frames.
+            compute_leg_metrics: set False to skip the per-leg rolling-kernel
+                metadata pass (~doubles load time for large universes) when
+                leg.metrics is not consumed.
         Returns:
             {
                 'variance_px': pd.DataFrame (Variance Asset prices, union calendar),
@@ -818,7 +859,8 @@ class DispersionDataLoader:
             variance_px = self._fetch_standard(all_legs, start)
             corridor_px = None
         # Compute per-leg metrics
-        self._compute_metrics(all_legs, variance_px, corridor_px)
+        if compute_leg_metrics:
+            self._compute_metrics(all_legs, variance_px, corridor_px, end_date=end_date)
         return {
             "variance_px": variance_px,
             "corridor_px": corridor_px,
@@ -927,20 +969,38 @@ class DispersionDataLoader:
         return variance_px.sort_index(), corridor_px.sort_index() if not corridor_px.empty else pd.DataFrame()
 
     def _compute_metrics(
-        self, legs: List[DispersionLeg], variance_px: pd.DataFrame, corridor_px: Optional[pd.DataFrame]
+        self, legs: List[DispersionLeg], variance_px: pd.DataFrame, corridor_px: Optional[pd.DataFrame],
+        end_date: Optional[date] = None,
     ):
-        """Populate each leg's .metrics dict with backtest stats."""
+        """Populate each leg's .metrics dict with backtest stats.
+
+        Prices are sliced at ``end_date`` (when given) so stats never embed
+        post-cutoff data.  Cross-corridor pairs are aligned on their SHARED
+        calendar (joint dropna — independent dropna would pair the variance
+        price of one date with the corridor price of another).
+        """
+        if end_date is not None:
+            cutoff = pd.Timestamp(end_date).normalize()
+            variance_px = variance_px[variance_px.index.normalize() <= cutoff]
+            if corridor_px is not None:
+                corridor_px = corridor_px[corridor_px.index.normalize() <= cutoff]
         for leg in legs:
             if leg.variance_asset not in variance_px.columns:
                 leg.metrics = {"last_value": 0, "avg_5y": 0, "avg_3y": 0, "hit_ratio": 50, "max_drawdown": 0}
                 continue
 
-            prices = variance_px[leg.variance_asset].dropna().values.astype(np.float64)
-            # Determine corridor prices for cross-corridor
+            # Determine corridor prices for cross-corridor — aligned jointly
             corridor_prices = None
-            if self.config.is_cross_corridor and leg.corridor_condition_asset and corridor_px is not None:
-                if leg.corridor_condition_asset in corridor_px.columns:
-                    corridor_prices = corridor_px[leg.corridor_condition_asset].dropna().values.astype(np.float64)
+            if (self.config.is_cross_corridor and leg.corridor_condition_asset
+                    and corridor_px is not None
+                    and leg.corridor_condition_asset in corridor_px.columns):
+                pair = pd.concat(
+                    [variance_px[leg.variance_asset],
+                     corridor_px[leg.corridor_condition_asset]], axis=1).dropna()
+                prices = pair.iloc[:, 0].values.astype(np.float64)
+                corridor_prices = pair.iloc[:, 1].values.astype(np.float64)
+            else:
+                prices = variance_px[leg.variance_asset].dropna().values.astype(np.float64)
             if len(prices) < self.config.n_exp + 1:
                 leg.metrics = {"last_value": 0, "avg_5y": 0, "avg_3y": 0, "hit_ratio": 50, "max_drawdown": 0}
                 continue

@@ -19,9 +19,11 @@ a Linear Program (solved via ``scipy.optimize.linprog`` in microseconds).
 For mixed/non-linear metrics, SLSQP with multi-start is used.  The problem
 dimension = |S| (typically 3–8), so it converges in milliseconds.
 
-Cache key = ``tuple(sorted(stock_indices))`` so that the same stock subset
-always hits the same cache entry regardless of input ordering, and cached
-weights are returned in the canonical sorted order.
+Cache key = ``(tuple(sorted(stock_indices)), tol, missing_data_policy,
+context digest)`` where the digest hashes the strikes / per-stock-bounds /
+vega arrays — so the same subset solved under a different tolerance, policy
+or constraint context never hits a stale entry, and cached weights are
+returned in the canonical sorted order.
 """
 
 from __future__ import annotations
@@ -207,8 +209,13 @@ class _SolverTuning:
 #: Module-level defaults — the solver reads THIS object.
 SOLVER_TUNING = _SolverTuning()
 
+#: Debug flag (default off): when True, ``_solve_concave_blend`` runs a
+#: cross-check LP against ``_solve_min_payoff_lp`` for near-min_payoff-only
+#: configs.  Costs one extra HiGHS solve per concave-blend call.
+CONCAVE_BLEND_SANITY_CHECK = False
 
-def project_to_bounded_simplex(w: np.ndarray, lb: np.ndarray, ub: np.ndarray) -> np.ndarray:
+
+def project_to_bounded_simplex(w: np.ndarray, lb: np.ndarray, ub: np.ndarray) -> Optional[np.ndarray]:
     """THE canonical projection onto {w : Σw = 1, lb <= w <= ub}.
 
     Iterative clipping: clip to the box, then redistribute the excess/deficit
@@ -216,7 +223,18 @@ def project_to_bounded_simplex(w: np.ndarray, lb: np.ndarray, ub: np.ndarray) ->
     <= 2n iterations.  Single implementation for the whole engine (GA weight
     derivation, LP numerical cleanup, sweep candidates, smoothing starts,
     safety-net) — the historical optimizer-side duplicate is gone.
+
+    Returns ``None`` when the box is infeasible for sum=1 (Σlb > 1 or
+    Σub < 1, or no free mass remains to redistribute) — callers must treat
+    that as a hard failure instead of receiving silently normalised,
+    bound-violating weights.
     """
+    lb = np.asarray(lb, dtype=np.float64)
+    ub = np.asarray(ub, dtype=np.float64)
+    if (np.any(lb > ub + 1e-12) or not np.all(np.isfinite(lb))
+            or not np.all(np.isfinite(ub))
+            or float(lb.sum()) > 1.0 + 1e-9 or float(ub.sum()) < 1.0 - 1e-9):
+        return None
     w = np.clip(np.asarray(w, dtype=np.float64), lb, ub)
     for _ in range(len(w) * 2):
         s = w.sum()
@@ -230,12 +248,16 @@ def project_to_bounded_simplex(w: np.ndarray, lb: np.ndarray, ub: np.ndarray) ->
             # Need to increase — only variables below their ub can increase
             free = w < ub - 1e-12
         if not free.any():
-            # Infeasible — just normalize (shouldn't happen with valid bounds)
-            w = w / s
-            break
-        # Distribute proportionally among free variables
-        adjustment = excess * (w[free] / w[free].sum())
-        w[free] -= adjustment
+            # No variable can move toward sum=1 — the box is infeasible.
+            return None
+        free_sum = float(w[free].sum())
+        if free_sum <= 1e-12:
+            # Free variables carry no mass — proportional redistribution
+            # would divide by zero; spread the adjustment equally instead.
+            w[free] -= excess / float(free.sum())
+        else:
+            # Distribute proportionally among free variables
+            w[free] -= excess * (w[free] / free_sum)
         w = np.clip(w, lb, ub)
     return w
 
@@ -273,6 +295,31 @@ def concave_blend_value(pnl: np.ndarray, lam_min: float, lam_mean: float,
         tail = pnl[-k_carry:] if k_carry <= len(pnl) else pnl
         val += lam_carry * float(np.mean(tail))
     return val
+
+
+def _context_digest(arr: Optional[np.ndarray]) -> int:
+    """Content hash of a constraint-context array for the solver cache key.
+
+    Order-sensitive and NaN-safe (hashes the raw float64 bytes), so two
+    subsets solved with different strikes/per-stock bounds never share a
+    cache entry.  ``None`` hashes to a constant.
+    """
+    if arr is None:
+        return 0
+    a = np.ascontiguousarray(np.asarray(arr, dtype=np.float64))
+    return hash((a.shape, a.tobytes()))
+
+
+def _step_score_from_raw(score_fn: "ScoreFunction", raw: Dict[str, float]) -> float:
+    """Step-normalised aggregate from an already-computed raw dict.
+
+    Mirrors the normalise+aggregate half of ``ScoreFunction.score`` so the
+    solver can evaluate the raw metrics ONCE per P&L series and derive both
+    the step score and the scalarised tie-break from it (previously the
+    series was scored twice: ``score()`` then ``raw_metrics()``).
+    """
+    normalized = score_fn._normalize(raw, smooth=False)
+    return score_fn._aggregator.aggregate(normalized, score_fn.weights.to_dict())
 
 
 # ---------------------------------------------------------------------------
@@ -412,8 +459,8 @@ class WeightSolver:
         self._rng = np.random.default_rng(seed)
         self._log = logger or (lambda l, m: None)
         self._missing_data_policy = missing_data_policy  # "adaptive_reweight", "fill_zero", "drop_incomplete"
-        # Cache keyed by sorted tuple of global stock indices
-        self._cache: Dict[Tuple[int, ...], WeightSolverResult] = {}
+        # Cache keyed by (sorted stock indices, tol, policy, context digest)
+        self._cache: Dict[Tuple, WeightSolverResult] = {}
         self._cache_hits: int = 0
         self._cache_misses: int = 0
         # Warm-start cache for bisection f_star values
@@ -423,8 +470,9 @@ class WeightSolver:
         self._log("DEBUG", f"[WEIGHT-SOLVER] MetricWeights={dict(score_fn.weights.items())} policy={missing_data_policy}")
 
     def clear_cache(self) -> None:
-        """Clear the memoisation cache."""
+        """Clear the memoisation cache and the bisection warm-start cache."""
         self._cache.clear()
+        self._fstar_cache.clear()
 
     #: Canonical bounded-simplex projection (module-level single source of truth)
     _project_to_bounded_simplex = staticmethod(project_to_bounded_simplex)
@@ -541,30 +589,63 @@ class WeightSolver:
 
     def _vega_choose_V(self, w: np.ndarray, vega: VegaSpec,
                        lam_a: float, lam_b: float) -> Optional[Tuple[float, float, float]]:
-        """Deterministic 1-D choice of the basket total V for given weights w.
+        """Deterministic exact 1-D choice of the basket total V for given w.
 
-        V ranges over a fixed 33-point grid on [v_min, min(v_max, cap-bound)]
-        where cap-bound = min_i cap_i / w_i guarantees v_i = w_i·V <= cap_i by
-        construction.  Picks the V maximising lam_a·A + lam_b·B (first/lowest
-        V wins ties — deterministic).  Returns (V, A, B), or None when caps
-        make every V < v_min (the subset cannot hold the minimum package).
+        With cleaned(V) = Σ min(w_i·V, t_i) — piecewise linear with
+        breakpoints at V = t_i/w_i — the objective lam_a·A + lam_b·B
+        (A = cleaned/T, B = cleaned/V) is, on every piece between consecutive
+        breakpoints, of the form  lam_a·(s·V + S_t)/T + lam_b·(s + S_t/V)
+        with s = Σ unsaturated w_i and S_t = Σ saturated t_i: concave, so its
+        maximum on [v_min, min(v_max, cap-bound)] is attained at an endpoint,
+        a breakpoint, or a per-piece stationary point
+        V* = sqrt(lam_b·S_t·T / (lam_a·s)) (only when both axe criteria are
+        active).  Evaluating exactly those ≤ 2n+3 candidates replaces the
+        historical 33-point grid with an exact deterministic pick (first/
+        lowest V wins ties — unchanged).  The cap-bound min_i cap_i/w_i
+        guarantees v_i = w_i·V <= cap_i by construction.  Returns (V, A, B),
+        or None when caps make every V < v_min (the subset cannot hold the
+        minimum package).
         """
         w = np.asarray(w, dtype=np.float64)
         with np.errstate(divide="ignore"):
             ratios = np.where(w > 1e-12, vega.caps / np.maximum(w, 1e-12), np.inf)
         v_cap = float(np.min(ratios)) if ratios.size else float("inf")
         v_hi = min(float(vega.v_max), v_cap)
-        if v_hi < float(vega.v_min) - 1e-9:
+        v_lo = float(vega.v_min)
+        if v_hi < v_lo - 1e-9:
             return None
-        grid = np.linspace(float(vega.v_min), v_hi, SOLVER_TUNING.vega_grid_points)
+        targets = np.asarray(vega.targets, dtype=np.float64)
+        with np.errstate(divide="ignore"):
+            bps = np.where(w > 1e-12, targets / np.maximum(w, 1e-12), np.inf)
+        cands = {v_lo, v_hi}
+        for bp in bps:
+            if np.isfinite(bp) and v_lo < float(bp) < v_hi:
+                cands.add(float(bp))
+        # Interior stationary points (only reachable when both axe criteria
+        # carry weight — with a single one the objective is monotone per
+        # piece and the max sits on a breakpoint/endpoint).
+        if lam_a > 0.0 and lam_b > 0.0 and vega.t_total > 0.0:
+            cuts = sorted(cands)
+            for j in range(len(cuts) - 1):
+                lo_j, hi_j = cuts[j], cuts[j + 1]
+                if hi_j - lo_j <= 1e-12:
+                    continue
+                mid = 0.5 * (lo_j + hi_j)
+                unsat = bps > mid
+                s = float(w[unsat].sum())
+                s_t = float(targets[~unsat].sum())
+                if s > 1e-12 and s_t > 1e-12:
+                    v_star = math.sqrt(lam_b * s_t * float(vega.t_total) / (lam_a * s))
+                    if lo_j < v_star < hi_j:
+                        cands.add(v_star)
         # Tie preference: with B active, ties break toward the LOWEST V
         # (recycled fraction favours small packages); otherwise toward the
         # LARGEST V (max-clean spirit: A is nondecreasing in V, and a basket
         # with no axes takes the largest feasible package).
         prefer_low = lam_b > 0.0
         best = None
-        for V in grid:
-            a, b = self._axe_fracs(w * V, vega.targets, vega.t_total)
+        for V in sorted(cands):
+            a, b = self._axe_fracs(w * V, targets, vega.t_total)
             val = (lam_a * (a if np.isfinite(a) else 0.0)
                    + lam_b * (b if np.isfinite(b) else 0.0))
             if best is None:
@@ -730,7 +811,8 @@ class WeightSolver:
             bounds, with positions indexing into the CALLER's stock_indices
             order (hi=None = no cap).  Must be a deterministic function of
             the subset (bucket membership) — the cache is keyed on the
-            subset only.
+            subset plus solve context (tol, policy, strikes, bounds, vega),
+            not on the bucket bounds themselves.
 
         Returns
         -------
@@ -740,11 +822,23 @@ class WeightSolver:
         n = len(stock_indices)
         c = self._constraints
 
-        # Canonical cache key: sorted tuple of indices
+        # Canonical cache key: sorted tuple of indices + solve context.
+        # tol / missing-data policy / strikes / per-stock bounds / vega all
+        # change the answer — a fine or policy-switched solve must never be
+        # served a GA-tolerance entry of the same subset.
         sorted_indices = tuple(sorted(int(i) for i in stock_indices))
-        if sorted_indices in self._cache:
+        vega_digest = 0
+        if vega is not None:
+            vega_digest = hash((
+                _context_digest(vega.targets), _context_digest(vega.caps),
+                float(vega.v_min), float(vega.v_max), float(vega.t_total),
+            ))
+        cache_key = (sorted_indices, tol, self._missing_data_policy,
+                     _context_digest(strikes), _context_digest(per_stock_bounds),
+                     vega_digest)
+        if cache_key in self._cache:
             self._cache_hits += 1
-            cached = self._cache[sorted_indices]
+            cached = self._cache[cache_key]
             # Remap weights from sorted order to caller's order if needed
             if tuple(int(i) for i in stock_indices) != sorted_indices:
                 idx_to_sorted_pos = {v: pos for pos, v in enumerate(sorted_indices)}
@@ -761,14 +855,15 @@ class WeightSolver:
 
         # Feasibility check (weight bounds + strike constraint + group floors)
         self._cache_misses += 1
-        if not self._is_feasible(n, strikes, group_bounds=group_bounds):
+        if not self._is_feasible(n, strikes, group_bounds=group_bounds,
+                                 per_stock_bounds=per_stock_bounds):
             result = WeightSolverResult(
                 weights=np.full(n, 1.0 / n),
                 score=-np.inf,
                 feasible=False,
                 n_evals=0,
             )
-            self._cache[sorted_indices] = result
+            self._cache[cache_key] = result
             return result
 
         # Compute full-active-day mask for LP paths (rows where ALL selected legs have data)
@@ -889,7 +984,7 @@ class WeightSolver:
                 result = dataclasses.replace(result, extra=_extra)
 
         # Cache in sorted order
-        self._cache[sorted_indices] = result
+        self._cache[cache_key] = result
 
         # Return in caller's order
         if sort_perm is not None:
@@ -996,13 +1091,17 @@ class WeightSolver:
     # --- Feasibility ---
 
     def _is_feasible(self, n: int, strikes: Optional[np.ndarray] = None,
-                     group_bounds=None) -> bool:
+                     group_bounds=None,
+                     per_stock_bounds: Optional[np.ndarray] = None) -> bool:
         """Check if constraint set is feasible for n stocks.
 
         Validates:
         - min_weight * n <= 1 (sum=1 achievable with lower bounds)
         - max_weight * n >= 1 (sum=1 achievable with upper bounds)
-        - max_net_strike achievable (if strikes provided)
+        - per-stock bounds (if provided): finite, lb_i <= ub_i,
+          Σlb <= 1 <= Σub
+        - max_net_strike achievable (if strikes provided); NaN/inf strikes
+          cannot certify the cap and fail the check
         - per-bucket weight floors sum to <= 1 (quick necessary condition;
           the LP itself is the full arbiter)
         """
@@ -1011,9 +1110,23 @@ class WeightSolver:
             return False
         if c.max_weight * n < 1.0 - 1e-9:
             return False
+        # Per-stock box feasibility: lb_i <= ub_i and Σlb <= 1 <= Σub
+        if per_stock_bounds is not None:
+            psb = np.asarray(per_stock_bounds, dtype=np.float64)
+            if psb.shape != (n, 2) or not np.all(np.isfinite(psb)):
+                return False
+            if np.any(psb[:, 0] > psb[:, 1] + 1e-9):
+                return False
+            if float(psb[:, 0].sum()) > 1.0 + 1e-9:
+                return False
+            if float(psb[:, 1].sum()) < 1.0 - 1e-9:
+                return False
         # Strike feasibility: if ALL stocks have strike > max_net_strike,
-        # then weighted avg > max_net_strike for ANY w with sum=1
+        # then weighted avg > max_net_strike for ANY w with sum=1.  NaN/inf
+        # strikes must not silently pass — the cap is uncertifiable.
         if strikes is not None and c.max_net_strike is not None and len(strikes) > 0:
+            if not np.all(np.isfinite(strikes)):
+                return False
             if np.all(strikes > c.max_net_strike + 1e-9):
                 return False
         if group_bounds:
@@ -1163,6 +1276,9 @@ class WeightSolver:
 
         # ── Starting point: equal-weight projected to bounded simplex ──
         w0 = self._project_to_bounded_simplex(target.copy(), lb, ub)
+        if w0 is None:
+            _engine_log.debug("[SMOOTH] infeasible weight box — weights unchanged")
+            return w_star
 
         # ── QP objective: minimize ||w - 1/n||^2 ──
         def objective(w):
@@ -1215,6 +1331,8 @@ class WeightSolver:
                 w_cand = w_cand / w_cand.sum()
                 # Cleanup: project to bounded simplex for numerical precision
                 w_cand = self._project_to_bounded_simplex(w_cand, lb, ub)
+                if w_cand is None:
+                    continue
                 cand_pnl = _adaptive_pnl(w_cand)
                 actual_min = float(np.min(cand_pnl))
                 actual_blend = _raw_blend(cand_pnl, w_cand)
@@ -1271,9 +1389,10 @@ class WeightSolver:
         D = sub_pnl.shape[0]
 
         if D < 2:
-            raise RuntimeError(
-                f"Concave blend LP: insufficient non-zero rows ({D}) after filtering."
-            )
+            self._log("WARNING",
+                      f"[WEIGHT-SOLVER] concave_blend LP: insufficient non-zero rows ({D}) after filtering.")
+            return WeightSolverResult(weights=np.full(n, 1.0 / n), score=-np.inf,
+                                      feasible=False, n_evals=0)
 
         use_t = lam_min > 1e-12  # include auxiliary variable t only if min_payoff active
         n_vars = n + 1 if use_t else n
@@ -1375,19 +1494,24 @@ class WeightSolver:
         w_optimal = res.x[:n]
 
         # Numerical cleanup — project onto simplex (skipped with bucket
-        # bounds: the iterative projection is group-blind)
+        # bounds: the iterative projection is group-blind).  A None
+        # projection (infeasible box) cannot follow a successful LP — keep
+        # the raw LP point in that case.
         if not group_bounds:
             if per_stock_bounds is not None:
-                w_optimal = self._project_to_bounded_simplex(w_optimal, per_stock_bounds[:, 0], per_stock_bounds[:, 1])
+                w_proj = self._project_to_bounded_simplex(w_optimal, per_stock_bounds[:, 0], per_stock_bounds[:, 1])
             else:
-                w_optimal = self._project_to_bounded_simplex(w_optimal, np.full(n, c.min_weight), np.full(n, c.max_weight))
+                w_proj = self._project_to_bounded_simplex(w_optimal, np.full(n, c.min_weight), np.full(n, c.max_weight))
+            if w_proj is not None:
+                w_optimal = w_proj
 
         # Compute final net_pnl and score
         net_pnl = sub_pnl @ w_optimal
         score = self._score_fn.score(net_pnl, self._ctx)
 
-        # Sanity check: if this is effectively min_payoff-only, verify consistency
-        if lam_min > 0.999 and lam_mean < 1e-9 and lam_carry < 1e-9:
+        # Sanity check (debug only — costs one extra LP per call): if this
+        # is effectively min_payoff-only, verify consistency.
+        if CONCAVE_BLEND_SANITY_CHECK and lam_min > 0.999 and lam_mean < 1e-9 and lam_carry < 1e-9:
             achieved_min = float(np.min(net_pnl))
             try:
                 ref_result = self._solve_min_payoff_lp(sub_pnl, strikes, n, per_stock_bounds)
@@ -1475,23 +1599,25 @@ class WeightSolver:
         )
 
         if not res.success:
-            if group_bounds:
-                # With bucket bounds an equal-weight fallback may violate the
-                # groups — infeasible must surface, not degrade silently.
-                return WeightSolverResult(weights=np.full(n, 1.0 / n), score=-np.inf,
-                                          feasible=False, n_evals=n)
-            w = np.full(n, 1.0 / n)
-        else:
-            w = res.x
+            # LP failed — an equal-weight fallback may violate the strike
+            # cap, per-stock bounds or bucket bounds: infeasible must
+            # surface, not degrade silently.
+            return WeightSolverResult(weights=np.full(n, 1.0 / n), score=-np.inf,
+                                      feasible=False, n_evals=n)
+        w = res.x
 
         # Numerical cleanup — project onto simplex respecting per-stock bounds
         # (skip when bucket bounds are active: the iterative projection is
-        # group-blind and could push the LP optimum out of the bucket box)
+        # group-blind and could push the LP optimum out of the bucket box).
+        # A None projection (infeasible box) cannot follow a successful LP —
+        # keep the raw LP point in that case.
         if not group_bounds:
             if per_stock_bounds is not None:
-                w = self._project_to_bounded_simplex(w, per_stock_bounds[:, 0], per_stock_bounds[:, 1])
+                w_proj = self._project_to_bounded_simplex(w, per_stock_bounds[:, 0], per_stock_bounds[:, 1])
             else:
-                w = self._project_to_bounded_simplex(w, np.full(n, c.min_weight), np.full(n, c.max_weight))
+                w_proj = self._project_to_bounded_simplex(w, np.full(n, c.min_weight), np.full(n, c.max_weight))
+            if w_proj is not None:
+                w = w_proj
 
         # Final score with STEP-function normalisation
         net_pnl = sub_pnl @ w
@@ -1517,6 +1643,10 @@ class WeightSolver:
         For fixed floor f, the constraint adaptive_pnl_d >= f rewrites as:
             sum_i active[d,i] * w_i * (pnl[d,i] - f) >= 0   (linear in w)
         Bisect on f to find the maximum feasible floor.
+
+        The bracket's lower end and the returned weights are always
+        certified by feasibility LPs — an uncertified incumbent is never
+        returned as ``feasible=True``.
         """
         c = self._constraints
         n_days, n_stocks = sub_pnl.shape
@@ -1538,6 +1668,7 @@ class WeightSolver:
 
         # hi: max over all days of max per-stock pnl (upper bound on achievable floor)
         hi = float(np.nanmax(pnl_active[mask_active])) if mask_active.any() else 0.0
+        hi_cold = hi  # un-narrowed bracket end (warm-start fallback)
 
         # Warm-start from cache (parent's f_star or global best)
         if cache_key is not None and cache_key in self._fstar_cache:
@@ -1608,42 +1739,10 @@ class WeightSolver:
             b_strike_val = np.concatenate(_extra_b_rows)
 
         # Bisection
-        best_w = eq_w.copy()
+        best_w: Optional[np.ndarray] = None  # set only by an LP-certified feasible point
         n_lps = 0
         max_iters = (SOLVER_TUNING.bisect_iters_ga if tol >= SOLVER_TUNING.bisect_tol_ga / 2
                      else SOLVER_TUNING.bisect_iters_fine)
-
-        # DIAGNOSTIC: if fine tolerance, sanity-check that incumbent weights are feasible
-        if tol < SOLVER_TUNING.bisect_tol_ga / 2 and per_stock_bounds is not None:
-            # Test feasibility at the incumbent's adaptive min (should always pass)
-            inc_f = adaptive_eq - 1e-6
-            A_test = -M1_sparse + inc_f * M2_sparse
-            if A_strike_sparse is not None:
-                from scipy.sparse import vstack as sparse_vstack
-                A_test = sparse_vstack([A_test, A_strike_sparse], format='csr')
-                b_test = np.empty(n_active_days + n_extra, dtype=np.float64)
-                b_test[:n_active_days] = 0.0
-                b_test[n_active_days:] = b_strike_val
-            else:
-                b_test = np.zeros(n_active_days, dtype=np.float64)
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                sanity_res = linprog(
-                    c=np.zeros(n, dtype=np.float64),
-                    A_ub=A_test, b_ub=b_test,
-                    A_eq=A_eq, b_eq=b_eq, bounds=w_bounds, method="highs",
-                )
-            sanity_ok = sanity_res.success
-            if not sanity_ok:
-                # Find first violated constraint at equal weights
-                viol_vals = (A_test @ eq_w) - b_test[:A_test.shape[0]]
-                violated_days = np.where(viol_vals > 1e-9)[0]
-                first_viol = int(violated_days[0]) if len(violated_days) > 0 else -1
-                active_cols_on_day = np.where(mask_active[first_viol])[0] if first_viol >= 0 and first_viol < n_active_days else []
-                self._log("WARN", f"[BISECT-SANITY] incumbent_f={inc_f:.4f} feasible=False first_violated_day={first_viol} active_cols={list(active_cols_on_day)}")
-                _engine_log.debug(f"[BISECT-SANITY] incumbent_f={inc_f:.4f} feasible=False first_violated_day={first_viol} active_cols={list(active_cols_on_day)}")
-            else:
-                self._log("DEBUG", f"[BISECT-SANITY] incumbent_f={inc_f:.4f} feasible=True")
 
         def _check_feasibility(f: float) -> Tuple[bool, Optional[np.ndarray]]:
             nonlocal n_lps
@@ -1672,6 +1771,48 @@ class WeightSolver:
                 return True, res.x.copy()
             return False, None
 
+        # Certify the bracket: lo must be an LP-feasible floor.  A warm-started
+        # or equal-weight lower end that no feasible weight achieves would make
+        # every probe infeasible and the returned incumbent meaningless.
+        # Probe a hair below lo (the floor value itself is borderline by
+        # construction when it comes from an achieved adaptive min).
+        _slack = 1e-9 * max(1.0, abs(lo))
+        feasible, w_cand = _check_feasibility(lo - _slack)
+        if feasible:
+            best_w = w_cand
+        else:
+            # Drop the warm-start narrowing entirely and retry the cold bracket.
+            lo, hi = adaptive_eq, hi_cold
+            _slack = 1e-9 * max(1.0, abs(lo))
+            feasible, w_cand = _check_feasibility(lo - _slack)
+            if feasible:
+                best_w = w_cand
+            elif A_strike_sparse is not None:
+                # The equal-weight point itself is infeasible (binding strike
+                # cap / per-stock bounds): anchor lo at ANY feasible weight
+                # from a plain feasibility LP (sum=1 + strike + group rows).
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    anchor = linprog(
+                        c=np.zeros(n, dtype=np.float64),
+                        A_ub=A_strike_sparse, b_ub=b_strike_val,
+                        A_eq=A_eq, b_eq=b_eq, bounds=w_bounds, method="highs",
+                    )
+                n_lps += 1
+                if anchor.success:
+                    best_w = anchor.x.copy()
+                    lo = self._eval_adaptive_min(pnl_active, mask_active, best_w)
+            if best_w is None:
+                self._log("DEBUG", "[BISECT] no feasible point — subset rejected")
+                return WeightSolverResult(weights=eq_w, score=-np.inf, feasible=False, n_evals=n_lps)
+
+        # Cold brackets can be far wider than tol — scale iterations to the
+        # final bracket width (capped at the fine budget) instead of
+        # mis-estimating the floor on wide cold starts.
+        if hi > lo:
+            width_iters = int(math.ceil(math.log2((hi - lo) / max(tol, 1e-12)))) + 1
+            max_iters = max(max_iters, min(width_iters, SOLVER_TUNING.bisect_iters_fine))
+
         for _ in range(max_iters):
             if hi - lo < tol:
                 break
@@ -1684,7 +1825,7 @@ class WeightSolver:
                 hi = mid
 
         self._bisect_lp_count += n_lps
-        f_star = lo
+        f_star = lo  # certified: best_w is an LP-feasible point with floor >= lo - slack
 
         if cache_key is not None:
             self._fstar_cache[cache_key] = f_star
@@ -1693,9 +1834,11 @@ class WeightSolver:
         # skipped when bucket bounds are active — LP output already honours them)
         if not group_bounds:
             if per_stock_bounds is not None:
-                best_w = self._project_to_bounded_simplex(best_w, per_stock_bounds[:, 0], per_stock_bounds[:, 1])
+                w_proj = self._project_to_bounded_simplex(best_w, per_stock_bounds[:, 0], per_stock_bounds[:, 1])
             else:
-                best_w = self._project_to_bounded_simplex(best_w, np.full(n, c.min_weight), np.full(n, c.max_weight))
+                w_proj = self._project_to_bounded_simplex(best_w, np.full(n, c.min_weight), np.full(n, c.max_weight))
+            if w_proj is not None:
+                best_w = w_proj
 
         # Recompute actual adaptive min after projection
         f_actual = self._eval_adaptive_min(pnl_active, mask_active, best_w)
@@ -1802,9 +1945,11 @@ class WeightSolver:
             w_opt = res.x
             if not group_bounds:
                 if per_stock_bounds is not None:
-                    w_opt = self._project_to_bounded_simplex(w_opt, per_stock_bounds[:, 0], per_stock_bounds[:, 1])
+                    w_proj = self._project_to_bounded_simplex(w_opt, per_stock_bounds[:, 0], per_stock_bounds[:, 1])
                 else:
-                    w_opt = self._project_to_bounded_simplex(w_opt, np.full(n, c.min_weight), np.full(n, c.max_weight))
+                    w_proj = self._project_to_bounded_simplex(w_opt, np.full(n, c.min_weight), np.full(n, c.max_weight))
+                if w_proj is not None:
+                    w_opt = w_proj
 
             adaptive_pnl = self._eval_adaptive_series(sub_pnl, active_mask_sub, w_opt)
             score = self._score_fn.score(adaptive_pnl, self._ctx)
@@ -1965,9 +2110,11 @@ class WeightSolver:
         # (group-blind projection is skipped when bucket bounds are active)
         if not group_bounds:
             if per_stock_bounds is not None:
-                w_optimal = self._project_to_bounded_simplex(w_optimal, per_stock_bounds[:, 0], per_stock_bounds[:, 1])
+                w_proj = self._project_to_bounded_simplex(w_optimal, per_stock_bounds[:, 0], per_stock_bounds[:, 1])
             else:
-                w_optimal = self._project_to_bounded_simplex(w_optimal, np.full(n, c.min_weight), np.full(n, c.max_weight))
+                w_proj = self._project_to_bounded_simplex(w_optimal, np.full(n, c.min_weight), np.full(n, c.max_weight))
+            if w_proj is not None:
+                w_optimal = w_proj
 
         # Recompute t after projection (may be lower due to projection)
         net_pnl = sub_pnl @ w_optimal
@@ -2119,30 +2266,39 @@ class WeightSolver:
                         {"type": "ineq",
                          "fun": lambda w, _p=pos, _lo=float(lo): float(np.sum(w[_p])) - _lo})
 
+        # Per-stock bound vectors — the ACTUAL box, used for starts, the
+        # greedy start, candidate projection and final cleanup.
+        if per_stock_bounds is not None:
+            lb = per_stock_bounds[:, 0]
+            ub = per_stock_bounds[:, 1]
+        else:
+            lb = np.full(n, c.min_weight)
+            ub = np.full(n, c.max_weight)
+
         # Multi-start
         best_w = np.full(n, 1.0 / n)
         best_score = -np.inf
 
-        starts = self._generate_starts(n)
+        starts = self._generate_starts(n, lb, ub, sweep_key)
 
         # Greedy start: max weight on the stock with best mean P&L
-        greedy_w = np.full(n, c.min_weight)
+        greedy_w = lb.copy()
         remaining = 1.0 - greedy_w.sum()
         best_stock = np.argmax(col_means)
-        add = min(remaining, c.max_weight - greedy_w[best_stock])
+        add = min(remaining, ub[best_stock] - greedy_w[best_stock])
         greedy_w[best_stock] += add
         remaining -= add
         if remaining > 1e-9:
             for i in np.argsort(-col_means):
                 if i == best_stock:
                     continue
-                a = min(remaining, c.max_weight - greedy_w[i])
+                a = min(remaining, ub[i] - greedy_w[i])
                 greedy_w[i] += a
                 remaining -= a
                 if remaining < 1e-12:
                     break
-        # Clip greedy start into bounds to avoid scipy warning
-        greedy_w = np.clip(greedy_w, c.min_weight, c.max_weight)
+        # Clip greedy start into the actual box to avoid scipy warning
+        greedy_w = np.clip(greedy_w, lb, ub)
         greedy_w = greedy_w / greedy_w.sum()
         starts.append(greedy_w)
 
@@ -2161,33 +2317,37 @@ class WeightSolver:
                     if score_val > best_score:
                         best_score = score_val
                         best_w = res.x.copy()
-            except Exception:
+            except Exception as exc:
+                _engine_log.debug(f"[WEIGHT-SOLVER] SLSQP start failed: {exc}")
                 continue
 
-        # Ensure constraints are satisfied numerically
-        best_w = np.clip(best_w, c.min_weight, c.max_weight)
-        best_w = best_w / best_w.sum()
-
-        # ── Per-stock bound vectors (for projection of sweep candidates) ──
-        if per_stock_bounds is not None:
-            lb = per_stock_bounds[:, 0]
-            ub = per_stock_bounds[:, 1]
-        else:
-            lb = np.full(n, c.min_weight)
-            ub = np.full(n, c.max_weight)
+        # Ensure constraints are satisfied numerically — clip into the ACTUAL
+        # (per-stock) box, then route through the canonical projection instead
+        # of silently normalising into bound violations.
+        best_w = np.clip(best_w, lb, ub)
+        _bw_sum = float(best_w.sum())
+        if _bw_sum > 1e-12:
+            best_w = best_w / _bw_sum
+        _bw_proj = self._project_to_bounded_simplex(best_w, lb, ub)
+        if _bw_proj is not None:
+            best_w = _bw_proj
 
         metric_map_all = {m.name: m for m in self._score_fn.metrics}
 
         def _step_eval(w: np.ndarray) -> Optional[Tuple[float, float]]:
-            """(rank_value, step_score) of w, or None if strike-infeasible.
+            """(rank_value, step_score) of w, or None if infeasible.
 
             The quantile step score saturates at 1.0 once a candidate beats
             the whole reference — ranking must then fall back to the
             scalarised raw objective (same tie-break as the GA fitness) or
-            the sweep cannot distinguish top-plateau candidates.
+            the sweep cannot distinguish top-plateau candidates.  Raw metrics
+            are computed ONCE (active names only) and the step score is
+            derived from the same dict.
             """
             if (strikes is not None and c.max_net_strike is not None
                     and float(np.dot(w, strikes)) > c.max_net_strike + 1e-9):
+                return None
+            if np.any(w < lb - 1e-9) or np.any(w > ub + 1e-9):
                 return None
             if not self._groups_satisfied(w, group_bounds):
                 return None
@@ -2202,12 +2362,12 @@ class WeightSolver:
                 _repl["axe_recycled"] = _picked[2]
             net = sub_pnl @ w
             ctx_w = dataclasses.replace(self._ctx, **_repl) if _repl else self._ctx
-            step = self._score_fn.score(net, ctx_w)
+            raw = self._score_fn._compute_raw(net, ctx_w, active_only=True)
+            step = _step_score_from_raw(self._score_fn, raw)
             if math.isnan(step) or math.isinf(step):
                 return None
             if step < SOLVER_TUNING.tiebreak_threshold:
                 return (float(step), float(step))
-            raw = self._score_fn.raw_metrics(net, ctx_w)
             scalar = 0.0
             for name in lam.active_names:
                 v = raw.get(name, float("nan"))
@@ -2229,7 +2389,8 @@ class WeightSolver:
             if proj is not None:
                 cand_ws.append(proj)
         else:
-            cand_ws = [self._project_to_bounded_simplex(best_w.copy(), lb, ub)]
+            _w0_proj = self._project_to_bounded_simplex(best_w.copy(), lb, ub)
+            cand_ws = [_w0_proj] if _w0_proj is not None else []
         sweep_entropy = [self._seed] + ([int(i) for i in sweep_key]
                                         if sweep_key is not None else [n])
         sweep_rng = np.random.default_rng(sweep_entropy)
@@ -2241,6 +2402,8 @@ class WeightSolver:
 
         def _add_candidate(w):
             w2 = self._project_to_bounded_simplex(w, lb, ub)
+            if w2 is None:
+                return  # infeasible box for this candidate — skip, never append
             cand_ws.append(w2)
             if (group_bounds and _proj_budget[0] > 0
                     and not self._groups_satisfied(w2, group_bounds)):
@@ -2307,25 +2470,29 @@ class WeightSolver:
             n_evals=n_evals,
         )
 
-    def _generate_starts(self, n: int) -> list:
-        """Generate feasible starting points for multi-start optimisation."""
-        c = self._constraints
+    def _generate_starts(self, n: int, lb: np.ndarray, ub: np.ndarray,
+                         key: Optional[Tuple[int, ...]] = None) -> list:
+        """Generate feasible starting points for multi-start optimisation.
+
+        Drawn inside the ACTUAL (per-stock) box and seeded per (solver seed,
+        subset key) — reproducible and independent of call order, like the
+        sweep RNG.
+        """
         starts = []
+        entropy = [self._seed] + ([int(i) for i in key] if key is not None else [n])
+        rng = np.random.default_rng(entropy)
 
-        # Start 1: equal weight (always feasible if _is_feasible passed)
-        starts.append(np.full(n, 1.0 / n))
+        # Start 1: equal weight projected into the actual box (1/n can
+        # violate per-stock bounds even when the box itself is feasible)
+        w_eq = self._project_to_bounded_simplex(np.full(n, 1.0 / n), lb, ub)
+        starts.append(w_eq if w_eq is not None else np.full(n, 1.0 / n))
 
-        # Start 2+: random feasible points via Dykstra-style projection
+        # Start 2+: random points in the box, canonically projected
         for _ in range(self._n_restarts - 1):
-            w = self._rng.uniform(c.min_weight, c.max_weight, size=n)
-            # Project onto simplex with box constraints (iterative)
-            for _ in range(20):
-                w = w / w.sum()  # project onto sum=1
-                w = np.clip(w, c.min_weight, c.max_weight)  # project onto box
-                if abs(w.sum() - 1.0) < 1e-10:
-                    break
-            # Final normalization
-            w = w / w.sum()
+            w = rng.uniform(lb, ub, size=n)
+            w = self._project_to_bounded_simplex(w, lb, ub)
+            if w is None:
+                continue
             starts.append(w)
 
         return starts

@@ -95,6 +95,7 @@ class WeightedSum:
         float
             ``Σ weights[n] * normalized[n]`` over all ``n`` with
             ``weights[n] > 0``.  Returns ``0.0`` if no criterion is active.
+            Active criteria missing from ``normalized`` contribute 0.0.
 
         Examples
         --------
@@ -105,7 +106,7 @@ class WeightedSum:
         0.0
         """
         return sum(
-            weights[n] * normalized[n]
+            weights[n] * normalized.get(n, 0.0)
             for n in weights
             if weights[n] > 0
         )

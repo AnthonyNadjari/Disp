@@ -23,7 +23,8 @@
 #
 # RESULTS (user-facing):
 #   - BacktestResult.hit_ratio → PERCENTAGE (65.0 = 65%)
-#   - BacktestResult.max_drawdown → PERCENTAGE, NEGATIVE (-12.5 = 12.5% drop)
+#   - BacktestResult.max_drawdown → RAW P&L UNITS, <= 0 (equity-curve
+#     peak-to-trough, same convention as per_stock_stats)
 #   - SolveResult.results_df → pre-formatted strings ("21.40%")
 #
 # RULE: All conversions happen HERE in _api.py. Internal modules never convert.
@@ -227,6 +228,12 @@ def _df_to_backtest_inputs(df: pd.DataFrame, is_cross_corridor: bool) -> Tuple[L
     for idx, row in df.iterrows():
         var_asset = str(row['Variance Asset']).strip()
         weight_pct = float(row['Weight (%)'])
+        if not np.isfinite(weight_pct):
+            # A NaN weight fails both w>0 and w<0 downstream and the leg would
+            # vanish silently — skip it loudly instead.
+            warnings.warn(f"'{var_asset}': 'Weight (%)' is blank/NaN — leg skipped.",
+                          stacklevel=2)
+            continue
         side = str(row.get('Side', 'long')).strip().lower()
 
         # Strike: percentage → decimal
@@ -499,6 +506,8 @@ def _normalize_vega_arg(vega):
 # ── Prep cache: skip Bloomberg + matrix build when nothing upstream changed ──
 # Single slot, opt-in (cache_prep=True). Key = content hash of every input the
 # pipeline consumes, so any change to the data/config/filters busts it.
+# The calendar DATE is part of the key: identical inputs on a different day
+# must reload market data — a HIT may only serve same-day data.
 _PREP_CACHE: dict = {}
 
 
@@ -507,6 +516,9 @@ def _prep_cache_key(long_df, config, constraints, short_df, start_date, end_date
     import dataclasses as _dc
     import hashlib
     h = hashlib.sha256()
+    # Bust the cache daily: a next-day rerun with identical inputs must not
+    # silently reuse stale prices / a stale P&L matrix.
+    h.update(date.today().isoformat().encode())
     for df in (long_df, short_df):
         if df is None or df.empty:
             h.update(b"~none~")
@@ -600,7 +612,7 @@ def _prepare_optimization_inputs(
     internal_cfg = _to_swap_config(config, start_date=start_date, end_date=end_date)
     loader = DispersionDataLoader(internal_cfg)
     basket = BasketInput(long_candidates=long_legs, short_candidates=short_legs)
-    data = loader.load(basket)
+    data = loader.load(basket, end_date=end_date)
 
     if data["variance_px"].empty:
         empty_ts = pd.DataFrame({"Long Leg": [], "Short Leg": [], "Result": []})
@@ -625,13 +637,6 @@ def _prepare_optimization_inputs(
     # so the optimizer's matrix row 0 matches the backtest curve row 0 exactly.
     variance_px_for_build = variance_px_all
     corridor_px_for_build = corridor_px_all
-    if not start_date and not end_date:
-        # No explicit dates: use lookback window including warm-up buffer
-        lookback_days = int(config.lookback_years * 252) + config.n_exp
-        if len(variance_px_for_build) > lookback_days:
-            variance_px_for_build = variance_px_for_build.iloc[-lookback_days:]
-            if corridor_px_for_build is not None and not corridor_px_for_build.empty:
-                corridor_px_for_build = corridor_px_for_build.iloc[-lookback_days:]
 
     pnl_matrix_full, col_map = _build_pnl_matrix(variance_px_for_build, corridor_px_for_build, legs, config)
 
@@ -639,8 +644,16 @@ def _prepare_optimization_inputs(
     _build_index = variance_px_for_build.index
     if start_date:
         _start_idx = _build_index.searchsorted(pd.Timestamp(start_date), side='left')
-    else:
+    elif end_date:
         _start_idx = 0
+    else:
+        # No explicit dates: default to the last lookback window — sliced AFTER
+        # the full-history build, so the window's first rows have their n_exp
+        # warm-up behind them (truncating prices BEFORE the build would make
+        # the first n_exp window rows NaN and diverge from the delivered
+        # backtest at the boundary).
+        lookback_days = int(config.lookback_years * 252) + config.n_exp
+        _start_idx = max(0, len(_build_index) - lookback_days)
     if end_date:
         _end_idx = _build_index.searchsorted(pd.Timestamp(end_date), side='right')
     else:
@@ -1242,14 +1255,21 @@ def optimize(
                     if (l.corridor_condition_asset
                         if config.cross_corridor and l.corridor_condition_asset
                         else l.variance_asset) in _basket_keys]
+    # Scored window == delivered window: with no explicit user dates the
+    # optimizer scored exactly _optimizer_dates — the delivered backtest must
+    # cover the same span, not the full fetched history.
+    _bt_start = start_date if start_date is not None else (
+        _optimizer_dates[0].date() if len(_optimizer_dates) else None)
+    _bt_end = end_date if end_date is not None else (
+        _optimizer_dates[-1].date() if len(_optimizer_dates) else None)
     bt_result = bt.run_from_optimization(
         variance_px=variance_px_all,
         long_basket=opt_result.long_basket,
         short_basket=opt_result.short_basket,
         legs=_basket_legs,
         corridor_px=corridor_px_all,
-        start_date=start_date,
-        end_date=end_date,
+        start_date=_bt_start,
+        end_date=_bt_end,
     )
     opt_result.backtest = bt_result
 
@@ -1269,7 +1289,13 @@ def optimize(
                 if config.global_cap < 9999998 or config.global_floor > -9999998:
                     s = np.clip(s, config.global_floor, config.global_cap)
                 _bt_ts = bt_result.timeseries if bt_result else None
-                b = _bt_ts["Result"].values if (_bt_ts is not None and "Result" in _bt_ts.columns) else np.array([])
+                # Align on the optimizer window dates — prefix comparison of
+                # misaligned series would cry wolf.
+                if _bt_ts is not None and "Result" in _bt_ts.columns:
+                    b = _bt_ts["Result"].reindex(
+                        pd.DatetimeIndex(_optimizer_dates)).values
+                else:
+                    b = np.array([])
                 s_nz = s[s != 0.0]
                 b_nz = b[b != 0.0] if len(b) > 0 else np.array([])
                 s_min_nz = float(s_nz.min()) if len(s_nz) > 0 else 0.0
@@ -1571,14 +1597,14 @@ def backtest(
         required.append('Corridor Condition Asset')
     _validate_columns(df, required, 'backtest')
 
-    from functions.dispersion._backtester import DispersionDataLoader, DispersionBacktester
+    from functions.dispersion._backtester import DispersionDataLoader, DispersionBacktester, series_key
 
     # ── Step 1: Parse DataFrame ──
     legs, weights = _df_to_backtest_inputs(df, config.cross_corridor)
 
-    # ── Helper for cross-corridor series key ──
+    # ── Cross-corridor series key (canonical helper — single source of truth) ──
     def _series_key(leg):
-        return leg.corridor_condition_asset if config.cross_corridor and leg.corridor_condition_asset else leg.variance_asset
+        return series_key(leg, config.cross_corridor)
 
     # ── Step 2: Load Bloomberg data ──
     internal_cfg = _to_swap_config(config, start_date=start_date)

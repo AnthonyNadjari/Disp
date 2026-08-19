@@ -62,3 +62,10 @@ def test_golden_replay_matches_expected(case):
         f"expected {exp['scoring_signature']} — the scoring inputs "
         f"(metrics/weights/seed/reference geometry) are no longer identical"
     )
+    # Termination regression guard: identical baskets with a wildly different
+    # generation count (stagnation never triggering, or always hitting
+    # max_generations) must not pass silently.
+    assert abs(result.generations_run - exp["generations_run"]) <= 5, (
+        f"[{case}] generations_run drift: got {result.generations_run}, "
+        f"expected {exp['generations_run']} (tol 5)"
+    )

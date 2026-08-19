@@ -163,11 +163,15 @@ def test_smooth_weights_ws_aware_blend_floor_holds():
         p = pnl @ w
         return 0.5 * float(np.mean(p)) - 0.5 * float(np.dot(w, strikes))
 
+    # The blend floor and min-payoff floor must hold unconditionally (they are
+    # trivial at w*, but a broken smoother violating them must fail loudly).
+    assert blend(w_sm) >= blend(w_star) - 4 * eps - 1e-6
+    assert float(np.min(pnl @ w_sm)) >= float(np.min(pnl @ w_star)) - 4 * eps - 1e-6
     if not np.allclose(w_sm, w_star):
-        # accepted smoothing: less dispersed AND the ws-aware blend floor held
+        # accepted smoothing: less dispersed
         assert np.std(w_sm) < np.std(w_star)
-        assert blend(w_sm) >= blend(w_star) - 4 * eps - 1e-6
-        assert float(np.min(pnl @ w_sm)) >= float(np.min(pnl @ w_star)) - 4 * eps - 1e-6
+    else:
+        pytest.skip("smoothing returned w* unchanged (no ladder attempt succeeded)")
 
 
 def test_smooth_weights_optional_metric_blend():
@@ -186,9 +190,11 @@ def test_smooth_weights_optional_metric_blend():
         p = pnl @ w
         return 0.6 * float(np.mean(p)) + 0.4 * CVaR5().compute(p, ctx)
 
+    assert blend(w_sm) >= blend(w_star) - 4 * 0.05 - 1e-6
     if not np.allclose(w_sm, w_star):
         assert np.std(w_sm) < np.std(w_star)
-        assert blend(w_sm) >= blend(w_star) - 4 * 0.05 - 1e-6
+    else:
+        pytest.skip("smoothing returned w* unchanged (no ladder attempt succeeded)")
 
 
 # ---------------------------------------------------------------------------
@@ -312,3 +318,86 @@ def test_legacy_score_weights_param_removed():
     import inspect
     sig = inspect.signature(DispersionOptimizer.__init__)
     assert "score_weights" not in sig.parameters
+
+
+# ---------------------------------------------------------------------------
+# Binding net-strike cap: the bisection must never certify a cap-violating
+# incumbent (regression for the equal-weight fallback / f* cache poisoning)
+# ---------------------------------------------------------------------------
+
+
+def test_bisection_never_certifies_strike_violating_weights():
+    """With a binding strike cap, equal weights violate the cap
+    ([1/3,1/3,1/3]·[0.01,0.05,0.05] = 0.0367 > 0.02). The old bisection
+    seeded its bracket at the equal-weight floor and returned the
+    unvalidated eq-weight incumbent as feasible=True; the fix must return
+    only LP-certified, cap-honouring weights (or infeasible)."""
+    from functions.dispersion.scoring import (
+        MetricWeights, ScoreContext, WeightConstraints, make_default_score_function)
+    from functions.dispersion.scoring.weight_solver import WeightSolver
+
+    rng = np.random.default_rng(11)
+    ctx = ScoreContext(n_days=120)
+    samples = [rng.normal(0.0, 1.0, 120) for _ in range(60)]
+    sf = make_default_score_function(weights=MetricWeights({"min_payoff": 1.0}))
+    sf.build_reference(samples, ctx)
+    wc = WeightConstraints(min_weight=0.0, max_weight=0.95, max_stocks=3,
+                           max_net_strike=0.02)
+    solver = WeightSolver(sf, ctx, wc, missing_data_policy="adaptive_reweight")
+
+    pnl = rng.normal(0.0, 1.0, (120, 3))
+    pnl[:, 0] -= 0.2  # the low-strike name is worse — the cap fights the objective
+    strikes = np.array([0.01, 0.05, 0.05])
+    active = np.ones((120, 3), dtype=bool)
+
+    res = solver.solve(pnl, np.arange(3), strikes=strikes, active_mask=active)
+    assert res.feasible, "a feasible region exists (e.g. w=[0.75, 0.05, 0.2])"
+    assert float(np.dot(res.weights, strikes)) <= 0.02 + 1e-9, (
+        "solver returned weights violating the strike cap")
+    assert not np.allclose(res.weights, 1.0 / 3.0), (
+        "the uncertified equal-weight incumbent must never come back as feasible")
+
+
+def test_bisection_warm_start_cache_not_poisoned():
+    """A cached f* from an unconstrained/easier subset must not narrow the
+    bracket of a harder subset into an infeasible region: the bracket is
+    validated by an LP and reset cold when it contains no feasible point."""
+    from functions.dispersion.scoring import (
+        MetricWeights, ScoreContext, WeightConstraints, make_default_score_function)
+    from functions.dispersion.scoring.weight_solver import WeightSolver
+
+    rng = np.random.default_rng(12)
+    ctx = ScoreContext(n_days=120)
+    samples = [rng.normal(0.0, 1.0, 120) for _ in range(60)]
+    sf = make_default_score_function(weights=MetricWeights({"min_payoff": 1.0}))
+    sf.build_reference(samples, ctx)
+    wc = WeightConstraints(min_weight=0.0, max_weight=0.95, max_stocks=3,
+                           max_net_strike=0.02)
+    solver = WeightSolver(sf, ctx, wc, missing_data_policy="adaptive_reweight")
+
+    pnl = rng.normal(0.0, 1.0, (120, 4))
+    pnl[50, 3] = -100.0  # name 3 has a crash day — much lower true f*
+    strikes = np.array([0.01, 0.01, 0.01, 0.05])
+    active = np.ones((120, 4), dtype=bool)
+
+    # Solve the EASY subset first (populates the f* warm-start cache)...
+    res_easy = solver.solve(pnl, np.arange(3), strikes=strikes[:3],
+                            active_mask=active)
+    assert res_easy.feasible
+    # ...then the HARD subset, order-dependent in the old code.
+    res_hard = solver.solve(pnl, np.array([0, 1, 3]), strikes=strikes[[0, 1, 3]],
+                            active_mask=active)
+    assert res_hard.feasible
+    assert float(np.dot(res_hard.weights, strikes[[0, 1, 3]])) <= 0.02 + 1e-9
+    # Clear-sky check: solving the hard subset FIRST (cold cache) must give
+    # the same certified answer — results are order-independent.
+    solver2 = WeightSolver(sf, ctx, wc, missing_data_policy="adaptive_reweight")
+    res_hard_cold = solver2.solve(pnl, np.array([0, 1, 3]), strikes=strikes[[0, 1, 3]],
+                                  active_mask=active)
+    assert np.allclose(res_hard.weights, res_hard_cold.weights, atol=1e-2), (
+        "warm-start cache made the result order-dependent beyond bisect tolerance")
+    f_warm = res_hard.extra["bisect_f_star"]
+    f_cold = res_hard_cold.extra["bisect_f_star"]
+    assert abs(f_warm - f_cold) <= 2e-2, (
+        f"certified f* diverged: warm={f_warm:.6f} cold={f_cold:.6f} — "
+        "the old cache-poisoning bug produced order-of-magnitude divergence")

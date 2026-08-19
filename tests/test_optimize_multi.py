@@ -42,7 +42,7 @@ def api_offline_counted(monkeypatch):
         dates = pd.bdate_range("2024-01-02", periods=pnl.shape[0])
         price_df = pd.DataFrame(100.0, index=dates, columns=tickers)
 
-        def fake_load(self, basket):
+        def fake_load(self, basket, **kwargs):
             counter["loads"] += 1
             legs = list(basket.long_candidates) + list(basket.short_candidates)
             return {"variance_px": price_df, "corridor_px": None, "legs": legs,

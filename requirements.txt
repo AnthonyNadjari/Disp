@@ -1,0 +1,16 @@
+# Dispersion Optimizer — runtime + test dependencies (Python 3.9+)
+# numba MUST be >= 0.58 for numpy 1.26 (older numba fails with
+# "SystemError: initialization of _internal failed").
+numpy>=1.24,<1.27
+pandas>=2.0
+scipy>=1.10
+numba>=0.58,<0.60
+streamlit>=1.30
+plotly>=5.18
+pretty_html_table
+python-dateutil
+xbbg; platform_system != "Darwin"  # Bloomberg data loading (app runtime)
+openpyxl>=3.1    # Excel export
+xlsxwriter>=3.1  # Excel export (alternate engine)
+# Dev/test
+pytest>=7.4

@@ -216,9 +216,9 @@ optimized quantity and the delivered curve obey the same arithmetic.
 | `DROP_INCOMPLETE_DAYS` | only days where **every** weighted name trades are kept |
 
 **Grace.** Under `ADAPTIVE_REWEIGHT`, `reweight_grace_days = N > 0` keeps a
-gapped name's weight allocated (contributing 0) through gaps of ≤ N days
-before redistributing — the basket runs under-invested for those days instead
-of being recomposed on every one-day data hiccup:
+gapped name's weight allocated (carrying its **last mark** through the gap,
+not 0) through gaps of ≤ N days before redistributing — the basket is not
+recomposed on every one-day data hiccup:
 
 | day | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
 |---|---|---|---|---|---|---|---|---|
@@ -259,7 +259,7 @@ a P&L series to a scalar:
 |---|---|
 | `last_carry` | mean of the most recent payoffs (recent-maturity carry) |
 | `mean_payoff` | mean of the series |
-| `hit_ratio` | share of positive payoffs among non-zero ones |
+| `hit_ratio` | share of positive payoffs over **all** days (NaN → metric NaN; the backtester summary divides by non-zero days instead) |
 | `min_payoff` | worst single payoff (floor) |
 | `max_drawdown` | worst peak-to-trough of the cumulative curve (penalized) |
 | `cvar_5` | mean of the 5 % worst payoffs |
@@ -492,4 +492,4 @@ tests.
 | `models.py` | dataclasses (`DispersionConfig`, `SwapConfig`, `DispersionLeg`, `OptimizationConstraints`, `BucketConstraint`, `VegaConfig`, `MissingDataPolicy`) and `BacktestResult` — including `per_stock()`, `per_stock_stats()`, `to_frames()`, `export()` |
 | `run_bundle.py` | save / load / `replay()` of runs (§3.8) |
 | `Dispersion_Optimizer.py` | the Streamlit page — input tables, widgets, charts; calls the API above and nothing else |
-| `tests/` | 86 tests: kernel-vs-reference, engine-equality (sign, policies, grace, window boundary), corner extremality end-to-end, golden regressions, API pipeline (offline monkeypatched loader), bundles, exports |
+| `tests/` | 92 tests: kernel-vs-reference, engine-equality (sign, policies, grace, window boundary), corner extremality end-to-end, golden regressions, API pipeline (offline monkeypatched loader), bundles, exports |

@@ -17,20 +17,20 @@ CORRIDOR BOUNDS (barrier_up, barrier_down):
     Display: multiply by 100 → "130/70 barriers"
 LOCAL CAP:
     Multiplier of strike. Stored as float: 2.5 means cap = 2.5 × strike.
-BASKET STRUCTURE DETECTION:
-    Use Basket.structure_type property:
+BASKET STRUCTURE:
+    Inferred from the legs directly (long/short sides, cross-corridor flag):
       - "dispersion": one or more stocks long, one index short
-      - "basket_vs_basket": multiple longs + multiple shorts (no index)
       - "cross_corridor": each stock paired with its own index
       - "long_only": all weights positive, no short leg
 "LONG LEG" / "SHORT LEG":
-    Long leg = sum of (weight_i × pnl_i) for all tickers where weight > 0
-    Short leg = sum of (|weight_i| × pnl_i) for all tickers where weight < 0
-    Result (net) = Long Leg − Short Leg
+    Long Leg = sum of (weight_i × pnl_i) for all tickers where weight > 0.
+    Short Leg is the contribution of the short side (negative on
+      high-index-vol days): the backtester stores it already negated,
+      −(|weight_i| × pnl_i) for tickers where weight < 0.
+    Result = Long Leg + Short Leg → positive = we made money.
     In timeseries columns: ["Long Leg", "Short Leg", "Result"]
-    Long Leg is always positive when longs perform well.
-    Short Leg is always positive when the short (index) has HIGH vol (bad for us).
-    Result = Long Leg - Short Leg → positive = we made money.
+    Long Leg is positive when longs perform well.
+    Short Leg is negative when the short (index) has HIGH vol (bad for us).
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
@@ -206,8 +206,17 @@ class SwapConfig:
             elif old in kwargs:
                 kwargs.pop(old)
         import dataclasses
+        known = {f.name for f in dataclasses.fields(self.__class__)}
+        unknown = sorted(set(kwargs) - known)
+        if unknown:
+            raise TypeError(
+                f"SwapConfig got unexpected keyword argument(s) {unknown} "
+                f"(known fields: {sorted(known)})"
+            )
         for f in dataclasses.fields(self.__class__):
             setattr(self, f.name, kwargs.get(f.name, f.default if f.default is not dataclasses.MISSING else None))
+        # Coerce string values back to the enum (accepts enum members unchanged)
+        self.product_type = ProductType(self.product_type)
     # Backward compat read access
     @property
     def is_capped(self): return self.capped
@@ -239,11 +248,6 @@ class SwapConfig:
         return self.product_type == ProductType.VAR_SWAP_CORRIDOR or self.cross_corridor
 
     @property
-    def is_index_asset(self) -> bool:
-        # Mono corridor uses .SPX as the asset (index), cross corridor uses individual stocks
-        return self.ref_asset and ('Index' in self.ref_asset or 'index' in self.ref_asset)
-
-    @property
     def product_display_name(self) -> str:
         """Human-readable product name for emails/UI."""
         base = {
@@ -265,14 +269,19 @@ class SwapConfig:
         return f"{d:.2f}/{u:.2f} barriers, T/T-1, {div}"
 
     def validate(self) -> None:
-        assert self.n_exp > 0, "n_exp must be positive"
-        assert self.local_cap > 0, "local_cap must be positive"
+        if self.n_exp <= 0:
+            raise ValueError("n_exp must be positive")
+        if self.local_cap <= 0:
+            raise ValueError("local_cap must be positive")
         # Only validate corridor bounds when corridor logic is actually used
         # (vol swaps never use barrier_up/barrier_down even if cross_corridor is set)
         if self.is_corridor and not self.is_vol_swap:
-            assert 0 < self.barrier_down < self.barrier_up, f"Need 0 < barrier_down ({self.barrier_down}) < barrier_up ({self.barrier_up})"
-            assert self.barrier_down < 1.0, f"barrier_down should be decimal (e.g. 0.70), got {self.barrier_down}"
-            assert self.barrier_up > 1.0, f"barrier_up should be decimal (e.g. 1.30), got {self.barrier_up}"
+            if not 0 < self.barrier_down < self.barrier_up:
+                raise ValueError(f"Need 0 < barrier_down ({self.barrier_down}) < barrier_up ({self.barrier_up})")
+            if self.barrier_down >= 1.0:
+                raise ValueError(f"barrier_down should be decimal (e.g. 0.70), got {self.barrier_down}")
+            if self.barrier_up <= 1.0:
+                raise ValueError(f"barrier_up should be decimal (e.g. 1.30), got {self.barrier_up}")
 
     # ── Factory methods (for explicit, readable construction) ──
 
@@ -310,7 +319,7 @@ class SwapConfig:
         )
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# DispersionLeg & Basket
+# DispersionLeg
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @dataclass
@@ -354,156 +363,6 @@ class DispersionLeg:
         """Weight as percentage for display: 10.0 or -100.0"""
         return self.weight * 100
 
-@dataclass
-class Basket:
-    """
-    Complete basket definition. Single source of truth for all leg/structure logic.
-    Construct via factory methods:
-        Basket.from_tickers(tickers, strikes, weights, ...)
-        Basket.from_legs(legs)
-    """
-    legs: List[DispersionLeg] = field(default_factory=list)
-
-    # ── Leg access ──
-
-    @property
-    def long_legs(self) -> List[DispersionLeg]:
-        """All legs with positive weight."""
-        return [s for s in self.legs if s.weight > 0]
-
-    @property
-    def short_legs(self) -> List[DispersionLeg]:
-        """All legs with negative weight."""
-        return [s for s in self.legs if s.weight < 0]
-
-    @property
-    def has_short_leg(self) -> bool:
-        return len(self.short_legs) > 0
-
-    @property
-    def long_tickers(self) -> List[str]:
-        return [s.variance_asset for s in self.long_legs]
-
-    @property
-    def short_tickers(self) -> List[str]:
-        return [s.variance_asset for s in self.short_legs]
-
-    @property
-    def all_tickers(self) -> List[str]:
-        return [s.variance_asset for s in self.legs]
-
-    @property
-    def weights_dict(self) -> Dict[str, float]:
-        """Signed weight dict: {variance_asset: weight}"""
-        return {s.variance_asset: s.weight for s in self.legs}
-
-    @property
-    def strikes_dict(self) -> Dict[str, float]:
-        """Strike dict: {variance_asset: strike_decimal}"""
-        return {s.variance_asset: s.strike_mono_var_swap for s in self.legs}
-
-    @property
-    def corridor_condition_asset_map(self) -> Optional[Dict[str, str]]:
-        """For cross-corridor: {variance_asset: corridor_condition_asset}"""
-        d = {s.variance_asset: s.corridor_condition_asset for s in self.legs if s.corridor_condition_asset}
-        return d if d else None
-
-    # ── Structure detection ──
-
-    @property
-    def structure_type(self) -> StructureType:
-        """Detect basket structure from weight signs and ticker types."""
-        if any(s.corridor_condition_asset for s in self.legs):
-            return StructureType.CROSS_CORRIDOR
-
-        longs = self.long_legs
-        shorts = self.short_legs
-        if not shorts:
-            return StructureType.LONG_ONLY
-
-        # Single short that looks like an index → classic dispersion
-        if len(shorts) == 1 and shorts[0].is_index_asset:
-            return StructureType.DISPERSION
-
-        # Multiple shorts → basket vs basket
-        if len(shorts) > 1:
-            return StructureType.BASKET_VS_BASKET
-
-        # Single short that's not an index → still dispersion-like
-        return StructureType.DISPERSION
-
-    @property
-    def short_leg_display(self) -> str:
-        """Display name for the short leg (e.g. 'SX5E Index')."""
-        shorts = self.short_legs
-        if not shorts:
-            return ""
-        if len(shorts) == 1:
-            return shorts[0].variance_asset
-        return f"{len(shorts)} stocks"
-
-    @property
-    def offer(self) -> float:
-        """Weighted strike (the 'offer'): sum(weight_i × strike_i) for display."""
-        if self.structure_type == StructureType.CROSS_CORRIDOR:
-            # Cross-corridor: sum(weight × (strike_mono - strike_cross))
-            total = 0.0
-            for s in self.legs:
-                strike_cross = s.strike_cross_corridor or s.strike_mono_var_swap
-                total += abs(s.weight) * (s.strike_mono_var_swap - strike_cross)
-            return round(total * 100, 2)  # Display as percentage
-        else:
-            # Standard: sum(weight × strike) × 100
-            return round(sum(s.weight * s.strike_mono_var_swap for s in self.legs) * 100, 2)
-
-    # ── Factory methods ──
-
-    @classmethod
-    def from_tickers(
-        cls,
-        tickers: List[str],
-        strikes: Dict[str, float],
-        weights: Dict[str, float],
-        corridor_condition_assets: Optional[Dict[str, str]] = None,
-        cross_corridor_strikes: Optional[Dict[str, float]] = None,
-    ) -> "Basket":
-        """Construct from dicts (the format used by the backtest engine)."""
-        legs = []
-        for t in tickers:
-            legs.append(DispersionLeg(
-                variance_asset=t,
-                strike_mono_var_swap=strikes.get(t, 0),
-                weight=weights.get(t, 0),
-                corridor_condition_asset=corridor_condition_assets.get(t) if corridor_condition_assets else None,
-                strike_cross_corridor=cross_corridor_strikes.get(t) if cross_corridor_strikes else None,
-            ))
-        return cls(legs=legs)
-
-    @classmethod
-    def from_legs(cls, legs: List[DispersionLeg]) -> "Basket":
-        return cls(legs=legs)
-
-    def to_dataframe(self) -> pd.DataFrame:
-        """Export to DataFrame (for display or email tables)."""
-        if self.structure_type == StructureType.CROSS_CORRIDOR:
-            return pd.DataFrame([{
-                'Variance Asset': s.variance_asset,
-                'Corridor Condition Asset': s.corridor_condition_asset or '',
-                'Strike Mono Var Swap (%)': s.strike_pct,
-                'Strike Cross Corridor (%)': (s.strike_cross_corridor or 0) * 100,
-                'Weight (%)': s.weight_pct,
-            } for s in self.legs])
-        else:
-            return pd.DataFrame([{
-                'Variance Asset': s.variance_asset,
-                'Strike Mono Var Swap (%)': s.strike_pct,
-                'Weight (%)': s.weight_pct,
-                'Sector': s.sector or '',
-            } for s in self.legs])
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Optimizer Input (for BasketInput compatibility during migration)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @dataclass
 class BasketInput:
@@ -632,31 +491,6 @@ class BucketConstraint:
         return self.min_names > 0 or self.max_names is not None
 
 
-@dataclass
-class ScoreWeights:
-    """
-    Multi-objective fitness weights for optimization. Auto-normalized to sum=1.
-    """
-    last_value: float = 0.3
-    avg_5y: float = 0.1
-    avg_3y: float = 0.2
-    max_drawdown: float = 0.1
-    hit_ratio: float = 0.3
-
-    def __post_init__(self):
-        self._normalize()
-
-    def _normalize(self):
-        total = self.last_value + self.avg_5y + self.avg_3y + self.max_drawdown + self.hit_ratio
-        if total > 0 and abs(total - 1.0) > 1e-6:
-            self.last_value /= total
-            self.avg_5y /= total
-            self.avg_3y /= total
-            self.max_drawdown /= total
-            self.hit_ratio /= total
-
-    def as_array(self) -> np.ndarray:
-        return np.array([self.last_value, self.avg_5y, self.avg_3y, self.max_drawdown, self.hit_ratio])
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Result Types (PUBLIC - returned by solve()/price())
@@ -715,6 +549,9 @@ class OptimizationResult:
     axe_recycled: Optional[float] = None     # criterion B of the delivered basket (fraction of the package)
     # ── Bootstrap robustness diagnostic (None unless robustness_check=True) ──
     robustness: Optional[Dict] = None        # {n_draws, n_challengers, top1_freq, top3_freq, winner_raw_ci}
+    # ── Interactive smoothing state (set post-construction by _api.py; UI-only) ──
+    _smooth_state: Optional[Dict] = None     # interactive smoothing snapshot (UI re-rank)
+    _final_raw_min: Optional[float] = None   # min net P&L of the delivered basket (UI assertion)
 
     @property
     def is_long_only(self) -> bool:
@@ -729,69 +566,21 @@ class OptimizationResult:
             "generations": self.generations_run,
         }
 
-    def to_backtester_df(self) -> "pd.DataFrame":
-        """Build a DataFrame matching the backtester input format.
-        Cross-corridor format: Variance Asset | Corridor Condition Asset | Strike Cross Corridor (%) | Strike Mono Var Swap (%) | Weight (%)
-        Standard format: Variance Asset | Strike Mono Var Swap (%) | Weight (%)
-        """
-        import pandas as pd
-        rows = []
-        if self.is_cross_corridor and self.long_cross_corridor:
-            # Cross-corridor format
-            xcorr_map = {t: (idx, xcs) for t, idx, xcs in self.long_cross_corridor}
-            for ticker, weight in self.long_basket:
-                strike_mono = dict(self.long_strikes).get(ticker, 0)
-                idx_ticker, strike_cross = xcorr_map.get(ticker, ("", 0))
-                rows.append({
-                    "Variance Asset": idx_ticker,
-                    "Corridor Condition Asset": ticker,
-                    "Strike Cross Corridor (%)": round(strike_cross * 100, 2),
-                    "Strike Mono Var Swap (%)": round(strike_mono * 100, 2),
-                    "Weight (%)": round(weight * 100, 2),
-                })
-            # Short side (if any)
-            xcorr_map_s = {t: (idx, xcs) for t, idx, xcs in self.short_cross_corridor}
-            for ticker, weight in self.short_basket:
-                strike_mono = dict(self.short_strikes).get(ticker, 0)
-                idx_ticker, strike_cross = xcorr_map_s.get(ticker, ("", 0))
-                rows.append({
-                    "Variance Asset": idx_ticker,
-                    "Corridor Condition Asset": ticker,
-                    "Strike Cross Corridor (%)": round(strike_cross * 100, 2),
-                    "Strike Mono Var Swap (%)": round(strike_mono * 100, 2),
-                    "Weight (%)": round(-weight * 100, 2),
-                })
-        else:
-            # Standard format (no Side column needed)
-            strike_map = dict(self.long_strikes)
-            for ticker, weight in self.long_basket:
-                rows.append({
-                    "Variance Asset": ticker,
-                    "Strike Mono Var Swap (%)": round(strike_map.get(ticker, 0) * 100, 2),
-                    "Weight (%)": round(weight * 100, 2),
-                })
-            strike_map_s = dict(self.short_strikes)
-            for ticker, weight in self.short_basket:
-                rows.append({
-                    "Variance Asset": ticker,
-                    "Strike Mono Var Swap (%)": round(strike_map_s.get(ticker, 0) * 100, 2),
-                    "Weight (%)": round(-weight * 100, 2),
-                })
-        return pd.DataFrame(rows)
-
 @dataclass
 class BacktestResult:
     """
     Output from a backtest run.
     timeseries columns: ["Long Leg", "Short Leg", "Result"]
       - Long Leg: weighted sum of long-side P&L (positive = good)
-      - Short Leg: weighted sum of short-side P&L (positive = bad for us)
-      - Result: Long Leg - Short Leg (positive = we profit)
+      - Short Leg: contribution of the short side, already negated by the
+        backtester (negative on high-index-vol days = bad for us)
+      - Result: Long Leg + Short Leg (positive = we profit)
     """
     timeseries: pd.DataFrame
     active_legs_count: Optional[pd.Series] = None
     per_leg_pnl: Optional[pd.DataFrame] = None  # columns=keys, index=dates, values=daily P&L
     metrics: Dict[str, float] = field(default_factory=dict)
+    cross_leg_pnl: Optional[pd.DataFrame] = None  # cross-corridor only: mono/cross leg split (set by the backtester)
 
     @property
     def result_series(self) -> pd.Series:
@@ -809,23 +598,23 @@ class BacktestResult:
 
     @property
     def last_value(self) -> float:
-        return float(self.result_series.iloc[-1]) if len(self.timeseries) > 0 else 0.0
+        if len(self.timeseries) == 0:
+            return 0.0
+        v = self.result_series.iloc[-1]
+        return 0.0 if pd.isna(v) else float(v)
 
     @property
     def max_drawdown(self) -> float:
-        """Max peak-to-trough drawdown as % of peak cumulative P&L.
-        Returns a negative number (e.g., -45.0 means 45% drop from peak)."""
+        """Max peak-to-trough drawdown of the cumulative P&L, in raw P&L units
+        (same convention as per_stock_stats): min of cum − cummax(cum),
+        always <= 0. Returns 0.0 for an empty or all-NaN series."""
         cumsum = self.result_series.cumsum()
         if len(cumsum) == 0:
             return 0.0
-        peak = cumsum.cummax()
-        drawdown = cumsum - peak
-        # Express as % of peak (avoid div by zero when peak <= 0)
-        peak_at_trough = peak[drawdown.idxmin()] if len(drawdown) > 0 else 0.0
-        if peak_at_trough > 1e-8:
-            return float(drawdown.min() / peak_at_trough * 100)
-        # Fallback: if peak never positive, return raw drawdown
-        return float(drawdown.min())
+        dd_min = (cumsum - cumsum.cummax()).min()
+        if pd.isna(dd_min):  # all-NaN series
+            return 0.0
+        return float(dd_min)
 
     @property
     def has_short_leg(self) -> bool:
@@ -845,7 +634,7 @@ class BacktestResult:
             "p25": float(s.quantile(0.25)) if len(s) > 0 else 0.0,
             "p50": float(s.quantile(0.50)) if len(s) > 0 else 0.0,
             "p75": float(s.quantile(0.75)) if len(s) > 0 else 0.0,
-            "n_observations": int((s != 0).sum()),
+            "n_observations": int((s.dropna() != 0).sum()),
         }
         return self.metrics
 
@@ -955,21 +744,6 @@ def frames_to_zip_bytes(frames: "Dict[str, pd.DataFrame]") -> bytes:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Helper
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def _to_decimal(value) -> float:
-    """
-    Normalize a value to decimal convention.
-    If |value| > 1, assume it's in percentage → divide by 100.
-    If |value| <= 1, assume it's already decimal.
-    Examples: 22 → 0.22, 130 → 1.30, 0.22 → 0.22, -60 → -0.60
-    """
-    try:
-        v = float(value)
-    except (ValueError, TypeError):
-        return 0.0
-    if abs(v) > 1.0:
-        return v / 100.0
-    return v
 
 def piecewise_function(x, a: float, b: float, c: float, d: float):
     """

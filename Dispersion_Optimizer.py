@@ -1,9 +1,4 @@
 import streamlit as st
-# Dev hot-reload: clear cached dispersion modules so code changes apply on rerun
-import sys
-_stale = [k for k in sys.modules if k.startswith("functions.dispersion")]
-for _k in _stale:
-    del sys.modules[_k]
 from functions.dispersion import optimize, backtest, DispersionConfig, OptimizationConstraints, price, solve
 from functions.dispersion.models import ProductType, MissingDataPolicy, OptimizationResult, PriceResult
 from functions.dispersion._portal import payment_dates as calculate_payment_dates, observation_schedule
@@ -105,6 +100,7 @@ def _run_bt(src_df, is_vol_swap, n_exp, local_cap,
         barrier_up=ubar,
         barrier_down=dbar,
         local_cap=local_cap,
+        is_capped=st.session_state.get('opt_is_capped', True),
         adj_divs=(adj_divs == "Yes"),
         missing_data_policy=_parse_policy(missing_data_policy) if isinstance(missing_data_policy,
                                                                              str) else missing_data_policy,
@@ -155,6 +151,7 @@ import io
 import time
 import cProfile
 import pstats
+import datetime  # explicit: this module uses datetime.date — do not rely on star imports
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -180,6 +177,32 @@ def _fetch_sector_data(tickers_key: str, tickers: list):
     """Cache Bloomberg sector lookups for 10 minutes."""
     df = blp.bdp(tickers, "INDUSTRY_SECTOR")
     return df
+
+
+def _df_from_paste(text: str, cols) -> pd.DataFrame:
+    """Parse pasted tab/comma-separated basket data into a DataFrame.
+
+    THE single paste parser — all Fill buttons route here (previously nine
+    divergent copies, only one of which skipped a pasted header row).
+    A single line pastes as one row; multiple lines as one row per line.
+    A header row (first cell looks like a column name) is skipped. Missing
+    trailing columns are filled with ''.
+    """
+    if '\n' not in text:
+        values = text.split('\t') if '\t' in text else text.split(',')
+        return pd.DataFrame({col: [values[i] if i < len(values) else '']
+                             for i, col in enumerate(cols)})
+    df = pd.read_csv(io.StringIO(text), sep='\t' if '\t' in text else ',', header=None)
+    first_cell = str(df.iloc[0, 0]).strip().lower()
+    header_candidates = ['tickers', 'variance asset', 'underlying', 'index', 'strike',
+                         'min weight', 'max weight', 'weight', 'ric']
+    if any(c in first_cell for c in header_candidates):
+        df = df.iloc[1:].reset_index(drop=True)
+        st.toast("⚠️ Header row detected and skipped", icon="ℹ️")
+    new_data = pd.DataFrame()
+    for i, col in enumerate(cols):
+        new_data[col] = df.iloc[:, i] if i < df.shape[1] else [''] * len(df)
+    return new_data
 
 @st.cache_resource
 def _warmup_numba():
@@ -307,9 +330,14 @@ def _render_optimization_result(result, is_cross, debug_info=None):
     if result.backtest is not None and getattr(result.backtest, "timeseries", None) is not None \
             and len(result.backtest.timeseries) > 0:
         from functions.dispersion.models import frames_to_zip_bytes
+        # Memoize the zip per result object — rebuilding it on every rerun
+        # (any widget interaction) is pure waste.
+        _zip_key = f"_zip_bytes_opt_{id(result)}"
+        if _zip_key not in st.session_state:
+            st.session_state[_zip_key] = frames_to_zip_bytes(result.backtest.to_frames())
         st.download_button(
             "⬇️ Download backtest data (zip of CSVs)",
-            data=frames_to_zip_bytes(result.backtest.to_frames()),
+            data=st.session_state[_zip_key],
             file_name="optimizer_backtest_data.zip", mime="application/zip",
             key="dl_opt_bt_zip")
     # Scoring signature — reproducibility fingerprint of the run
@@ -438,7 +466,8 @@ st.set_page_config(
 )
 # Trigger numba warmup after set_page_config
 _warmup_numba()
-os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# NOTE: no os.chdir here — mutating the process CWD on every rerun is unsafe
+# in a multi-session server. Relative paths resolve from the launch directory.
 if 'display_criteria' not in st.session_state:
     st.session_state['display_criteria'] = False
 if 'graph_backtest' not in st.session_state:
@@ -470,7 +499,7 @@ with tab1:
             key='n_exp_mode_tab1'
         )
         if n_exp_mode == 'Days':
-            n_exp = st.number_input('Input N expected in days', value=310, key=41050)
+            n_exp = st.number_input('Input N expected in days', value=310, key='n_exp_days_tab1')
         else:
             maturity_date = st.date_input(
                 'Select Maturity Date',
@@ -483,6 +512,9 @@ with tab1:
             n_exp = None  # Placeholder, will be calculated later
     with c5:
         local_cap = st.number_input("Input local cap", value=2.50, key=12001)
+        is_capped_opt = st.toggle(
+            "Capped legs (note-style)", value=True, key='opt_is_capped',
+            help="ON = local cap applies (note-style capped variance). OFF = uncapped OTC swap legs.")
     with c7:
         global_cap = st.number_input("Input global cap", value=999999999, key=12005)
     with c8:
@@ -546,7 +578,10 @@ with tab1:
             for _c in _xc_show_cols:
                 if _c not in _xc_show.columns:
                     _xc_show[_c] = ''
-            st.data_editor(
+            # Capture the edited df — the widget returns it; without assigning
+            # it back, manual cell edits never reach the optimizer (the grid
+            # only *displays* them). Same pattern as tab 3's editors.
+            st.session_state.long_df_cross = st.data_editor(
                 _xc_show[_xc_show_cols],
                 num_rows="dynamic",
                 use_container_width=True,
@@ -564,27 +599,7 @@ with tab1:
             if st.button("Fill Long Basket", key="fill_long_cross"):
                 if long_pasted_text:
                     try:
-                        if '\n' not in long_pasted_text:
-                            values = long_pasted_text.split(
-                                '\t') if '\t' in long_pasted_text else long_pasted_text.split(',')
-                            row_data = {}
-                            for i, col in enumerate(_xc_paste_cols):
-                                row_data[col] = [values[i] if i < len(values) else '']
-                            st.session_state.long_df_cross = pd.DataFrame(row_data)
-                        else:
-                            df = pd.read_csv(io.StringIO(long_pasted_text),
-                                             sep='\t' if '\t' in long_pasted_text else ',', header=None)
-                            # Detect and skip header row if first cell looks like a column name
-                            first_cell = str(df.iloc[0, 0]).strip().lower()
-                            header_candidates = ['tickers', 'variance asset', 'index', 'strike', 'min weight',
-                                                 'max weight']
-                            if any(c in first_cell for c in header_candidates):
-                                df = df.iloc[1:].reset_index(drop=True)
-                                st.toast("⚠️ Header row detected and skipped", icon="ℹ️")
-                            new_data = pd.DataFrame()
-                            for i, col in enumerate(_xc_paste_cols):
-                                new_data[col] = df.iloc[:, i] if i < df.shape[1] else [''] * len(df)
-                            st.session_state.long_df_cross = new_data
+                        st.session_state.long_df_cross = _df_from_paste(long_pasted_text, _xc_paste_cols)
                         st.rerun()
                     except Exception as e:
                         st.error(f"Error processing long basket data: {e}")
@@ -612,7 +627,8 @@ with tab1:
             for _c in _std_show_cols:
                 if _c not in _std_show.columns:
                     _std_show[_c] = ''
-            st.data_editor(
+            # Capture the edited df (see long_df_cross above).
+            st.session_state.long_df = st.data_editor(
                 _std_show[_std_show_cols],
                 num_rows="dynamic",
                 use_container_width=True,
@@ -630,21 +646,7 @@ with tab1:
             if st.button("Fill Long Basket", key="fill_long"):
                 if long_pasted_text:
                     try:
-                        if '\n' not in long_pasted_text:
-                            values = long_pasted_text.split(
-                                '\t') if '\t' in long_pasted_text else long_pasted_text.split(',')
-                            row_data = {}
-                            for i, col in enumerate(_std_paste_cols):
-                                row_data[col] = [values[i] if i < len(values) else '']
-                            st.session_state.long_df = pd.DataFrame(row_data)
-                        else:
-                            df = pd.read_csv(io.StringIO(long_pasted_text),
-                                             sep='\t' if '\t' in long_pasted_text else ',',
-                                             header=None)
-                            new_data = pd.DataFrame()
-                            for i, col in enumerate(_std_paste_cols):
-                                new_data[col] = df.iloc[:, i] if i < df.shape[1] else [''] * len(df)
-                            st.session_state.long_df = new_data
+                        st.session_state.long_df = _df_from_paste(long_pasted_text, _std_paste_cols)
                         st.rerun()
                     except Exception as e:
                         st.error(f"Error processing long basket data: {e}")
@@ -660,7 +662,8 @@ with tab1:
                     'Min Weight': [],
                     'Max Weight': []
                 })
-            st.data_editor(
+            # Capture the edited df (see long_df_cross above).
+            st.session_state.short_df_cross = st.data_editor(
                 st.session_state.short_df_cross[
                     ['Variance Asset', 'Corridor Condition Asset', 'Strike Cross Corridor (%)',
                      'Strike Mono Var Swap (%)', 'Min Weight', 'Max Weight']],
@@ -679,25 +682,10 @@ with tab1:
             if st.button("Fill Short Basket", key="fill_short_cross"):
                 if short_pasted_text:
                     try:
-                        if '\n' not in short_pasted_text:
-                            values = short_pasted_text.split(
-                                '\t') if '\t' in short_pasted_text else short_pasted_text.split(',')
-                            row_data = {}
-                            for i, col in enumerate(
-                                    ['Variance Asset', 'Corridor Condition Asset', 'Strike Cross Corridor (%)',
-                                     'Strike Mono Var Swap (%)', 'Min Weight', 'Max Weight']):
-                                row_data[col] = [values[i] if i < len(values) else '']
-                            st.session_state.short_df_cross = pd.DataFrame(row_data)
-                        else:
-                            df = pd.read_csv(io.StringIO(short_pasted_text),
-                                             sep='\t' if '\t' in short_pasted_text else ',',
-                                             header=None)
-                            new_data = pd.DataFrame()
-                            for i, col in enumerate(
-                                    ['Variance Asset', 'Corridor Condition Asset', 'Strike Cross Corridor (%)',
-                                     'Strike Mono Var Swap (%)', 'Min Weight', 'Max Weight']):
-                                new_data[col] = df.iloc[:, i] if i < df.shape[1] else [''] * len(df)
-                            st.session_state.short_df_cross = new_data
+                        st.session_state.short_df_cross = _df_from_paste(
+                            short_pasted_text,
+                            ['Variance Asset', 'Corridor Condition Asset', 'Strike Cross Corridor (%)',
+                             'Strike Mono Var Swap (%)', 'Min Weight', 'Max Weight'])
                         st.rerun()
                     except Exception as e:
                         st.error(f"Error processing short basket data: {e}")
@@ -710,7 +698,8 @@ with tab1:
                     'Min Weight': [],
                     'Max Weight': []
                 })
-            st.data_editor(
+            # Capture the edited df (see long_df_cross above).
+            st.session_state.short_df = st.data_editor(
                 st.session_state.short_df,
                 num_rows="dynamic",
                 use_container_width=True,
@@ -725,21 +714,7 @@ with tab1:
             if st.button("Fill Short Basket", key="fill_short"):
                 if short_pasted_text:
                     try:
-                        if '\n' not in short_pasted_text:
-                            values = short_pasted_text.split(
-                                '\t') if '\t' in short_pasted_text else short_pasted_text.split(',')
-                            row_data = {}
-                            for i, col in enumerate(_opt_std_cols):
-                                row_data[col] = [values[i] if i < len(values) else '']
-                            st.session_state.short_df = pd.DataFrame(row_data)
-                        else:
-                            df = pd.read_csv(io.StringIO(short_pasted_text),
-                                             sep='\t' if '\t' in short_pasted_text else ',',
-                                             header=None)
-                            new_data = pd.DataFrame()
-                            for i, col in enumerate(_opt_std_cols):
-                                new_data[col] = df.iloc[:, i] if i < df.shape[1] else [''] * len(df)
-                            st.session_state.short_df = new_data
+                        st.session_state.short_df = _df_from_paste(short_pasted_text, _opt_std_cols)
                         st.rerun()
                     except Exception as e:
                         st.error(f"Error processing short basket data: {e}")
@@ -803,7 +778,9 @@ with tab1:
                         st.error(f"Failed to calculate days: {str(e)}")
                         n_exp = 310  # Fallback value
         else:
-            n_exp = st.session_state.get('n_exp', 310)
+            # Days mode: read the widget's own value (previously a stale
+            # session_state entry — the widget was silently ignored).
+            n_exp = st.session_state.get('n_exp_days_tab1', 310)
         if is_cross_corridor:
             long_df_check = st.session_state.get('long_df_cross', pd.DataFrame())
             short_df_check = st.session_state.get('short_df_cross', pd.DataFrame())
@@ -811,17 +788,18 @@ with tab1:
                 st.error("Please add stocks to the long basket!")
             else:
                 # Store config — optimize() handles data loading internally
+                # (opt_-prefixed keys: namespaced from tab 3's bt_ keys)
                 st.session_state['opt_config_ready'] = True
                 st.session_state['is_vol_swap'] = is_vol_swap
-                st.session_state['n_exp'] = n_exp
+                st.session_state['opt_n_exp'] = n_exp
                 st.session_state['local_cap'] = local_cap
                 st.session_state['global_cap'] = global_cap
                 st.session_state['global_floor'] = global_floor
                 st.session_state['ubar'] = ubar
                 st.session_state['dbar'] = dbar
-                st.session_state['adj_divs'] = adj_divs
+                st.session_state['opt_adj_divs'] = adj_divs
                 st.session_state['_opt_start_date_value'] = optimization_start
-                st.session_state['is_cross_corridor'] = True
+                st.session_state['opt_is_cross_corridor'] = True
                 st.session_state['is_long_only'] = len(short_df_check) == 0
                 st.session_state['n_long_candidates'] = len(long_df_check)
                 st.session_state['n_short_candidates'] = len(short_df_check)
@@ -833,17 +811,18 @@ with tab1:
                 st.error("Please add stocks to the long basket!")
             else:
                 # Store config — optimize() handles data loading internally
+                # (opt_-prefixed keys: namespaced from tab 3's bt_ keys)
                 st.session_state['opt_config_ready'] = True
                 st.session_state['is_vol_swap'] = is_vol_swap
-                st.session_state['n_exp'] = n_exp
+                st.session_state['opt_n_exp'] = n_exp
                 st.session_state['local_cap'] = local_cap
                 st.session_state['global_cap'] = global_cap
                 st.session_state['global_floor'] = global_floor
                 st.session_state['ubar'] = ubar
                 st.session_state['dbar'] = dbar
-                st.session_state['adj_divs'] = adj_divs
+                st.session_state['opt_adj_divs'] = adj_divs
                 st.session_state['_opt_start_date_value'] = optimization_start
-                st.session_state['is_cross_corridor'] = False
+                st.session_state['opt_is_cross_corridor'] = False
                 st.session_state['is_long_only'] = len(short_df_check) == 0
                 st.session_state['n_long_candidates'] = len(long_df_check)
                 st.session_state['n_short_candidates'] = len(short_df_check)
@@ -1160,8 +1139,16 @@ with tab1:
                 else:
                     _src_check = st.session_state.get('long_df', pd.DataFrame())
                 if not _src_check.empty and 'Max Weight' in _src_check.columns:
-                    _max_w_pct = _src_check['Max Weight'].astype(float).max()
-                    _max_w_dec = _max_w_pct / 100.0
+                    # Coerce defensively: pasted cells can be blank strings
+                    # (astype(float) would raise a bare ValueError here).
+                    _max_w_pct = pd.to_numeric(_src_check['Max Weight'], errors='coerce').max()
+                    if pd.isna(_max_w_pct) or float(_max_w_pct) <= 0:
+                        st.error(
+                            "Max Weight has no positive numeric value in the long basket "
+                            "table — the constraints are infeasible. Check the Max Weight column.")
+                        _preflight_ok = False
+                if _preflight_ok and not _src_check.empty and 'Max Weight' in _src_check.columns:
+                    _max_w_dec = float(_max_w_pct) / 100.0
                     _max_alloc = max_stocks_long * _max_w_dec
                     if _max_alloc < 1.0 - 1e-9:
                         import math
@@ -1200,7 +1187,7 @@ with tab1:
                             opti_progress.progress(pct, text=f"Gen {gen}/{max_gen} | Best: {best_score:.4f}")
                             opti_status.caption(f"🧬 Generation {gen}/{max_gen} — best score: {best_score:.4f}")
 
-                        _is_xc = st.session_state.get('is_cross_corridor', False)
+                        _is_xc = st.session_state.get('opt_is_cross_corridor', False)
                         if _is_xc:
                             _long_src = st.session_state.get('long_df_cross', pd.DataFrame())
                             _short_src = st.session_state.get('short_df_cross', pd.DataFrame())
@@ -1212,14 +1199,14 @@ with tab1:
                             product_type=ProductType.VOL_SWAP if st.session_state.get('is_vol_swap',
                                                                                       False) else ProductType.VAR_SWAP_CORRIDOR,
                             cross_corridor=_is_xc,
-                            n_exp=st.session_state.get('n_exp', 252),
+                            n_exp=st.session_state.get('opt_n_exp', 252),
                             barrier_up=st.session_state.get('ubar', 1.30),
                             barrier_down=st.session_state.get('dbar', 0.70),
                             local_cap=st.session_state.get('local_cap', 2.5),
-                            is_capped=True,
+                            is_capped=st.session_state.get('opt_is_capped', True),
                             missing_data_policy=_parse_policy(missing_data_policy),
                             reweight_grace_days=int(reweight_grace_days),
-                            adj_divs=(st.session_state.get('adj_divs', 'No') == "Yes"),
+                            adj_divs=(st.session_state.get('opt_adj_divs', 'No') == "Yes"),
                             lookback_years=5,
                             global_cap=st.session_state.get('global_cap', 9999999.0),
                             global_floor=st.session_state.get('global_floor', -9999999.0),
@@ -1667,19 +1654,7 @@ with tab3:
         if st.button("Fill Standard Editor", key="fill_standard"):
             if pasted_text:
                 try:
-                    if '\n' not in pasted_text:
-                        values = pasted_text.split('\t') if '\t' in pasted_text else pasted_text.split(',')
-                        row_data = {}
-                        for i, col in enumerate(_bt_std_cols):
-                            row_data[col] = [values[i] if i < len(values) else '']
-                        st.session_state.edited_df_bis = pd.DataFrame(row_data)
-                    else:
-                        df = pd.read_csv(io.StringIO(pasted_text), sep='\t' if '\t' in pasted_text else ',',
-                                         header=None)
-                        new_data = pd.DataFrame()
-                        for i, col in enumerate(_bt_std_cols):
-                            new_data[col] = df.iloc[:, i] if i < df.shape[1] else [''] * len(df)
-                        st.session_state.edited_df_bis = new_data
+                    st.session_state.edited_df_bis = _df_from_paste(pasted_text, _bt_std_cols)
                     st.rerun()
                 except Exception as e:
                     st.error(f"Error processing data: {e}")
@@ -1707,24 +1682,10 @@ with tab3:
         if st.button("Fill Cross Corridor Editor", key="fill_cross"):
             if cross_pasted_text:
                 try:
-                    if '\n' not in cross_pasted_text:
-                        values = cross_pasted_text.split(
-                            '\t') if '\t' in cross_pasted_text else cross_pasted_text.split(',')
-                        row_data = {}
-                        for i, col in enumerate(
-                                ['Variance Asset', 'Corridor Condition Asset', 'Strike Cross Corridor (%)',
-                                 'Strike Mono Var Swap (%)', 'Weight (%)']):
-                            row_data[col] = [values[i] if i < len(values) else '']
-                        st.session_state.edited_df_cross = pd.DataFrame(row_data)
-                    else:
-                        df = pd.read_csv(io.StringIO(cross_pasted_text), sep='\t' if '\t' in cross_pasted_text else ',',
-                                         header=None)
-                        new_data = pd.DataFrame()
-                        for i, col in enumerate(
-                                ['Variance Asset', 'Corridor Condition Asset', 'Strike Cross Corridor (%)',
-                                 'Strike Mono Var Swap (%)', 'Weight (%)']):
-                            new_data[col] = df.iloc[:, i] if i < df.shape[1] else [''] * len(df)
-                        st.session_state.edited_df_cross = new_data
+                    st.session_state.edited_df_cross = _df_from_paste(
+                        cross_pasted_text,
+                        ['Variance Asset', 'Corridor Condition Asset', 'Strike Cross Corridor (%)',
+                         'Strike Mono Var Swap (%)', 'Weight (%)'])
                     st.rerun()
                 except Exception as e:
                     st.error(f"Error processing cross corridor data: {e}")
@@ -1769,16 +1730,16 @@ with tab3:
                             st.error(f"Failed to calculate days: {str(e)}")
                             n_exp = 315  # Fallback value
             else:
-                print("oula ya pas de nexp")
                 n_exp = st.session_state.get('expiry')
-            st.session_state['n_exp'] = n_exp
+            st.session_state['bt_n_exp'] = n_exp
             # Clear previous state
             st.session_state['is_dual_sectorial'] = False
             st.session_state['show_email_analysis'] = False
             st.session_state['show_60d_analysis'] = False
             st.session_state['backtest_completed'] = True
             for key in ['fig_split', 'fig_60d_split', 'fig_entry_point', 'email_60d_graph',
-                        'fig_sectorial', 'fig_sectorial_long', 'fig_sectorial_short']:
+                        'fig_sectorial', 'fig_sectorial_long', 'fig_sectorial_short',
+                        'carry_result_series']:
                 if key in st.session_state:
                     del st.session_state[key]
             # Run backtest
@@ -1791,7 +1752,7 @@ with tab3:
                     missing_data_policy=missing_data_policy,
                     reweight_grace_days=reweight_grace_days
                 )
-                st.session_state['is_cross_corridor'] = True
+                st.session_state['bt_is_cross_corridor'] = True
                 # Store backtest results
                 st.session_state.ds_res = df_res_basket
                 st.session_state.long_tickers = backtest_metadata['long_tickers']
@@ -1835,7 +1796,7 @@ with tab3:
                     missing_data_policy=missing_data_policy,
                     reweight_grace_days=reweight_grace_days
                 )
-                st.session_state['is_cross_corridor'] = False
+                st.session_state['bt_is_cross_corridor'] = False
                 # Store backtest results
                 st.session_state.ds_res = df_res_basket
                 st.session_state.long_tickers = backtest_metadata['long_tickers']
@@ -1886,7 +1847,7 @@ with tab3:
             st.exception(e)
     # Display results if backtest completed
     if st.session_state.get('backtest_completed', False) and 'ds_res' in st.session_state:
-        is_cross_corridor = st.session_state.get('is_cross_corridor', False)
+        is_cross_corridor = st.session_state.get('bt_is_cross_corridor', False)
         # Guard: ensure Result series has data
         _ds_res = st.session_state.ds_res
         if _ds_res is None or _ds_res.empty or "Result" not in _ds_res.columns or _ds_res["Result"].dropna().empty:
@@ -1939,9 +1900,13 @@ with tab3:
             _bt_dl = st.session_state.get('bt_result_obj')
             if _bt_dl is not None:
                 from functions.dispersion.models import frames_to_zip_bytes
+                # Memoize per backtest-result object (rebuilt only on a new backtest)
+                _zip_key = f"_zip_bytes_bt_{id(_bt_dl)}"
+                if _zip_key not in st.session_state:
+                    st.session_state[_zip_key] = frames_to_zip_bytes(_bt_dl.to_frames())
                 st.download_button(
                     "⬇️ Download backtest data (zip of CSVs)",
-                    data=frames_to_zip_bytes(_bt_dl.to_frames()),
+                    data=st.session_state[_zip_key],
                     file_name="backtest_data.zip", mime="application/zip",
                     key="dl_bt_zip")
             with st.expander("📈 Per-Stock Time Series (Raw Data)"):
@@ -2207,7 +2172,7 @@ with tab3:
                         'result_series': st.session_state.ds_res["Result"],
                         'carry_series': df_res_60d["Result"] if 'df_res_60d' in dir() else st.session_state.get(
                             'carry_result_series'),
-                        'n_exp': st.session_state.get('n_exp'),
+                        'n_exp': st.session_state.get('bt_n_exp'),
                         'is_cross_corridor': is_cross_corridor,
                         'product_type': 'Vol Swap' if is_vol_swap else 'Var Swap',
                         'short_leg_display': '' if is_cross_corridor else _get_short_leg_display(
@@ -2356,21 +2321,17 @@ with tab4:
                                 _existing_lsv.empty if isinstance(_existing_lsv, pd.DataFrame) else True):
                             st.session_state.edited_df_lsv_p = pd.DataFrame(
                                 {'RIC': [], 'VolOfVar': [], 'Eq/VolCorrel': [], 'MeanReversion': []})
-                        st.data_editor(st.session_state.edited_df_lsv_p, num_rows="dynamic", use_container_width=True,
-                                       key="p_lsv_editor")
+                        # Capture the edited df — otherwise manual LSV edits are ignored.
+                        st.session_state.edited_df_lsv_p = st.data_editor(
+                            st.session_state.edited_df_lsv_p, num_rows="dynamic", use_container_width=True,
+                            key="p_lsv_editor")
                         lsv_paste_var = st.text_area("Paste LSV:", height=68, key="p_lsv_paste")
                         if st.button("Fill LSV", key="p_fill_lsv") and lsv_paste_var:
                             try:
-                                df = pd.read_csv(io.StringIO(lsv_paste_var), sep='\t' if '\t' in lsv_paste_var else ',',
-                                                 header=None)
-                                new_data = pd.DataFrame()
-                                for i, col in enumerate(['RIC', 'VolOfVar', 'Eq/VolCorrel', 'MeanReversion']):
-                                    if i < df.shape[1]:
-                                        new_data[col] = df.iloc[:, i] if col == 'RIC' else pd.to_numeric(df.iloc[:, i],
-                                                                                                         errors='coerce').fillna(
-                                            0.0)
-                                    else:
-                                        new_data[col] = [''] * len(df) if col == 'RIC' else [0.0] * len(df)
+                                new_data = _df_from_paste(
+                                    lsv_paste_var, ['RIC', 'VolOfVar', 'Eq/VolCorrel', 'MeanReversion'])
+                                for col in ['VolOfVar', 'Eq/VolCorrel', 'MeanReversion']:
+                                    new_data[col] = pd.to_numeric(new_data[col], errors='coerce').fillna(0.0)
                                 st.session_state.edited_df_lsv_p = new_data
                                 st.rerun()
                             except Exception as e:
@@ -2472,26 +2433,7 @@ with tab4:
             st.write("")
             if st.button("📋 Fill", key="p_fill_var") and pasted_text_var:
                 try:
-                    if '\n' not in pasted_text_var:
-                        values = pasted_text_var.split('\t') if '\t' in pasted_text_var else pasted_text_var.split(',')
-                        st.session_state.edited_df_corr_p = pd.DataFrame(
-                            {col: [values[i] if i < len(values) else ''] for i, col in enumerate(default_columns_var)})
-                    else:
-                        df = pd.read_csv(io.StringIO(pasted_text_var), sep='\t' if '\t' in pasted_text_var else ',',
-                                         header=None)
-                        new_data = pd.DataFrame()
-                        # Map pasted columns to expected columns based on column count
-                        # Expected columns: default_columns_var
-                        pasted_cols = df.shape[1] if df is not None else 0
-                        n_rows = len(df)
-                        # Default mapping: column index matches expected column order
-                        # Fill any missing columns with empty values
-                        for i, col in enumerate(default_columns_var):
-                            if i < pasted_cols:
-                                new_data[col] = df.iloc[:, i]
-                            else:
-                                new_data[col] = [''] * n_rows
-                        st.session_state.edited_df_corr_p = new_data
+                    st.session_state.edited_df_corr_p = _df_from_paste(pasted_text_var, default_columns_var)
                     st.rerun()
                 except Exception as e:
                     st.error(f"Error: {e}")
@@ -2507,10 +2449,17 @@ with tab4:
                                    st.session_state.edited_df_corr_p["Variance Asset"].astype(str).str.strip().tolist()
                                    if t and t != 'nan']
                     matu_ex, matu_stl = calculate_payment_dates(maturity_date_p, tickers_fpf[0])
-                    strikes_fpf = (st.session_state.edited_df_corr_p["Strikes (%)"].astype(
-                        float) / 100).tolist() if 'Strikes (%)' in st.session_state.edited_df_corr_p.columns else [
-                                                                                                                      0.15] * len(
-                        tickers_fpf)
+                    _df_fpf = st.session_state.edited_df_corr_p
+                    if 'Strikes (%)' in _df_fpf.columns:
+                        strikes_fpf = (_df_fpf["Strikes (%)"].astype(float) / 100).tolist()
+                    elif 'Strike Mono Var Swap (%)' in _df_fpf.columns:
+                        # Cross-corridor layout: the mono var-swap strike is the FPF strike
+                        strikes_fpf = (_df_fpf["Strike Mono Var Swap (%)"].astype(float) / 100).tolist()
+                    else:
+                        # Never silently price every leg at a 15% strike.
+                        st.error("No strike column found ('Strikes (%)' or "
+                                 "'Strike Mono Var Swap (%)') — cannot generate FPFs.")
+                        st.stop()
                     all_schedules = [
                         set(create_schedule(strike_date_p.strftime("%Y-%m-%d"), maturity_date_p.strftime("%Y-%m-%d"),
                                             "1D", get_trading_calendar(t), "MF")) for t in tickers_fpf]
@@ -2678,7 +2627,12 @@ with tab4:
             st.dataframe(_styled, use_container_width=True, height=600)
             # ── Export to Excel button (horizontal: tickers as rows, metrics as columns) ──
             from functions.dispersion.export_excel import export_result_matrix
-            _excel_bytes = export_result_matrix(st.session_state['pricing_results_df'], horizontal=True)
+            # Memoize per pricing-results object — the workbook rebuild is expensive.
+            _xls_key = f"_excel_bytes_pricing_{id(st.session_state['pricing_results_df'])}"
+            if _xls_key not in st.session_state:
+                st.session_state[_xls_key] = export_result_matrix(
+                    st.session_state['pricing_results_df'], horizontal=True)
+            _excel_bytes = st.session_state[_xls_key]
             if _excel_bytes:
                 st.download_button(
                     "📥 Download Result Matrix",
@@ -2720,8 +2674,10 @@ with tab4:
         if 'edited_df_volswap_p' not in st.session_state or set(
                 st.session_state.edited_df_volswap_p.columns.tolist()) != set(default_columns_vol):
             st.session_state.edited_df_volswap_p = pd.DataFrame({col: [] for col in default_columns_vol})
-        st.data_editor(st.session_state.edited_df_volswap_p, num_rows="dynamic", use_container_width=True,
-                       key="p_volswap_editor")
+        # Capture the edited df — otherwise manual pricing edits are ignored.
+        st.session_state.edited_df_volswap_p = st.data_editor(
+            st.session_state.edited_df_volswap_p, num_rows="dynamic", use_container_width=True,
+            key="p_volswap_editor")
         _vp_col, _vb_col = st.columns([4, 1])
         with _vp_col:
             pasted_text_vol = st.text_area("Paste data:", height=68, key="p_paste_vol")
@@ -2730,17 +2686,7 @@ with tab4:
             st.write("")
             if st.button("📋 Fill", key="p_fill_vol") and pasted_text_vol:
                 try:
-                    if '\n' not in pasted_text_vol:
-                        values = pasted_text_vol.split('\t') if '\t' in pasted_text_vol else pasted_text_vol.split(',')
-                        st.session_state.edited_df_volswap_p = pd.DataFrame(
-                            {col: [values[i] if i < len(values) else ''] for i, col in enumerate(default_columns_vol)})
-                    else:
-                        df = pd.read_csv(io.StringIO(pasted_text_vol), sep='\t' if '\t' in pasted_text_vol else ',',
-                                         header=None)
-                        new_data = pd.DataFrame()
-                        for i, col in enumerate(default_columns_vol):
-                            new_data[col] = df.iloc[:, i] if i < df.shape[1] else [''] * len(df)
-                        st.session_state.edited_df_volswap_p = new_data
+                    st.session_state.edited_df_volswap_p = _df_from_paste(pasted_text_vol, default_columns_vol)
                     st.rerun()
                 except Exception as e:
                     st.error(f"Error: {e}")

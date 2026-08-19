@@ -1,5 +1,9 @@
 {
-  "bundle_version": 1,
+  "active_mask": {
+    "present": false,
+    "sha256": null
+  },
+  "bundle_version": 2,
   "config": null,
   "constraints": {
     "crossover_rate": 0.8,
@@ -16,7 +20,7 @@
     "time_limit_seconds": 60.0,
     "tournament_size": 3
   },
-  "created_utc": "2026-08-12T11:59:54.822657+00:00",
+  "created_utc": "2026-08-19T14:18:07.170589+00:00",
   "long_candidates": [
     {
       "axe_cap": null,
@@ -150,8 +154,8 @@
     }
   ],
   "meta": {
-    "numpy": "2.4.6",
-    "pandas": "3.0.5"
+    "numpy": "1.26.4",
+    "pandas": "2.3.3"
   },
   "optimizer": {
     "adj_divs": false,
@@ -163,7 +167,7 @@
     "is_cross_corridor": false,
     "missing_data_policy": "reweight",
     "n_reference_samples": null,
-    "reweight_grace_days": 3,
+    "reweight_grace_days": 0,
     "vega_config": null
   },
   "provenance": {
