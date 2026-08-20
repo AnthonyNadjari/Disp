@@ -442,7 +442,6 @@ def build_corridor_fpf(
     # Calendar intersection audit log (cross-corridor only)
     global_cap = "Nothing"
     global_floor = "Nothing"
-    basket_leg_cap = 6.25 / 100 if high_barrier < 200 else "Nothing"
     if use_parameters:
         # Parameterized version for solving
         annot = fpf_to_price.varianceDetails.clone(
@@ -1996,10 +1995,7 @@ class PricingEngine(VolSwapMixin):
             strikes_ref.append(strike_va)
             strikes_linked.append(strike_ca)
 
-        ref_ticker = tickers[0]
         ref_corr_asset = corr_assets[0]
-        ref_currency = currencies[0]
-        is_cross = any(t != c for t, c in zip(tickers, corr_assets))
 
         # ── LSV validation (forbidden for mono corridor) ──
         use_lsv = cfg.use_lsv_cross_ev and cfg.lsv_params is not None
@@ -2133,7 +2129,6 @@ class PricingEngine(VolSwapMixin):
                 pass
 
         # ── Step 2: Create instruments and batch-price ──
-        t_price = time.time()
 
         # Model context
         is_index_product = ref_corr_asset.startswith(".") and all(t.startswith(".") for t in tickers)
@@ -2515,7 +2510,6 @@ class PricingEngine(VolSwapMixin):
         ref_ticker = tickers[0]
         ref_corr_asset = corr_assets[0]
         ref_currency = currencies[0]
-        ref_schedule_asset = schedule_assets[0]
 
         # DEBUG: Log schedule asset configuration
         for idx, (t, c, s) in enumerate(zip(tickers, corr_assets, schedule_assets)):
@@ -2761,7 +2755,6 @@ class PricingEngine(VolSwapMixin):
                 ).to_fpf_string()
 
             # ── Parallelize FPF serialization (CPU-bound, independent) ──
-            from concurrent.futures import ThreadPoolExecutor, as_completed
             t_clone = time.time()
             ev_cross_fpfs = {}
             ev_mono_fpfs = {}
@@ -2821,7 +2814,6 @@ class PricingEngine(VolSwapMixin):
                 pass
 
         # ── Step 3: Create instruments and batch-price (1 HTTP call) ──
-        t_price = time.time()
         # linked_asset already defined earlier (line ~2748)
 
         is_index_product = linked_asset.startswith(".") and all(t.startswith(".") for t in tickers)
@@ -3688,15 +3680,6 @@ class PricingEngine(VolSwapMixin):
                 ev_cross_lcm_values = [_get_bump_fv(i, "LCM") for i in range(n_ev)] if use_lcm_solve else [None] * n_ev
 
                 # ── LCM extraction (first ticker only) ──
-                if use_lcm_solve and n_ev > 0:
-                    _ra_proof = ra_values_by_corr.get(corr_assets[0])
-                    if ev_cross_values[0] is not None and _ra_proof is not None and _ra_proof != 0:
-                        import math as _m
-                        _strike_lv = _m.sqrt(abs(-ev_cross_values[0] / _ra_proof))
-                    if ev_cross_lcm_values[0] is not None and _ra_proof is not None and _ra_proof != 0:
-                        import math as _m
-                        _strike_lcm = _m.sqrt(abs(-ev_cross_lcm_values[0] / _ra_proof))
-
                 # Vols and correlation from LV bump
 
                 atmf_vols_cross = {tickers[i]: _get_bump_vol(i, "LV", tickers[i]) for i in
@@ -4647,7 +4630,6 @@ class PricingEngine(VolSwapMixin):
             return None
         cfg = self.config
         rows = []
-        _sqrt = math.sqrt
         for r in results:
             if cfg.is_cross_corridor and r.ticker != r.corridor_asset:
                 row = {
