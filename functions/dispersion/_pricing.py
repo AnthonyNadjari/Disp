@@ -153,6 +153,124 @@ def calculate_payment_dates(obs_date, ric_or_currency):
     return _payment_dates_impl(obs_date, ric_or_currency)
 
 
+# ── PayoutTrace RA: unfunded ZCB + expected in-corridor days ─────────────────
+#
+# Alternative to pricing a dedicated range-accrual instrument per corridor
+# asset: the portal metric ``PayoutTraceVariableExpectation`` with
+# ``DumpStateNames=var_calculatePayoff_nCorridorObs`` returns the EXPECTED
+# number of in-corridor observation days directly on the EV instrument.
+# Because that expectation is undiscounted (unlike the RA instrument fair
+# value), the discount factor must be reintroduced explicitly:
+#
+#     RA = ZCB_unfunded(currency, strike_date, maturity) * E[n_corridor_obs] / n_total_obs
+#
+# Mono and cross legs of the same line share the corridor asset and the
+# barriers, so E[n_corridor_obs] is identical for both — the metric is only
+# needed once per UNIQUE corridor asset (the mono universe), cross legs reuse it.
+
+_PAYOUT_TRACE_METRIC = "PayoutTraceVariableExpectation"
+_PAYOUT_TRACE_VAR = "var_calculatePayoff_nCorridorObs"
+_ZCB_CACHE: Dict[tuple, float] = {}
+
+
+def _unfunded_zcb(currency: str, start_date, maturity_date, snap_name: str = None) -> float:
+    """Unfunded zero-coupon bond (discount factor) at 100% reoffer.
+
+    ``get_bullet_funding`` with ``apply_spread_adjustment=False`` and
+    ``spread_override=0.0`` — i.e. the pure rates ZCB, no funding spread.
+    Cached per (currency, start, maturity, snap).
+    """
+    key = (str(currency), str(start_date), str(maturity_date), snap_name)
+    if key in _ZCB_CACHE:
+        return _ZCB_CACHE[key]
+    _ensure_portal()
+    from fpf_builder_utils.funding import get_bullet_funding as _get_bullet_funding
+    funding = _get_bullet_funding(
+        pricing_portal=pricing_portal,
+        start_date=start_date,
+        maturity_date=maturity_date,
+        currency=currency,
+        product="WOBEN",
+        treasury_deposit_frequency=(3, "M"),
+        yield_curve_snap=snap_name or live_snap["name"],
+        apply_spread_adjustment=False,
+        spread_scaling_factor=1.0,   # 100% reoffer
+        display_spread_adjustment=False,
+        spread_override=0.0,         # unfunded
+    )
+    zcb = float(funding.ZCB)
+    _ZCB_CACHE[key] = zcb
+    return zcb
+
+
+def _parse_payout_trace_value(raw) -> Optional[float]:
+    """Recursively find ``var_calculatePayoff_nCorridorObs`` in a portal response
+    (the metric payload is a SERIALIZED JSON string under extraResults)."""
+    import json as _json
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        try:
+            return _parse_payout_trace_value(_json.loads(raw))
+        except (ValueError, TypeError):
+            return None
+    if isinstance(raw, dict):
+        if _PAYOUT_TRACE_VAR in raw:
+            try:
+                return float(raw[_PAYOUT_TRACE_VAR])
+            except (TypeError, ValueError):
+                return None
+        for v in raw.values():
+            found = _parse_payout_trace_value(v)
+            if found is not None:
+                return found
+        return None
+    if isinstance(raw, (list, tuple)):
+        for v in raw:
+            found = _parse_payout_trace_value(v)
+            if found is not None:
+                return found
+    return None
+
+
+def _n_corridor_obs(instruments, valuation_date, model_context, snap_name: str,
+                    price_id: str = "PayoutTraceRA") -> List[Optional[float]]:
+    """Expected in-corridor observation days per instrument (aligned list).
+
+    One pricing call for all instruments with ONLY the PayoutTrace metric —
+    much cheaper than a dedicated RA instrument per corridor asset.
+    """
+    _ensure_portal()
+    raw = pricing_portal.price(
+        price_id=price_id,
+        instruments=instruments,
+        valuation_date=valuation_date,
+        metrics=[{
+            "name": _PAYOUT_TRACE_METRIC,
+            "metricParameters": {"DumpStateNames": {"value": _PAYOUT_TRACE_VAR}},
+        }],
+        calculation_parameters={},
+        model_context=model_context,
+        overridden_snap_name=snap_name,
+    )
+    # Preferred positional extraction: results.{price_id}.PayoutTraceVariableExpectation[i]
+    results = raw.get("results", {}) if isinstance(raw, dict) else {}
+    entries = results.get(price_id, {}).get(_PAYOUT_TRACE_METRIC, [])
+    out: List[Optional[float]] = []
+    for i in range(len(instruments)):
+        val = None
+        if i < len(entries):
+            val = _parse_payout_trace_value(entries[i])
+        out.append(val)
+    return out
+
+
+def _ra_from_payout_trace(n_corridor_obs: float, n_total_obs: int, zcb: float) -> float:
+    """RA equivalent of the legacy range-accrual instrument:
+    discounted expected in-corridor day fraction."""
+    return zcb * (float(n_corridor_obs) / float(n_total_obs))
+
+
 # Module-level state (portal connection)
 pricing_portal = None
 live_snap = None
