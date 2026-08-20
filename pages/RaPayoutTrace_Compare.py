@@ -46,21 +46,26 @@ def _build_instrument(var_asset, corr_asset, is_capped, strike_date, last_obs_da
         schedule_calendar_asset=var_asset,
         use_parameters=False,
     )
-    from speq.fpf.unified_economics_schema.fpf_schema import FPFUnifiedEconomicsWrapper
     from pricingportal import NovaIdSource
-    wrapper = FPFUnifiedEconomicsWrapper.from_data(fpf)
+    from functions.dispersion._portal import observation_schedule
+
     portal = get_pricing_portal()
     underlyings = [
         portal.load_instrument(schema=NovaIdSource.REUTERS, instrument_id=u)
         for u in sorted({var_asset, corr_asset})
     ]
     nova = portal.create_fpf(
-        fpf_string=wrapper.to_fpf_string(),
+        fpf_string=fpf,
         instrument_ccy=currency,
         underlyings=underlyings,
         premium_date=strike_date,
     )
-    return nova, len(wrapper.observationDates) - 1  # engine convention: today excluded
+    # n_total via the SAME calendar intersection the FPF builder uses
+    # (engine convention: today excluded, hence the -1)
+    sched_var = set(observation_schedule(strike_date, last_obs_date, var_asset))
+    sched_corr = set(observation_schedule(strike_date, last_obs_date, corr_asset))
+    n_total = len(sched_var & sched_corr) - 1
+    return nova, n_total
 
 
 def _solve_ra_old(df, cross, barrier_dn, barrier_up, strike_date, last_obs_date):

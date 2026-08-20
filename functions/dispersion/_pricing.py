@@ -3348,6 +3348,57 @@ class PricingEngine(VolSwapMixin):
             results_map = batch_res
             results_map_atms = batch_res_atms if batch_res_atms else {}
 
+            # ── VOL DEBUG (opt-in): dump what the portal REALLY returned per
+            # instrument — PrimaryAssetRef values vs the assets we match on.
+            # Enable with DISP_PRICING_DEBUG_VOLS=1 in the environment.
+            if os.environ.get("DISP_PRICING_DEBUG_VOLS") == "1":
+                try:
+                    def _dbg_unwrap(entry):
+                        if not isinstance(entry, dict):
+                            return []
+                        vl = entry.get("QueryLocalCcyVol", [])
+                        if isinstance(vl, list) and vl:
+                            return vl
+                        for bn in ("LV", "LSV", "LSV0", "LCM"):
+                            bd = entry.get(bn, [])
+                            if isinstance(bd, list) and bd and isinstance(bd[0], dict):
+                                vl = bd[0].get("QueryLocalCcyVol", [])
+                                if isinstance(vl, list) and vl:
+                                    return vl
+                        bumps = entry.get("SimpleScenarioBump", [])
+                        if isinstance(bumps, list) and bumps and isinstance(bumps[0], dict):
+                            for bn in ("LV", "LSV", "LSV0", "LCM"):
+                                bd = bumps[0].get(bn, [])
+                                if isinstance(bd, list) and bd and isinstance(bd[0], dict):
+                                    vl = bd[0].get("QueryLocalCcyVol", [])
+                                    if isinstance(vl, list) and vl:
+                                        return vl
+                        return []
+
+                    for _di in range(len(instruments)):
+                        if _di < n_ev:
+                            _block, _expected = "EV_CROSS", tickers[_di]
+                        elif _di < n_ev + n_ev_mono:
+                            _block, _expected = "EV_MONO", mono_corr_order[_di - n_ev]
+                        else:
+                            _block, _expected = "RA", mono_corr_order[_di - n_ev - n_ev_mono]
+                        _run = 0
+                        _entry = None
+                        for _cs in sorted(results_map.keys()):
+                            _cd = results_map[_cs]
+                            if _di < _run + _cd["chunk_size"]:
+                                _li = _di - _run
+                                _key = "Price" if _li == 0 else f"Price_{_li}"
+                                _entry = _cd["raw"].get(_key)
+                                break
+                            _run += _cd["chunk_size"]
+                        _pairs = [(v.get("PrimaryAssetRef"), v.get("value"))
+                                  for v in _dbg_unwrap(_entry) if isinstance(v, dict)]
+                        _safe_print(f"[VOL-DEBUG] [{_di:02d}] {_block} expected={_expected} | "
+                                    f"portal returned: {_pairs if _pairs else 'NOTHING'}")
+                except Exception as _vdbe:
+                    _safe_print(f"[VOL-DEBUG] failed: {_vdbe}")
+
 
         # ── Unified metric extraction ──
         # The portal can return in different formats. We figure it out from the raw response.
