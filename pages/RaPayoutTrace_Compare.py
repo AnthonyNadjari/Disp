@@ -64,11 +64,15 @@ def _build_instrument(var_asset, corr_asset, is_capped, strike_date, last_obs_da
     return nova, len(wrapper.observationDates) - 1  # engine convention: today excluded
 
 
-def _solve_ra_old(df, cross, cfg_kwargs):
-    cfg = DispersionConfig(product_type=ProductType.VAR_SWAP_CORRIDOR,
-                           cross_corridor=cross, **cfg_kwargs)
+def _solve_ra_old(df, cross, barrier_dn, barrier_up, strike_date, last_obs_date):
+    cfg = DispersionConfig(
+        product_type=ProductType.VAR_SWAP_CORRIDOR,
+        cross_corridor=cross,
+        barrier_up=barrier_up, barrier_down=barrier_dn,
+        local_cap=2.5, is_capped=True,
+    )
     res = solve(df=df, config=cfg,
-                last_obs_date=cfg_kwargs["_last_obs"], strike_date=cfg_kwargs["_strike"],
+                last_obs_date=last_obs_date, strike_date=strike_date,
                 eqeq_lambda=0.10, eqfx_shift=-0.05, vol_mode="ATMF")
     if not res.success:
         raise RuntimeError(f"solve failed for {list(df['Variance Asset'])}")
@@ -100,10 +104,6 @@ if run:
             s, i = p.split("/", 1)
             cross_pairs.append((s.strip(), i.strip()))
 
-    cfg_kwargs = dict(barrier_up=barrier_up, barrier_down=barrier_dn,
-                      local_cap=2.5, is_capped=True,
-                      _last_obs=last_obs_date, _strike=strike_date)
-
     portal = get_pricing_portal()
     snap = get_live_snap()
     model_context = portal.create_model_context(
@@ -118,7 +118,7 @@ if run:
                 "Corridor Condition Asset": mono_tickers,
                 "Currency": [currency] * len(mono_tickers),
             })
-            res = _solve_ra_old(mono_df, False, cfg_kwargs)
+            res = _solve_ra_old(mono_df, False, barrier_dn, barrier_up, strike_date, last_obs_date)
             for tr in res.ticker_results:
                 nova, n_total = _build_instrument(tr.ticker, tr.ticker, True,
                                                   strike_date, last_obs_date,
@@ -137,7 +137,7 @@ if run:
                 "Corridor Condition Asset": [s for s, _ in cross_pairs],
                 "Currency": [currency] * len(cross_pairs),
             })
-            res = _solve_ra_old(cross_df, True, cfg_kwargs)
+            res = _solve_ra_old(cross_df, True, barrier_dn, barrier_up, strike_date, last_obs_date)
             for tr in res.ticker_results:
                 # index leg
                 nova, n_total = _build_instrument(tr.ticker, tr.corridor_asset, True,
