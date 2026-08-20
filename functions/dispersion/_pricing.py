@@ -1480,6 +1480,10 @@ class TickerResult:
     ev_cap_mono_lsv0: Optional[float] = None  # capped EV mono under LSV0
     ev_cap_mono_lsv: Optional[float] = None  # capped EV mono under LSV
     error: Optional[str] = None
+    # Display extras (both solve paths): unfunded ZCB of the leg currency and
+    # the as-if-vanilla strike sqrt(-EV/ZCB) of the corridor EV.
+    discount_factor: Optional[float] = None
+    strike_vanilla_var: Optional[float] = None
 
 @dataclass
 class PricingResult:
@@ -2652,7 +2656,7 @@ class PricingEngine(VolSwapMixin):
                     ),
                 )
 
-                mono_ra_obj = mono_ev_obj.clone(
+                mono_ra_obj = None if cfg.use_payout_trace_ra else mono_ev_obj.clone(
                     varianceDetails=mono_ev_obj.varianceDetails.clone(
                         varianceAssetsAndIndexLegDetails=[
                             mono_ev_obj.varianceDetails.varianceAssetsAndIndexLegDetails[0].clone(
@@ -4087,6 +4091,24 @@ class PricingEngine(VolSwapMixin):
                     _ra_disp = ra_val
                     _ra_disp_mono = ra_values_by_corr.get(corr_assets[idx])
 
+                # Display extras: unfunded ZCB of the leg currency (reused from
+                # the RA computation in PayoutTrace mode) + as-if-vanilla strike
+                # sqrt(-EV/ZCB) of the corridor EV. Funding failure never breaks
+                # the run — the columns are just left empty.
+                _zcb_leg = ra_zcb_by_corr.get(corr_assets[idx]) if cfg.use_payout_trace_ra else None
+                if _zcb_leg is None:
+                    try:
+                        _zcb_leg = _unfunded_zcb(currencies[idx], cfg.strike_date,
+                                                 cfg.last_obs_date, live_snap["name"])
+                    except Exception:
+                        _zcb_leg = None
+                _vanilla_var = None
+                if _zcb_leg and ev_val is not None and ev_val != 0:
+                    try:
+                        _vanilla_var = math.sqrt(abs(-ev_val / _zcb_leg))
+                    except Exception:
+                        _vanilla_var = None
+
                 indexed_results[idx] = (TickerResult(
                     ticker=ticker,
                     corridor_asset=corr_assets[idx],
@@ -4132,6 +4154,8 @@ class PricingEngine(VolSwapMixin):
                     atms_vol_corridor_asset=atms_linked,
                     vol_spread=vol_spread,
                     correlation=corr_value,
+                    discount_factor=_zcb_leg,
+                    strike_vanilla_var=_vanilla_var,
                 ), None)
 
             except Exception as e:
@@ -4849,6 +4873,15 @@ class PricingEngine(VolSwapMixin):
                             'Sparx Notional per 1k EUR Vega (Cross)'] = f"{100 * 1000 / (2 * r.strike_variance_asset):,.2f}"
                         row[
                             'Sparx Notional per 1k EUR Vega (Mono)'] = f"{100 * 1000 / (2 * r.strike_corridor_asset):,.2f}"
+                    # ── Display extras (ZCB, barriers, tenor, vanilla strike) ──
+                    if r.discount_factor is not None:
+                        row['Discount Factor'] = f"{r.discount_factor:.6f}"
+                    row['Barrier Down (%)'] = f"{cfg.dvar * 100:.0f}%"
+                    row['Barrier Up (%)'] = f"{cfg.uvar * 100:.0f}%"
+                    if r.obs_dates_cross is not None:
+                        row['Tenor (bd)'] = r.obs_dates_cross
+                    if r.strike_vanilla_var is not None:
+                        row['Strike Vanilla Var (%)'] = f"{r.strike_vanilla_var * 100:.2f}%"
                 else:
                     row['Status'] = r.error or 'Failed'
             else:
@@ -4889,6 +4922,15 @@ class PricingEngine(VolSwapMixin):
                     row['FPF Mono LSV Cap'] = r.fpf_string_cap_lsv_mono if r.fpf_string_cap_lsv_mono else ''
                     if r.strike_variance_asset:
                         row['Sparx Notional per 1k EUR Vega'] = f"{100 * 1000 / (2 * r.strike_variance_asset):,.2f}"
+                    # ── Display extras (ZCB, barriers, tenor, vanilla strike) ──
+                    if r.discount_factor is not None:
+                        row['Discount Factor'] = f"{r.discount_factor:.6f}"
+                    row['Barrier Down (%)'] = f"{cfg.dvar * 100:.0f}%"
+                    row['Barrier Up (%)'] = f"{cfg.uvar * 100:.0f}%"
+                    if r.obs_dates_cross is not None:
+                        row['Tenor (bd)'] = r.obs_dates_cross
+                    if r.strike_vanilla_var is not None:
+                        row['Strike Vanilla Var (%)'] = f"{r.strike_vanilla_var * 100:.2f}%"
                 else:
                     row['Status'] = r.error or 'Failed'
             rows.append(row)

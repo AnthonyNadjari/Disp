@@ -1,13 +1,14 @@
-"""RA Comparison page — legacy range-accrual instrument vs PayoutTrace RA.
+"""RA Comparison page — legacy RA instruments vs PayoutTrace RA (engine flag).
 
-Ultra-simple: click "Run comparison", get RA_old vs RA_new side by side.
+Ultra-simple: click "Run comparison" — the SAME solve is run twice through the
+engine (use_payout_trace_ra OFF vs ON) and the RA / strike columns are compared.
 
 Run from the repo root:
     streamlit run pages/RaPayoutTrace_Compare.py
 """
 
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -19,73 +20,13 @@ if str(ROOT) not in sys.path:
 
 from functions.dispersion import solve, DispersionConfig
 from functions.dispersion.models import ProductType
-from functions.dispersion._pricing import (
-    build_corridor_fpf,
-    get_pricing_portal,
-    get_live_snap,
-    _n_corridor_obs,
-    _unfunded_zcb,
-)
-
-MODEL_CONTEXT_NAME = "EMEA-Stocks-MC-LV-MultiAsset"
-
-
-def _build_instrument(var_asset, corr_asset, is_capped, strike_date, last_obs_date,
-                      barrier_dn, barrier_up, currency):
-    fpf = build_corridor_fpf(
-        tickers=[var_asset],
-        last_obs_date=last_obs_date,
-        strike_date=strike_date,
-        strikes=[0.000001],  # placeholder — RA does not depend on the strike
-        weights=[1.0],
-        low_barrier=barrier_dn,
-        high_barrier=barrier_up,
-        is_capped=is_capped,
-        corr_asset=corr_asset,
-        currency=currency,
-        schedule_calendar_asset=var_asset,
-        use_parameters=False,
-    )
-    from pricingportal import NovaIdSource
-    from functions.dispersion._portal import observation_schedule
-
-    portal = get_pricing_portal()
-    underlyings = [
-        portal.load_instrument(schema=NovaIdSource.REUTERS, instrument_id=u)
-        for u in sorted({var_asset, corr_asset})
-    ]
-    nova = portal.create_fpf(
-        fpf_string=fpf,
-        instrument_ccy=currency,
-        underlyings=underlyings,
-        premium_date=strike_date,
-    )
-    # n_total via the SAME calendar intersection the FPF builder uses
-    # (engine convention: today excluded, hence the -1)
-    sched_var = set(observation_schedule(strike_date, last_obs_date, var_asset))
-    sched_corr = set(observation_schedule(strike_date, last_obs_date, corr_asset))
-    n_total = len(sched_var & sched_corr) - 1
-    return nova, n_total
-
-
-def _solve_ra_old(df, cross, barrier_dn, barrier_up, strike_date, last_obs_date):
-    cfg = DispersionConfig(
-        product_type=ProductType.VAR_SWAP_CORRIDOR,
-        cross_corridor=cross,
-        barrier_up=barrier_up, barrier_down=barrier_dn,
-        local_cap=2.5, is_capped=True,
-    )
-    res = solve(df=df, config=cfg,
-                last_obs_date=last_obs_date, strike_date=strike_date,
-                eqeq_lambda=0.10, eqfx_shift=-0.05, vol_mode="ATMF")
-    if not res.success:
-        raise RuntimeError(f"solve failed for {list(df['Variance Asset'])}")
-    return res
-
 
 st.set_page_config(page_title="RA Comparison", page_icon="⚖️", layout="wide")
-st.title("⚖️ RA Comparison — legacy instrument vs PayoutTrace")
-st.caption("RA_old (range-accrual instrument) vs RA_new = ZCB unfunded × E[nCorridorObs] / n_total")
+st.title("⚖️ RA — legacy instruments vs PayoutTrace (use_payout_trace_ra)")
+st.caption(
+    "Same solve, run twice through the engine. Expected: strikes identical (MC "
+    "noise aside); RA displayed ≈ legacy/ZCB in the new path (undiscounted fraction)."
+)
 
 with st.sidebar:
     st.header("Inputs")
@@ -108,76 +49,83 @@ if run:
             s, i = p.split("/", 1)
             cross_pairs.append((s.strip(), i.strip()))
 
-    portal = get_pricing_portal()
-    snap = get_live_snap()
-    model_context = portal.create_model_context(
-        name=MODEL_CONTEXT_NAME, instrument_model_parameters={})
+    cfg_common = dict(
+        product_type=ProductType.VAR_SWAP_CORRIDOR,
+        barrier_up=barrier_up, barrier_down=barrier_dn,
+        local_cap=2.5, is_capped=True,
+    )
+
+    def _run(df, cross, ptr):
+        cfg = DispersionConfig(cross_corridor=cross, **cfg_common)
+        res = solve(df=df, config=cfg,
+                    last_obs_date=last_obs_date, strike_date=strike_date,
+                    eqeq_lambda=0.10, eqfx_shift=-0.05, vol_mode="ATMF",
+                    use_payout_trace_ra=ptr)
+        if not res.success:
+            raise RuntimeError(f"solve failed (ptr={ptr}) for {list(df['Variance Asset'])}")
+        return res
 
     rows = []
-    with st.spinner("Solving + pricing metric..."):
-        # Mono
-        if mono_tickers:
-            mono_df = pd.DataFrame({
-                "Variance Asset": mono_tickers,
-                "Corridor Condition Asset": mono_tickers,
-                "Currency": [currency] * len(mono_tickers),
-            })
-            res = _solve_ra_old(mono_df, False, barrier_dn, barrier_up, strike_date, last_obs_date)
-            for tr in res.ticker_results:
-                nova, n_total = _build_instrument(tr.ticker, tr.ticker, True,
-                                                  strike_date, last_obs_date,
-                                                  barrier_dn, barrier_up, currency)
-                n_obs = _n_corridor_obs([nova], datetime.now(), model_context, snap["name"])[0]
-                zcb = _unfunded_zcb(currency, strike_date, last_obs_date)
-                rows.append({"case": "mono", "ticker": tr.ticker,
-                             "RA_old": tr.range_accrual,
-                             "n_obs": n_obs, "n_total_obs": n_total, "ZCB": zcb})
 
-        # Cross
-        if cross_pairs:
-            cross_df = pd.DataFrame({
-                "Variance Asset": [i for _, i in cross_pairs],
-                "Corridor Condition Asset": [s for s, _ in cross_pairs],
-                "Currency": [currency] * len(cross_pairs),
+    def _fill(df, cross, label_fn):
+        with st.spinner("Legacy solve (flag OFF)..."):
+            res_old = _run(df, cross, False)
+        with st.spinner("PayoutTrace solve (flag ON)..."):
+            res_new = _run(df, cross, True)
+        by_ticker_old = {tr.ticker: tr for tr in res_old.ticker_results}
+        for tr_new in res_new.ticker_results:
+            tr_old = by_ticker_old.get(tr_new.ticker)
+            if tr_old is None:
+                continue
+            rows.append({
+                "case": label_fn(tr_new),
+                "ticker": tr_new.ticker,
+                "corr": tr_new.corridor_asset,
+                "RA_legacy": tr_old.range_accrual,
+                "RA_ptrace(undisc)": tr_new.range_accrual,
+                "ZCB": tr_new.discount_factor,
+                "strike_legacy": tr_old.strike_variance_asset,
+                "strike_ptrace": tr_new.strike_variance_asset,
+                "strike_mono_legacy": tr_old.strike_corridor_asset,
+                "strike_mono_ptrace": tr_new.strike_corridor_asset,
+                "vanilla_var": tr_new.strike_vanilla_var,
             })
-            res = _solve_ra_old(cross_df, True, barrier_dn, barrier_up, strike_date, last_obs_date)
-            for tr in res.ticker_results:
-                # index leg
-                nova, n_total = _build_instrument(tr.ticker, tr.corridor_asset, True,
-                                                  strike_date, last_obs_date,
-                                                  barrier_dn, barrier_up, currency)
-                n_obs = _n_corridor_obs([nova], datetime.now(), model_context, snap["name"])[0]
-                zcb = _unfunded_zcb(currency, strike_date, last_obs_date)
-                rows.append({"case": "cross (index leg)", "ticker": f"{tr.ticker}/{tr.corridor_asset}",
-                             "RA_old": tr.range_accrual,
-                             "n_obs": n_obs, "n_total_obs": n_total, "ZCB": zcb})
-                # mono leg — same corridor asset, same n_obs (no extra call needed in prod)
-                nova_m, _ = _build_instrument(tr.corridor_asset, tr.corridor_asset, True,
-                                              strike_date, last_obs_date,
-                                              barrier_dn, barrier_up, currency)
-                n_obs_m = _n_corridor_obs([nova_m], datetime.now(), model_context, snap["name"])[0]
-                rows.append({"case": "cross (mono leg)", "ticker": tr.corridor_asset,
-                             "RA_old": tr.range_accrual_mono,
-                             "n_obs": n_obs_m, "n_total_obs": n_total, "ZCB": zcb})
+
+    if mono_tickers:
+        mono_df = pd.DataFrame({
+            "Variance Asset": mono_tickers,
+            "Corridor Condition Asset": mono_tickers,
+            "Currency": [currency] * len(mono_tickers),
+        })
+        _fill(mono_df, False, lambda tr: "mono")
+
+    if cross_pairs:
+        cross_df = pd.DataFrame({
+            "Variance Asset": [i for _, i in cross_pairs],
+            "Corridor Condition Asset": [s for s, _ in cross_pairs],
+            "Currency": [currency] * len(cross_pairs),
+        })
+        _fill(cross_df, True, lambda tr: "cross")
 
     out = pd.DataFrame(rows)
-    # Three candidate formulas side by side — the run tells us which one the
-    # portal's metric semantics match (×ZCB = we discount; ÷ZCB or plain = the
-    # metric is already discounted / RA instrument is undiscounted).
-    frac = out["n_obs"] / out["n_total_obs"]
-    out["RA_×zcb"] = (out["ZCB"] * frac).round(6)
-    out["RA_÷zcb"] = (frac / out["ZCB"]).round(6)
-    out["RA_no_zcb"] = frac.round(6)
-    for variant in ["RA_×zcb", "RA_÷zcb", "RA_no_zcb"]:
-        out[f"diff_%_{variant}"] = ((out[variant] - out["RA_old"]).abs()
-                                    / out["RA_old"].abs() * 100).round(4)
+    if out.empty:
+        st.error("No comparable rows (both solves must succeed).")
+    else:
+        out["dstrike_%"] = ((out["strike_ptrace"] - out["strike_legacy"]).abs()
+                            / out["strike_legacy"].abs() * 100).round(4)
+        out["dstrike_mono_%"] = ((out["strike_mono_ptrace"] - out["strike_mono_legacy"]).abs()
+                                 / out["strike_mono_legacy"].abs() * 100).round(4)
+        out["RA_check (legacy×1/ZCB)"] = (out["RA_legacy"] / out["ZCB"]).round(4)
 
-    st.dataframe(out, use_container_width=True)
+        st.dataframe(out, use_container_width=True)
 
-    st.caption("Compare each variant column against **RA_old** — the matching "
-               "formula is the one with all diffs ≈ 0 (MC noise aside). "
-               "Report back which variant wins and the engine switches to it.")
-    for variant in ["RA_×zcb", "RA_÷zcb", "RA_no_zcb"]:
-        worst_v = out[f"diff_%_{variant}"].max()
-        (st.success if worst_v < 0.1 else st.warning)(
-            f"{variant}: worst diff {worst_v:.4f}%")
+        worst = out[["dstrike_%", "dstrike_mono_%"]].max().max()
+        if worst < 0.1:
+            st.success(f"✅ PASS — worst strike diff: {worst:.4f}% (threshold 0.1%)")
+        else:
+            st.error(f"⚠️ CHECK — worst strike diff: {worst:.4f}% (threshold 0.1%)")
+        st.caption(
+            "Strikes must match (MC noise aside). RA_ptrace should equal "
+            "RA_check = legacy/ZCB (the undiscounted day fraction). "
+            "vanilla_var = sqrt(−EV/ZCB)."
+        )
