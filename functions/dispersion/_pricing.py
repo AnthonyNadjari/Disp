@@ -3348,11 +3348,10 @@ class PricingEngine(VolSwapMixin):
             results_map = batch_res
             results_map_atms = batch_res_atms if batch_res_atms else {}
 
-            # ── VOL DEBUG (always on, temporary): dump what the portal REALLY
-            # returned per instrument — PrimaryAssetRef values vs the assets we
-            # match on. If you see no [VOL-DEBUG] line in the console, the app
-            # is NOT running this file.
-            if True:
+            # ── VOL DEBUG (opt-in, DISP_PRICING_DEBUG_VOLS=1): dump what the
+            # portal REALLY returned per instrument — PrimaryAssetRef values
+            # vs the assets we match on.
+            if os.environ.get("DISP_PRICING_DEBUG_VOLS") == "1":
                 try:
                     def _dbg_unwrap(entry):
                         if not isinstance(entry, dict):
