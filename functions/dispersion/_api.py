@@ -54,6 +54,7 @@ the top of functions/dispersion/_backtester.py.
 """
 from __future__ import annotations
 
+import re
 import warnings
 import numpy as np
 import pandas as pd
@@ -164,11 +165,40 @@ def _warn_if_decimal_strikes(df: pd.DataFrame, col: str, fn_name: str):
 # DATAFRAME → STOCK CONVERSION
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# ── RIC / BBG dual input ──
+# Input tables accept both forms ("AAPL.O" / "ISP.MI" / ".STOXX50E" or
+# "AAPL US Equity" / "SPX Index"); RICs are normalized to the BBG form the
+# Bloomberg loader needs (desk-network conversion, cached; anything
+# unrecognized is kept as-is and the loader warns loudly).
+
+_RIC_STOCK_RE = re.compile(r"^[A-Z0-9]{1,12}\.[A-Z]{1,4}$")
+_ticker_conv_cache: Dict[str, str] = {}
+
+
+def _looks_like_ric(name: str) -> bool:
+    name = str(name).strip()
+    return name.startswith(".") or bool(_RIC_STOCK_RE.match(name))
+
+
+def _to_bbg(name) -> str:
+    """Normalize a ticker to BBG form if it is a RIC; pass BBG names through."""
+    name = str(name).strip()
+    if not name or not _looks_like_ric(name):
+        return name
+    if name not in _ticker_conv_cache:
+        try:
+            from functions.common.tickers import ric_to_bbg
+            _ticker_conv_cache[name] = ric_to_bbg(name) or name
+        except Exception:
+            _ticker_conv_cache[name] = name
+    return _ticker_conv_cache[name]
+
+
 def _df_to_legs(df: pd.DataFrame, is_cross_corridor: bool) -> List[DispersionLeg]:
     """Parse a tickers DataFrame into DispersionLeg objects with unit conversions."""
     legs = []
     for _, row in df.iterrows():
-        var_asset = str(row['Variance Asset']).strip()
+        var_asset = _to_bbg(row['Variance Asset'])
 
         # Strike: DataFrame is percentage → DispersionLeg is decimal
         # Long leg uses Strike Mono Var Swap (%)
@@ -184,7 +214,7 @@ def _df_to_legs(df: pd.DataFrame, is_cross_corridor: bool) -> List[DispersionLeg
         corr_asset = None
         cross_strike = None
         if is_cross_corridor:
-            corr_asset = str(row.get('Corridor Condition Asset', '')).strip() or None
+            corr_asset = _to_bbg(row.get('Corridor Condition Asset', '')) or None
             cross_strike_pct = float(row.get('Strike Cross Corridor (%)'))
             if pd.isna(cross_strike_pct):
                 raise ValueError(f"Cross-corridor backtest requires 'Strike Cross Corridor (%)' for '{var_asset}'.")
@@ -226,7 +256,7 @@ def _df_to_backtest_inputs(df: pd.DataFrame, is_cross_corridor: bool) -> Tuple[L
     legs = []
     weights = {}
     for idx, row in df.iterrows():
-        var_asset = str(row['Variance Asset']).strip()
+        var_asset = _to_bbg(row['Variance Asset'])
         weight_pct = float(row['Weight (%)'])
         if not np.isfinite(weight_pct):
             # A NaN weight fails both w>0 and w<0 downstream and the leg would
@@ -247,7 +277,7 @@ def _df_to_backtest_inputs(df: pd.DataFrame, is_cross_corridor: bool) -> Tuple[L
         corr_asset = None
         cross_strike = None
         if is_cross_corridor:
-            corr_asset = str(row.get('Corridor Condition Asset', '')).strip() or None
+            corr_asset = _to_bbg(row.get('Corridor Condition Asset', '')) or None
             cross_strike_pct = float(row.get('Strike Cross Corridor (%)'))
             if pd.isna(cross_strike_pct):
                 raise ValueError(f"Cross-corridor backtest requires 'Strike Cross Corridor (%)' for '{var_asset}'.")
