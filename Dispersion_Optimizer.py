@@ -210,15 +210,21 @@ def _df_from_paste(text: str, cols) -> pd.DataFrame:
         return pd.DataFrame({col: [values[i] if i < len(values) else '']
                              for i, col in enumerate(cols)})
     df = pd.read_csv(io.StringIO(text), sep='\t' if '\t' in text else ',', header=None)
-    # Header row: first cell IS a column name (exact match, case-insensitive)
-    # or a generic label. Substring matching is NOT safe — a real ticker like
-    # "SPX Index" contains "index" and must never be dropped as a header.
-    first_cell = str(df.iloc[0, 0]).strip().casefold()
-    _col_names = {str(c).strip().casefold() for c in cols}
-    _generic_labels = {'tickers', 'ticker', 'name', 'names', 'ric', 'rics'}
-    if first_cell in _col_names or first_cell in _generic_labels:
+    # Header row: at least TWO cells of the first row are known column names
+    # (exact, case-insensitive). A single match is NOT enough (a ticker can
+    # look like a column word), and an unknown-name header is left as data
+    # rather than silently dropping a real row.
+    _known = {str(c).strip().casefold() for c in cols} | {
+        'underlying', 'variance asset', 'corridor condition asset',
+        'strike (%)', 'strike mono var swap (%)', 'strike cross corridor (%)',
+        'weight (%)', 'min weight', 'max weight', 'side', 'sector',
+        'vega cap', 'axe target', 'axe cap', 'currency', 'correlation',
+        'ticker', 'tickers', 'name', 'names', 'ric', 'rics',
+        'volofvar', 'eq/volcorrel', 'meanreversion',
+    }
+    _row0 = [str(v).strip().casefold() for v in df.iloc[0].tolist()]
+    if sum(1 for v in _row0 if v in _known) >= 2:
         df = df.iloc[1:].reset_index(drop=True)
-        st.toast("⚠️ Header row detected and skipped", icon="ℹ️")
     new_data = pd.DataFrame()
     for i, col in enumerate(cols):
         new_data[col] = df.iloc[:, i] if i < df.shape[1] else [''] * len(df)
