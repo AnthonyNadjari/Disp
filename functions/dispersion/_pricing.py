@@ -3381,8 +3381,10 @@ class PricingEngine(VolSwapMixin):
                             _block, _expected = "EV_CROSS", tickers[_di]
                         elif _di < n_ev + n_ev_mono:
                             _block, _expected = "EV_MONO", mono_corr_order[_di - n_ev]
-                        else:
+                        elif _di < n_ev + n_ev_mono + n_ra:
                             _block, _expected = "RA", mono_corr_order[_di - n_ev - n_ev_mono]
+                        else:
+                            _block, _expected = "EXTRA_LSV_LCM", "N/A"
                         _run = 0
                         _entry = None
                         for _cs in sorted(results_map.keys()):
@@ -3977,12 +3979,23 @@ class PricingEngine(VolSwapMixin):
                     lcm_var = strike_lcm_vol ** 2
                     fpf_lcm = _solved_fpf(ev_cross_ref_obj, ticker, corr_assets[idx], lcm_var)
 
-                # ATMF vols
+                # ATMF vols — straight from the batch extraction (correct per
+                # asset, proven by VOL-DEBUG). The (ticker, maturity, anchor)
+                # cache is only a fallback: its key mixes per-currency payment
+                # dates and misses for non-EUR assets.
                 matu_ex, matu_stl = calculate_payment_dates(cfg.last_obs_date, currencies[idx])
-                atmf_ref = self._get_atmf_vol(ticker, matu_stl, "Forward")
-                atmf_linked = self._get_atmf_vol(corr_assets[idx], matu_stl, "Forward")
-                atms_ref = self._get_atmf_vol(ticker, matu_stl, "Spot")
-                atms_linked = self._get_atmf_vol(corr_assets[idx], matu_stl, "Spot")
+                atmf_ref = atmf_vols_cross.get(ticker)
+                if atmf_ref is None:
+                    atmf_ref = self._get_atmf_vol(ticker, matu_stl, "Forward")
+                atmf_linked = atmf_vols_mono.get(corr_assets[idx])
+                if atmf_linked is None:
+                    atmf_linked = self._get_atmf_vol(corr_assets[idx], matu_stl, "Forward")
+                atms_ref = atms_vols_cross.get(ticker)
+                if atms_ref is None:
+                    atms_ref = self._get_atmf_vol(ticker, matu_stl, "Spot")
+                atms_linked = atms_vols_mono.get(corr_assets[idx])
+                if atms_linked is None:
+                    atms_linked = self._get_atmf_vol(corr_assets[idx], matu_stl, "Spot")
                 vol_spread = None
                 if atmf_ref is not None and atmf_linked is not None:
                     vol_spread = (linked_vol - strike_vol) - (atmf_linked - atmf_ref)
