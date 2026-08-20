@@ -1,37 +1,129 @@
-# PRICING_INDIV_LSV_LCM — enable LSV/LCM in Individual Correlations mode
+# PRICING_INDIV_LSV_LCM — enable LSV/LCM in Individual Correlations mode (v2, corrected)
 
 ## Goal
 
 `solve(..., correl_input_method="Individual Correlations", use_lsv=True, use_lcm=True)`
 currently produces **no** LSV/LCM columns (the per-ticker branch hardcodes the LSV/LCM
-lists to `None`). This patch prices the LSV/LSV0/LCM variants **under each group's
-forced correlation**, so the columns appear with exact values.
+lists to `None`). This patch prices the LSV/LSV0/LCM bumps **under each group's forced
+correlation**, so the columns appear with exact values.
 
-## How it works (design)
+## Design (corrected after reviewing `pricing_scenarios.py`)
 
-Per-ticker mode groups tickers by correlation value and prices each group with a
-`GenericMutatorOverrideCorrelationEqEq` scenario. The unified (Global) path instead
-prices everything under ONE `build_unified_scenario` whose bumps (`LV`, `LSV0`,
-`LSV`, `LCM`) include LSV/LCM — and that helper already accepts a correlation
-perturbation (`correl_bump` / `correl_bump_style`).
+`correl_bump` in `build_unified_scenario` is a **perturbation** mutator
+(`GenericMutatorBumpCorrelationEqEq`, BumpSize + Style Relative/Absolute) — it cannot
+force a correlation LEVEL. Forcing a level requires
+`GenericMutatorOverrideCorrelationEqEq(CorrelationLevel=X)`.
 
-So per correlation group we build **one unified scenario with the group's correlation
-level forced** and read the bump values at the same positions as today's LV batch.
-Same number of batch calls as today (1 per group), more instruments variants
-extracted from the same response.
-
-> **ONE THING TO CHECK FIRST** (30 seconds): in
-> `functions/common/pricing_scenarios.py`, confirm `build_unified_scenario`'s
-> `correl_bump` accepts an **absolute level** with `correl_bump_style="Absolute"`
-> (the UI exposes Relative/Absolute styles). If it only supports relative bumps, use
-> the fallback in §4.
+So the patch adds an optional `correl_override` to the scenario builders: when set,
+the correlation mutator in **every** bump (LV, LSV0, LSV) is the override mutator at
+the group's level instead of the no-op/bump correl mutators. One scenario per
+correlation group, same number of batch calls as today.
 
 ---
 
-## 1. Per-group scenario with forced correlation + bumps
+## 1. `functions/common/pricing_scenarios.py` — add `correl_override`
 
-**File:** `functions/dispersion/_pricing.py`, per-ticker branch, in the
-`for corr_val, ticker_indices in corr_groups.items():` loop.
+### In `build_lsv_bumps` — signature: replace
+
+```python
+def build_lsv_bumps(
+    pricing_portal,
+    underlying_rics: List[str],
+    lsv_params: pd.DataFrame,
+    correl_bump: float = 0,
+    correl_bump_style: str = "Relative",
+) -> Dict[str, Any]:
+```
+
+### By
+
+```python
+def build_lsv_bumps(
+    pricing_portal,
+    underlying_rics: List[str],
+    lsv_params: pd.DataFrame,
+    correl_bump: float = 0,
+    correl_bump_style: str = "Relative",
+    correl_override: Optional[float] = None,
+) -> Dict[str, Any]:
+```
+
+### Replace
+
+```python
+    lv_correl_noop = pricing_portal.create_scenario_mutator(
+        name="GenericMutatorBumpCorrelationEqEq",
+        mutator_properties=pricing_portal.create_scenario_mutator_properties(
+            {"BumpSize": 0.0, "Style": correl_bump_style}
+        ),
+        mutator_properties_asset_overrides=[]
+    )
+```
+
+### By
+
+```python
+    if correl_override is not None:
+        # Force the correlation LEVEL in every bump (per-ticker correlation mode):
+        # an override mutator replaces the no-op/bump correl mutators.
+        _corr_level_mutator = pricing_portal.create_scenario_mutator(
+            name="GenericMutatorOverrideCorrelationEqEq",
+            mutator_properties=pricing_portal.create_scenario_mutator_properties(
+                {"CorrelationLevel": float(correl_override)}
+            ),
+            mutator_properties_asset_overrides=[]
+        )
+        lv_correl_noop = _corr_level_mutator
+    else:
+        lv_correl_noop = pricing_portal.create_scenario_mutator(
+            name="GenericMutatorBumpCorrelationEqEq",
+            mutator_properties=pricing_portal.create_scenario_mutator_properties(
+                {"BumpSize": 0.0, "Style": correl_bump_style}
+            ),
+            mutator_properties_asset_overrides=[]
+        )
+```
+
+### Replace
+
+```python
+    lsv_correl_mutator = pricing_portal.create_scenario_mutator(
+        name="GenericMutatorBumpCorrelationEqEq",
+        mutator_properties=pricing_portal.create_scenario_mutator_properties(
+            {"BumpSize": correl_bump, "Style": correl_bump_style}
+        ),
+        mutator_properties_asset_overrides=[]
+    )
+```
+
+### By
+
+```python
+    if correl_override is not None:
+        lsv_correl_mutator = _corr_level_mutator
+    else:
+        lsv_correl_mutator = pricing_portal.create_scenario_mutator(
+            name="GenericMutatorBumpCorrelationEqEq",
+            mutator_properties=pricing_portal.create_scenario_mutator_properties(
+                {"BumpSize": correl_bump, "Style": correl_bump_style}
+            ),
+            mutator_properties_asset_overrides=[]
+        )
+```
+
+### Thread the parameter through the two wrappers
+
+In `build_lsv_scenario` and `build_unified_scenario`: add
+`correl_override: Optional[float] = None` to each signature and pass
+`correl_override=correl_override` into every `build_lsv_bumps(...)` /
+`build_lsv_scenario(...)` call they make. (LCM-only path: no correl mutator exists in
+its bumps — with `correl_override` set and LCM enabled, also append
+`_corr_level_mutator`-equivalent into the LCM bump via the same override; simplest is
+to always build LSV parts when `correl_override` is set and rely on the LSV+LCM path.)
+
+## 2. `functions/dispersion/_pricing.py` — per-group unified scenario
+
+In the per-ticker branch, `for corr_val, ticker_indices in corr_groups.items():` loop.
 
 ### Replace
 
@@ -50,7 +142,8 @@ extracted from the same response.
 ```python
                 # Create scenario for this correlation level. With LSV/LCM requested,
                 # build a UNIFIED bump scenario (LV/LSV0/LSV/LCM) with the group's
-                # correlation forced — bumps are then read from the same response.
+                # correlation forced to its level — bumps are read from the same
+                # response, so no extra batch calls.
                 group_scenario = None
                 _use_lsv_pt = lsv_scenario is not None
                 _use_lcm_pt = cfg.lcm_params is not None and cfg.lcm_params.get('enabled', False)
@@ -68,13 +161,9 @@ extracted from the same response.
                         use_lcm=_use_lcm_pt,
                         underlying_rics=_grp_rics,
                         lsv_params=_grp_lsv_df,
-                        correl_bump=(corr_val if corr_val is not None else 0.0),
-                        correl_bump_style="Absolute",   # force the LEVEL, not a relative bump
+                        correl_override=corr_val,
                         lcm_properties=cfg.lcm_params.get('lcm_properties') if cfg.lcm_params else None,
                     )
-                    _grp_bump_names = (["LV", "LSV0", "LSV"] if _use_lsv_pt else ["LV"])
-                    if _use_lcm_pt:
-                        _grp_bump_names.append("LCM")
                 elif corr_val is not None:
                     group_scenario = pricing_portal.create_scenario_simple(
                         mutator_name="GenericMutatorOverrideCorrelationEqEq",
@@ -82,11 +171,28 @@ extracted from the same response.
                     )
 ```
 
-## 2. Extract the bump values (cross + mono)
+## 3. Record group responses + extract the bumps
 
-Right after the existing group extraction (`all_ev_cross[global_i] = ev_val` /
-`all_ra[global_i] = ra_val` end of loop) and **before** the mono batch, initialize
-and fill the LSV/LCM lists from the SAME group responses.
+### Replace
+
+```python
+            for corr_val, ticker_indices in corr_groups.items():
+                # Build instruments for this group
+```
+
+### By
+
+```python
+            group_results = []  # (ticker_indices, group_res) per correlation group
+            for corr_val, ticker_indices in corr_groups.items():
+                # Build instruments for this group
+```
+
+plus, right after the `group_res = _price_in_batches(...)` call:
+
+```python
+                group_results.append((ticker_indices, group_res))
+```
 
 ### Replace
 
@@ -109,11 +215,9 @@ and fill the LSV/LCM lists from the SAME group responses.
             ev_mono_lsv_values = [None] * len(mono_corr_order)
             ev_mono_lsv_zero_values = [None] * len(mono_corr_order)
 
-            # LSV/LCM bumps: read per-bump values from each group's response at the
-            # same instrument positions as the LV extraction above. Requires the
-            # unified scenario of §1 (otherwise the lists stay None and the LSV/LCM
-            # columns are simply absent, as before).
-            if (_use_lsv_pt or _use_lcm_pt) and 'group_res' in dir():
+            # LSV/LCM bumps: per bump name, the response entry holds
+            # bump_data[0]["FairValue"][0]["value"] (same shape as _get_bump_fv).
+            if (_use_lsv_pt or _use_lcm_pt) and group_results:
                 def _pt_bump_fv(res, pos, bump):
                     running = 0
                     for cs in sorted(res.keys()):
@@ -125,36 +229,28 @@ and fill the LSV/LCM lists from the SAME group responses.
                             if key in raw and isinstance(raw[key], dict):
                                 bump_data = raw[key].get(bump, [])
                                 if isinstance(bump_data, list) and bump_data:
-                                    v = bump_data[0].get("value")
-                                    return v if isinstance(v, (int, float)) else None
+                                    fv_list = bump_data[0].get("FairValue", [])
+                                    if fv_list:
+                                        v = fv_list[0].get("value")
+                                        return v if isinstance(v, (int, float)) else None
                             return None
                         running += cd["chunk_size"]
                     return None
 
-                # NOTE: re-run the group loop storing each group's response and
-                # indices, e.g. before the loop add `group_results = []` and inside
-                # append `(ticker_indices, n_group, group_res)`. Then:
-                for ticker_indices_b, n_group_b, group_res_b in group_results:
+                for ticker_indices_b, group_res_b in group_results:
                     for local_i, global_i in enumerate(ticker_indices_b):
                         if _use_lsv_pt:
-                            ev_cross_lsv_zero_values[global_i] = _pt_bump_fv(
-                                group_res_b, local_i, "LSV0")
-                            ev_cross_lsv_values[global_i] = _pt_bump_fv(
-                                group_res_b, local_i, "LSV")
+                            ev_cross_lsv_zero_values[global_i] = _pt_bump_fv(group_res_b, local_i, "LSV0")
+                            ev_cross_lsv_values[global_i] = _pt_bump_fv(group_res_b, local_i, "LSV")
                         if _use_lcm_pt:
-                            ev_cross_lcm_values[global_i] = _pt_bump_fv(
-                                group_res_b, local_i, "LCM")
+                            ev_cross_lcm_values[global_i] = _pt_bump_fv(group_res_b, local_i, "LCM")
 
-            # Mono LSV: second mono batch under a unified LSV scenario (mono assets
-            # have no correlation override — the corridor asset IS the asset).
+            # Mono LSV: one extra mono batch under a unified LSV scenario (mono
+            # assets have no correlation override — corridor asset IS the asset).
             if _use_lsv_pt:
-                from functions.common.pricing_scenarios import build_unified_scenario
-                _mono_lsv_scenario = build_unified_scenario(
-                    pricing_portal,
-                    use_lsv=True, use_lcm=False,
-                    underlying_rics=list(mono_corr_order),
-                    lsv_params=_grp_lsv_df,
-                    correl_bump=0.0, correl_bump_style="Relative",
+                from functions.common.pricing_scenarios import build_lsv_scenario
+                _mono_lsv_scenario = build_lsv_scenario(
+                    pricing_portal, list(mono_corr_order), _grp_lsv_df,
                 )
                 mono_lsv_res = _price_in_batches(
                     mono_instruments,
@@ -167,54 +263,21 @@ and fill the LSV/LCM lists from the SAME group responses.
                     ev_mono_lsv_values[i] = _pt_bump_fv(mono_lsv_res, i, "LSV")
 ```
 
-And inside the existing `for corr_val, ticker_indices in corr_groups.items():` loop,
-record each response (needed by the extraction above):
+## 4. Post-processing: nothing to change
 
-### Replace
-
-```python
-            for corr_val, ticker_indices in corr_groups.items():
-                # Build instruments for this group
-```
-
-### By
-
-```python
-            group_results = []  # (ticker_indices, n_group, group_res) per correlation group
-            for corr_val, ticker_indices in corr_groups.items():
-                # Build instruments for this group
-```
-
-plus, right after the `group_res = _price_in_batches(...)` call:
-
-```python
-                group_results.append((ticker_indices, len(ticker_indices), group_res))
-```
-
-## 3. Post-processing: nothing to change
-
-The shared post-processing already consumes `ev_cross_lsv_values`,
-`ev_cross_lsv_zero_values`, `ev_cross_lcm_values`, `ev_mono_lsv_values`,
-`ev_mono_lsv_zero_values` and only emits columns for non-None values — with the
-lists now populated, the `Strike Cross Corr LSV/LCM (%)`, `EV Mono LSV (%)` and
-cap-priced variants appear automatically. (Keep the crash-fix from
-PRICING_INDIV_CORR_FIX: the lists are now initialized in §2 above.)
-
-## 4. Fallback if `correl_bump` cannot force an absolute level
-
-If §1's check fails (`build_unified_scenario` only supports relative bumps), keep the
-LV batch with the corr-override scenario (today's code) and run ONE additional batch
-per group with the unified LSV/LCM scenario **without** corr override; document that
-LSV/LCM values are then computed at the model correlation while LV uses the forced
-one (approximation, usually small for bump-sized impacts). Structure: reuse §2 but
-price `group_instruments` a second time with the unified scenario instead of reading
-bumps from the same response.
+The shared post-processing only emits columns for non-None values — with the lists
+populated, `Strike Cross Corr LSV/LCM (%)`, `EV Mono LSV (%)` and the cap-priced
+variants appear automatically. (The lists are now initialized in §3, which also
+covers the earlier `ev_mono_lsv_values` UnboundLocalError crash-fix.)
 
 ## Verify
 
 1. `solve(..., correl_input_method="Individual Correlations", use_lsv=True)` →
    `Strike Cross Corr LSV (%)` present and finite for every ticker.
-2. Same + `use_lcm=True` → `Strike Cross Corr LCM (%)` present; mono rows (ticker ==
-   corridor asset) still raise the intended LCM ValueError.
-3. `Global Parameters` mode → unchanged columns/values.
-4. Per-ticker mode without LSV/LCM → unchanged (no new columns, no extra batch).
+2. Same + `use_lcm=True` → `Strike Cross Corr LCM (%)` present; mono rows
+   (ticker == corridor asset) still raise the intended LCM ValueError.
+3. With `Correlation` column values forced (e.g. 55/60/48): the LV strikes must
+   match today's per-ticker LV results (same forced level, now via the unified
+   scenario) — compare one row before/after the patch.
+4. `Global Parameters` mode with LSV/LCM → unchanged.
+5. Per-ticker mode WITHOUT LSV/LCM → unchanged (no new columns, no extra batch).
