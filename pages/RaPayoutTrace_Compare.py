@@ -1,7 +1,8 @@
-"""RA Comparison page — legacy RA instruments vs PayoutTrace RA (engine flag).
+"""RA display page — PayoutTrace RA in the engine (single run).
 
-Ultra-simple: click "Run comparison" — the SAME solve is run twice through the
-engine (use_payout_trace_ra OFF vs ON) and the RA / strike columns are compared.
+The engine now computes RA exclusively via the PayoutTrace metric
+(E[n_corridor_obs] × unfunded ZCB for the strike; undiscounted fraction for display).
+This page runs one solve and shows the RA / strike / discount columns.
 
 Run from the repo root:
     streamlit run pages/RaPayoutTrace_Compare.py
@@ -21,11 +22,12 @@ if str(ROOT) not in sys.path:
 from functions.dispersion import solve, DispersionConfig
 from functions.dispersion.models import ProductType
 
-st.set_page_config(page_title="RA Comparison", page_icon="⚖️", layout="wide")
-st.title("⚖️ RA — legacy instruments vs PayoutTrace (use_payout_trace_ra)")
+st.set_page_config(page_title="RA — PayoutTrace", page_icon="⚖️", layout="wide")
+st.title("⚖️ RA via PayoutTrace — engine output")
 st.caption(
-    "Same solve, run twice through the engine. Expected: strikes identical (MC "
-    "noise aside); RA displayed ≈ legacy/ZCB in the new path (undiscounted fraction)."
+    "RA displayed = undiscounted day fraction E[n_corridor_obs]/n_total; "
+    "strikes use ZCB(unfunded, leg currency) × that fraction. "
+    "Strike Vanilla Var = sqrt(−EV/ZCB)."
 )
 
 with st.sidebar:
@@ -38,9 +40,36 @@ with st.sidebar:
     strike_date = st.date_input("Strike date", value=date.today())
     last_obs_date = st.date_input("Last obs date", value=date.today() + timedelta(days=365))
 
-run = st.button("🚀 Run comparison", type="primary", use_container_width=True)
+run = st.button("🚀 Run", type="primary", use_container_width=True)
 
 if run:
+    rows = []
+
+    def _fill(df, cross, label):
+        cfg = DispersionConfig(
+            product_type=ProductType.VAR_SWAP_CORRIDOR,
+            cross_corridor=cross,
+            barrier_up=barrier_up, barrier_down=barrier_dn,
+            local_cap=2.5, is_capped=True,
+        )
+        res = solve(df=df, config=cfg,
+                    last_obs_date=last_obs_date, strike_date=strike_date,
+                    eqeq_lambda=0.10, eqfx_shift=-0.05, vol_mode="ATMF")
+        if not res.success:
+            raise RuntimeError(f"solve failed for {list(df['Variance Asset'])}")
+        for tr in res.ticker_results:
+            rows.append({
+                "case": label,
+                "ticker": tr.ticker,
+                "corr": tr.corridor_asset,
+                "RA (undisc)": tr.range_accrual,
+                "ZCB": tr.discount_factor,
+                "strike": tr.strike_variance_asset,
+                "strike mono": tr.strike_corridor_asset,
+                "strike vanilla var": tr.strike_vanilla_var,
+                "tenor (bd)": tr.obs_dates_cross,
+            })
+
     mono_tickers = [t.strip() for t in mono_txt.split(",") if t.strip()]
     cross_pairs = []
     for p in cross_txt.split(","):
@@ -49,83 +78,20 @@ if run:
             s, i = p.split("/", 1)
             cross_pairs.append((s.strip(), i.strip()))
 
-    cfg_common = dict(
-        product_type=ProductType.VAR_SWAP_CORRIDOR,
-        barrier_up=barrier_up, barrier_down=barrier_dn,
-        local_cap=2.5, is_capped=True,
-    )
-
-    def _run(df, cross, ptr):
-        cfg = DispersionConfig(cross_corridor=cross, **cfg_common)
-        res = solve(df=df, config=cfg,
-                    last_obs_date=last_obs_date, strike_date=strike_date,
-                    eqeq_lambda=0.10, eqfx_shift=-0.05, vol_mode="ATMF",
-                    use_payout_trace_ra=ptr)
-        if not res.success:
-            raise RuntimeError(f"solve failed (ptr={ptr}) for {list(df['Variance Asset'])}")
-        return res
-
-    rows = []
-
-    def _fill(df, cross, label_fn):
-        with st.spinner("Legacy solve (flag OFF)..."):
-            res_old = _run(df, cross, False)
-        with st.spinner("PayoutTrace solve (flag ON)..."):
-            res_new = _run(df, cross, True)
-        by_ticker_old = {tr.ticker: tr for tr in res_old.ticker_results}
-        for tr_new in res_new.ticker_results:
-            tr_old = by_ticker_old.get(tr_new.ticker)
-            if tr_old is None:
-                continue
-            rows.append({
-                "case": label_fn(tr_new),
-                "ticker": tr_new.ticker,
-                "corr": tr_new.corridor_asset,
-                "RA_legacy": tr_old.range_accrual,
-                "RA_ptrace(undisc)": tr_new.range_accrual,
-                "ZCB": tr_new.discount_factor,
-                "strike_legacy": tr_old.strike_variance_asset,
-                "strike_ptrace": tr_new.strike_variance_asset,
-                "strike_mono_legacy": tr_old.strike_corridor_asset,
-                "strike_mono_ptrace": tr_new.strike_corridor_asset,
-                "vanilla_var": tr_new.strike_vanilla_var,
+    with st.spinner("Solving..."):
+        if mono_tickers:
+            mono_df = pd.DataFrame({
+                "Variance Asset": mono_tickers,
+                "Corridor Condition Asset": mono_tickers,
+                "Currency": [currency] * len(mono_tickers),
             })
+            _fill(mono_df, False, "mono")
+        if cross_pairs:
+            cross_df = pd.DataFrame({
+                "Variance Asset": [i for _, i in cross_pairs],
+                "Corridor Condition Asset": [s for s, _ in cross_pairs],
+                "Currency": [currency] * len(cross_pairs),
+            })
+            _fill(cross_df, True, "cross")
 
-    if mono_tickers:
-        mono_df = pd.DataFrame({
-            "Variance Asset": mono_tickers,
-            "Corridor Condition Asset": mono_tickers,
-            "Currency": [currency] * len(mono_tickers),
-        })
-        _fill(mono_df, False, lambda tr: "mono")
-
-    if cross_pairs:
-        cross_df = pd.DataFrame({
-            "Variance Asset": [i for _, i in cross_pairs],
-            "Corridor Condition Asset": [s for s, _ in cross_pairs],
-            "Currency": [currency] * len(cross_pairs),
-        })
-        _fill(cross_df, True, lambda tr: "cross")
-
-    out = pd.DataFrame(rows)
-    if out.empty:
-        st.error("No comparable rows (both solves must succeed).")
-    else:
-        out["dstrike_%"] = ((out["strike_ptrace"] - out["strike_legacy"]).abs()
-                            / out["strike_legacy"].abs() * 100).round(4)
-        out["dstrike_mono_%"] = ((out["strike_mono_ptrace"] - out["strike_mono_legacy"]).abs()
-                                 / out["strike_mono_legacy"].abs() * 100).round(4)
-        out["RA_check (legacy×1/ZCB)"] = (out["RA_legacy"] / out["ZCB"]).round(4)
-
-        st.dataframe(out, use_container_width=True)
-
-        worst = out[["dstrike_%", "dstrike_mono_%"]].max().max()
-        if worst < 0.1:
-            st.success(f"✅ PASS — worst strike diff: {worst:.4f}% (threshold 0.1%)")
-        else:
-            st.error(f"⚠️ CHECK — worst strike diff: {worst:.4f}% (threshold 0.1%)")
-        st.caption(
-            "Strikes must match (MC noise aside). RA_ptrace should equal "
-            "RA_check = legacy/ZCB (the undiscounted day fraction). "
-            "vanilla_var = sqrt(−EV/ZCB)."
-        )
+    st.dataframe(pd.DataFrame(rows), use_container_width=True)

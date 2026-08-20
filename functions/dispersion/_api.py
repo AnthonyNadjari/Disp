@@ -366,7 +366,6 @@ def solve(
     use_lcm: bool = False,
     lcm_properties: dict = None,
     progress_callback: Callable[[dict], None] = None,
-    use_payout_trace_ra: bool = False,
 ) -> SolveResult:
     """
     Compute fair-value strikes for a set of tickers via portal pricing.
@@ -428,7 +427,6 @@ def solve(
         lsv_correl_bump=lsv_correl_bump,
         lsv_correl_bump_style=lsv_correl_bump_style,
         lcm_params={'enabled': use_lcm, 'lcm_properties': lcm_properties} if use_lcm else None,
-        use_payout_trace_ra=use_payout_trace_ra,
     )
     result = PricingEngine(pricing_cfg).run(tickers_df=engine_df, progress_callback=progress_callback)
 
@@ -464,7 +462,6 @@ def price(
     use_lcm: bool = False,
     lcm_properties: dict = None,
     progress_callback: Callable[[dict], None] = None,
-    use_payout_trace_ra: bool = False,
 ) -> PriceResult:
     """
     Price given strikes for a set of variance assets via portal pricing.
@@ -508,7 +505,6 @@ def price(
         lsv_correl_bump=lsv_correl_bump,
         lsv_correl_bump_style=lsv_correl_bump_style,
         lcm_params={'enabled': use_lcm, 'lcm_properties': lcm_properties} if use_lcm else None,
-        use_payout_trace_ra=use_payout_trace_ra,
     )
     result = PricingEngine(pricing_cfg).run(tickers_df=engine_df, progress_callback=progress_callback)
 
