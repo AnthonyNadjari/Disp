@@ -3926,7 +3926,8 @@ class PricingEngine(VolSwapMixin):
                     fpf_lcm = _solved_fpf(ev_cross_ref_obj, ticker, corr_assets[idx], lcm_var)
 
                 # ATMF vols — straight from the batch extraction (correct per
-                # asset, proven by VOL-DEBUG). The (ticker, maturity, anchor)
+                # asset, verified per asset in production). The (ticker,
+                # maturity, anchor)
                 # cache is only a fallback: its key mixes per-currency payment
                 # dates and misses for non-EUR assets.
                 matu_ex, matu_stl = calculate_payment_dates(cfg.last_obs_date, currencies[idx])
