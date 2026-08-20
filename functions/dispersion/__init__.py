@@ -57,11 +57,24 @@ from functions.dispersion._portal import (
 )
 
 # Internal exports (not for direct public use, but used by pages/✅Dispersion_Optimizer.py)
-from functions.dispersion._pricing import (
-    PricingEngine,
-    PricingConfig,
-    CrossCorridorVarianceSwap,
-    _load_instrument_impl,
-    get_trading_calendar,
-    calculate_payment_dates,
-)
+# The real _pricing.py pulls the proprietary pricing stack (fpf_builder_utils,
+# pricingportal) — degrade gracefully where it is absent (engine-only envs / tests).
+try:
+    from functions.dispersion._pricing import (
+        PricingEngine,
+        PricingConfig,
+        CrossCorridorVarianceSwap,
+        _load_instrument_impl,
+        get_trading_calendar,
+        calculate_payment_dates,
+    )
+except Exception as _pricing_import_error:
+    _PRICING_IMPORT_ERROR = _pricing_import_error
+
+    def _pricing_unavailable(*args, **kwargs):
+        raise RuntimeError(
+            "functions.dispersion._pricing could not be imported (the pricing-portal "
+            f"stack is not available in this environment): {_PRICING_IMPORT_ERROR}")
+
+    PricingEngine = PricingConfig = CrossCorridorVarianceSwap = None
+    _load_instrument_impl = get_trading_calendar = calculate_payment_dates = _pricing_unavailable
