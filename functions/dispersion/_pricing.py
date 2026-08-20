@@ -3197,6 +3197,7 @@ class PricingEngine(VolSwapMixin):
                 for _i, _c in enumerate(corr_assets):
                     _corr_ccy.setdefault(_c, currencies[_i])
                 ra_values_by_corr = {}
+                ra_zcb_by_corr = {}
                 for _m_idx, _corr in enumerate(mono_corr_order):
                     _n_obs = _pt_extract_n_obs_mono(_m_idx)
                     _mono_obj = mono_ref_objs.get(_corr, (None,))[0]
@@ -3207,8 +3208,10 @@ class PricingEngine(VolSwapMixin):
                                              cfg.strike_date, cfg.last_obs_date,
                                              live_snap["name"])
                         ra_values_by_corr[_corr] = _ra_from_payout_trace(_n_obs, _n_total, _zcb)
+                        ra_zcb_by_corr[_corr] = _zcb
                     else:
                         ra_values_by_corr[_corr] = None
+                        ra_zcb_by_corr[_corr] = None
                         dbg.warn("batch", f"PayoutTrace RA: unavailable for {_corr}")
             else:
                 # Build unified ra_values_by_corr: per-ticker RA from all_ra, keyed by corridor asset
@@ -3380,7 +3383,9 @@ class PricingEngine(VolSwapMixin):
                         running_idx += chunk_size
                     return None
 
-                # RA = unfunded ZCB(leg currency) × E[n_corridor_obs] / n_total_obs.
+                # RA strikes = unfunded ZCB(leg currency) × E[n_corridor_obs]/n_total
+                # (ZCB recorded per corridor asset: the DISPLAYED RA is the
+                # undiscounted day fraction — the ZCB only enters the strike).
                 # Mono and cross legs of a line share the corridor asset and the
                 # barriers → E[n] is computed once per UNIQUE corridor asset (from
                 # the mono EV instrument) and reused by the cross legs; n_total is
@@ -3389,6 +3394,7 @@ class PricingEngine(VolSwapMixin):
                 for _i, _c in enumerate(corr_assets):
                     _corr_ccy.setdefault(_c, currencies[_i])
                 ra_values_by_corr = {}
+                ra_zcb_by_corr = {}
                 for _m_idx, _corr in enumerate(mono_corr_order):
                     _n_obs = _pt_extract_n_obs(n_ev + _m_idx)
                     _mono_obj = mono_ref_objs.get(_corr, (None,))[0]
@@ -3399,8 +3405,10 @@ class PricingEngine(VolSwapMixin):
                                              cfg.strike_date, cfg.last_obs_date,
                                              live_snap["name"])
                         ra_values_by_corr[_corr] = _ra_from_payout_trace(_n_obs, _n_total, _zcb)
+                        ra_zcb_by_corr[_corr] = _zcb
                     else:
                         ra_values_by_corr[_corr] = None
+                        ra_zcb_by_corr[_corr] = None
                         dbg.warn("batch", f"PayoutTrace RA: n_obs={_n_obs}, n_total={_n_total} "
                                           f"for {_corr} — RA unavailable for this leg")
 
@@ -4067,6 +4075,18 @@ class PricingEngine(VolSwapMixin):
                 except Exception:
                     pass
 
+                # Displayed RA: undiscounted day fraction in PayoutTrace mode
+                # (ZCB only enters the strike); legacy path shows the
+                # (discounted) instrument value as before.
+                if cfg.use_payout_trace_ra and ra_val is not None:
+                    _ra_disp = ra_val / (ra_zcb_by_corr.get(corr_assets[idx]) or 1.0)
+                    _ra_mono_v = ra_values_by_corr.get(corr_assets[idx])
+                    _ra_disp_mono = (_ra_mono_v / (ra_zcb_by_corr.get(corr_assets[idx]) or 1.0)
+                                     if _ra_mono_v is not None else None)
+                else:
+                    _ra_disp = ra_val
+                    _ra_disp_mono = ra_values_by_corr.get(corr_assets[idx])
+
                 indexed_results[idx] = (TickerResult(
                     ticker=ticker,
                     corridor_asset=corr_assets[idx],
@@ -4076,11 +4096,8 @@ class PricingEngine(VolSwapMixin):
                     strike_cap_adjusted=strike_cap_vol,
                     cap_impact_bp=cap_bp,
                     ev_cross=ev_val * 100 if ev_val is not None else None,
-                    # range_accrual=ra_val * 100 if ra_val is not None else None,
- ###
-                    range_accrual=ra_val * 100 if ra_val is not None else None,
-                    range_accrual_mono=ra_values_by_corr.get(corr_assets[idx]) * 100
-                    if ra_values_by_corr.get(corr_assets[idx]) is not None else None,
+                    range_accrual=_ra_disp * 100 if _ra_disp is not None else None,
+                    range_accrual_mono=_ra_disp_mono * 100 if _ra_disp_mono is not None else None,
 ####
                     ev_mono=ev_mono_values[mono_corr_order.index(corr_assets[idx])] * 100 if ev_mono_values[
                                                                                                  mono_corr_order.index(
