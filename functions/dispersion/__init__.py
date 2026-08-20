@@ -28,7 +28,15 @@ from functions.dispersion.models import (
 
 # Internal exports (not for direct public use, but used by pages/✅Dispersion_Optimizer.py)
 from functions.dispersion._optimizer import DispersionOptimizer
-from functions.common.utils import get_n_exp_from_date
+try:
+    from functions.common.utils import get_n_exp_from_date
+except Exception as _utils_import_error:  # pricing-portal stack absent (engine-only envs / tests)
+    _UTILS_IMPORT_ERROR = _utils_import_error
+
+    def get_n_exp_from_date(*args, **kwargs):
+        raise RuntimeError(
+            "functions.common.utils could not be imported (the pricing-portal "
+            f"stack is not available in this environment): {_UTILS_IMPORT_ERROR}")
 from functions.dispersion._backtester import (
     DispersionBacktester,
     DispersionDataLoader,
