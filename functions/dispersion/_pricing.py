@@ -1082,68 +1082,6 @@ class CrossCorridorVarianceSwap:
             dbg.err("fair-value", f"failed: {e}")
             return None
 
-    def price_range_accrual(self):
-        """
-        Price as Range Accrual for both legs of the cross-corridor swap.
-        Uses solved strikes from self.strike_variance_asset / self.strike_corridor_asset.
-        Returns dict with 'range_accrual', 'fair_value', 'discount_factor' (from cross leg).
-        Also stores both legs in self.range_accrual_ref / self.range_accrual_linked.
-        """
-        _ensure_portal()
-        dbg.step("range-accrual", f"{self.ref_asset}")
-        # Use solved strikes if available, fallback to 0.5
-        strike_variance_asset = self.strike_variance_asset if self.strike_variance_asset else 0.5
-        strike_corridor_asset = self.strike_corridor_asset if self.strike_corridor_asset else 0.5
-        try:
-            ra_ref = price_range_accrual(
-                tickers=[self.ref_asset],
-                last_obs_date=self.last_obs_date,
-                strike_date=self.strike_date,
-                dvar=self.dvar,
-                uvar=self.uvar,
-                currency=self.currency,
-                weights=[1.0],
-                eqeq_lambda=self.eqeq_lambda,
-                correl_floor=self.correl_floor,
-                eqfx_shift=self.eqfx_shift,
-                corr_asset=self.linked_asset,
-                strikes=[strike_variance_asset],
-                model_name=self.model_name,
-                individual_correlation=self.individual_correlation,
-            )
-            if self.ref_asset == self.linked_asset:
-                ra_linked = ra_ref
-            else:
-                ra_linked = price_range_accrual(
-                    tickers=[self.linked_asset],
-                    last_obs_date=self.last_obs_date,
-                    strike_date=self.strike_date,
-                    dvar=self.dvar,
-                    uvar=self.uvar,
-                    currency=self.currency,
-                    weights=[1.0],
-                    eqeq_lambda=self.eqeq_lambda,
-                    correl_floor=self.correl_floor,
-                    eqfx_shift=self.eqfx_shift,
-                    corr_asset=self.linked_asset,
-                    strikes=[strike_corridor_asset],
-                    schedule_calendar_asset=self.ref_asset,
-                    model_name=self.model_name,
-                    individual_correlation=self.individual_correlation,
-                )
-            self.range_accrual_ref = ra_ref
-            self.range_accrual_linked = ra_linked
-            dbg.ok("range-accrual", f"ref={ra_ref}, linked={ra_linked}")
-            # Return in same format as standalone function for UI compatibility
-            return {
-                'range_accrual': ra_ref.get('range_accrual', 0.0),
-                'fair_value': ra_ref.get('fair_value', 0.0),
-                'discount_factor': ra_ref.get('discount_factor', 1.0),
-            }
-        except Exception as e:
-            dbg.err("range-accrual", f"failed: {e}")
-            return None
-
     def compute_atmf_volspread(self):
         if not hasattr(self, 'spread_price_value') or self.spread_price_value is None:
             dbg.err("ATMF", "cannot compute: spread price is None")
@@ -1467,6 +1405,9 @@ class PricingConfig:
     use_lsv_cross_ev: bool = False
     lsv_correl_bump: float = 0
     lsv_correl_bump_style: str = "Relative"
+    # RA via PayoutTrace metric (E[n_corridor_obs] × unfunded ZCB) instead of
+    # dedicated range-accrual instruments. False = legacy RA instrument path.
+    use_payout_trace_ra: bool = False
 
 @dataclass
 class TickerResult:
@@ -2845,7 +2786,7 @@ class PricingEngine(VolSwapMixin):
             _clone_tasks = []  # (type, key, ref_obj, ticker, corr_asset)
             for i, ticker in enumerate(tickers):
                 sched_asset = schedule_assets[i]
-                ev_cross_ref_obj = ev_cross_ref_objs[sched_asset]
+                ev_cross_ref_obj = ev_cross_ref_objs[schedule_assets[i]]
                 _clone_tasks.append(('ev', i, ev_cross_ref_obj, ticker, corr_assets[i]))
             for corr, (ev_obj, ra_obj, ev_lsv_obj, ev_lsv_zero_obj) in mono_ref_objs.items():
                 _clone_tasks.append(('ev_mono', corr, ev_obj, None, None))
@@ -2853,7 +2794,9 @@ class PricingEngine(VolSwapMixin):
                     _clone_tasks.append(('ev_mono_lsv', corr, ev_lsv_obj, None, None))
                 if ev_lsv_zero_obj is not None:
                     _clone_tasks.append(('ev_mono_lsv_zero', corr, ev_lsv_zero_obj, None, None))
-                _clone_tasks.append(('ra', corr, ra_obj, None, None))
+                # RA instruments are not needed at all in PayoutTrace mode
+                if not cfg.use_payout_trace_ra:
+                    _clone_tasks.append(('ra', corr, ra_obj, None, None))
 
             def _do_clone(task):
                 kind, key, obj, ticker, corr = task
@@ -2965,10 +2908,12 @@ class PricingEngine(VolSwapMixin):
         for corr in mono_corr_order:
             instruments.append(_make_instrument(ev_mono_fpfs[corr], [corr]))
         n_ev_mono = len(mono_corr_order)
-        # RA instruments (1 per unique corridor asset — shared between cross and mono)
-        for corr in mono_corr_order:
-            instruments.append(_make_instrument(ra_fpfs[corr], [corr]))
-        n_ra = len(mono_corr_order)
+        # RA instruments (1 per unique corridor asset — shared between cross and mono).
+        # Skipped in PayoutTrace mode: RA comes from the metric on the EV instruments.
+        if not cfg.use_payout_trace_ra:
+            for corr in mono_corr_order:
+                instruments.append(_make_instrument(ra_fpfs[corr], [corr]))
+        n_ra = 0 if cfg.use_payout_trace_ra else len(mono_corr_order)
         # LSV versions for mono EV (if enabled)
         n_ev_mono_lsv = 0
         n_ev_mono_lsv_zero = 0
@@ -3153,10 +3098,11 @@ class PricingEngine(VolSwapMixin):
                 group_instruments = []
                 for i in ticker_indices:
                     group_instruments.append(_make_instrument(ev_cross_fpfs[i], [tickers[i], corr_assets[i]]))
-                for i in ticker_indices:
-                    # ra_fpfs is keyed by corridor asset, not by ticker index
-                    corr = corr_assets[i]
-                    group_instruments.append(_make_instrument(ra_fpfs[corr], [tickers[i], corr]))
+                if not cfg.use_payout_trace_ra:
+                    for i in ticker_indices:
+                        # ra_fpfs is keyed by corridor asset, not by ticker index
+                        corr = corr_assets[i]
+                        group_instruments.append(_make_instrument(ra_fpfs[corr], [tickers[i], corr]))
 
                 # Create scenario for this correlation level
                 group_scenario = None
@@ -3182,21 +3128,29 @@ class PricingEngine(VolSwapMixin):
                 for local_i, global_i in enumerate(ticker_indices):
                     # EV-cross is at position local_i, RA at n_group + local_i
                     all_ev_cross[global_i] = _pt_fv_at(group_res, local_i)
-                    all_ra[global_i] = _pt_fv_at(group_res, n_group + local_i)
+                    if not cfg.use_payout_trace_ra:
+                        all_ra[global_i] = _pt_fv_at(group_res, n_group + local_i)
 
             # Mono instruments: price without per-ticker correlation (they use the corridor asset itself)
             mono_instruments = []
             for corr in mono_corr_order:
                 mono_instruments.append(_make_instrument(ev_mono_fpfs[corr], [corr]))
-            for corr in mono_corr_order:
-                mono_instruments.append(_make_instrument(ra_fpfs[corr], [corr]))
+            if not cfg.use_payout_trace_ra:
+                for corr in mono_corr_order:
+                    mono_instruments.append(_make_instrument(ra_fpfs[corr], [corr]))
+
+            _mono_metrics = [
+                pricing_portal.create_metric("FairValue"),
+                pricing_portal.create_metric("QueryLocalCcyVol", atmf_params),
+            ]
+            if cfg.use_payout_trace_ra:
+                _mono_metrics.append(pricing_portal.create_metric(
+                    _PAYOUT_TRACE_METRIC,
+                    [pricing_portal.create_metric_parameter("DumpStateNames", _PAYOUT_TRACE_VAR)]))
 
             mono_res = _price_in_batches(
                 mono_instruments,
-                metrics=[
-                    pricing_portal.create_metric("FairValue"),
-                    pricing_portal.create_metric("QueryLocalCcyVol", atmf_params),
-                ],
+                metrics=_mono_metrics,
                 price_id="Price",
             )
 
@@ -3214,21 +3168,61 @@ class PricingEngine(VolSwapMixin):
 
             # Extract mono values from mono_res
             ev_mono_values = [_pt_fv_at(mono_res, i) for i in range(len(mono_corr_order))]
-            ra_mono_values_list = [_pt_fv_at(mono_res, len(mono_corr_order) + i)
-                                   for i in range(len(mono_corr_order))]
+            ra_mono_values_list = ([_pt_fv_at(mono_res, len(mono_corr_order) + i)
+                                    for i in range(len(mono_corr_order))]
+                                   if not cfg.use_payout_trace_ra else [None] * len(mono_corr_order))
 
-            # Build unified ra_values_by_corr: per-ticker RA from all_ra, keyed by corridor asset
-            # In per-ticker mode, all_ra[idx] is the RA for ticker idx's corridor asset
-            # Deduplicate: prefer mono RA for mono corridor tickers, then cross RA
-            ra_values_by_corr = {}
-            # First, store mono RA values (for mono corridor tickers)
-            for i, corr in enumerate(mono_corr_order):
-                if corr not in ra_values_by_corr and ra_mono_values_list[i] is not None:
-                    ra_values_by_corr[corr] = ra_mono_values_list[i]
-            # Then, store cross RA values (for cross corridor tickers)
-            for idx, corr in enumerate(corr_assets):
-                if corr not in ra_values_by_corr and idx < len(all_ra) and all_ra[idx] is not None:
-                    ra_values_by_corr[corr] = all_ra[idx]
+            if cfg.use_payout_trace_ra:
+                # RA via PayoutTrace metric on the mono EV instruments (positions
+                # 0..M-1 in mono_res); cross legs reuse per corridor asset.
+                def _pt_extract_n_obs_mono(pos):
+                    running = 0
+                    for cs in sorted(mono_res.keys()):
+                        cd = mono_res[cs]
+                        if pos < running + cd["chunk_size"]:
+                            local_idx = pos - running
+                            raw = cd["raw"]
+                            key = "Price" if local_idx == 0 else f"Price_{local_idx}"
+                            entry = raw.get(key)
+                            if isinstance(entry, dict):
+                                for item in entry.get(_PAYOUT_TRACE_METRIC, []):
+                                    v = _parse_payout_trace_value(item)
+                                    if v is not None:
+                                        return v
+                            return None
+                        running += cd["chunk_size"]
+                    return None
+
+                _corr_ccy = {}
+                for _i, _c in enumerate(corr_assets):
+                    _corr_ccy.setdefault(_c, currencies[_i])
+                ra_values_by_corr = {}
+                for _m_idx, _corr in enumerate(mono_corr_order):
+                    _n_obs = _pt_extract_n_obs_mono(_m_idx)
+                    _mono_obj = mono_ref_objs.get(_corr, (None,))[0]
+                    _od = getattr(_mono_obj, "observationDates", None)
+                    _n_total = (len(_od) - 1) if _od else None
+                    if _n_obs is not None and _n_total:
+                        _zcb = _unfunded_zcb(_corr_ccy.get(_corr, ref_currency),
+                                             cfg.strike_date, cfg.last_obs_date,
+                                             live_snap["name"])
+                        ra_values_by_corr[_corr] = _ra_from_payout_trace(_n_obs, _n_total, _zcb)
+                    else:
+                        ra_values_by_corr[_corr] = None
+                        dbg.warn("batch", f"PayoutTrace RA: unavailable for {_corr}")
+            else:
+                # Build unified ra_values_by_corr: per-ticker RA from all_ra, keyed by corridor asset
+                # In per-ticker mode, all_ra[idx] is the RA for ticker idx's corridor asset
+                # Deduplicate: prefer mono RA for mono corridor tickers, then cross RA
+                ra_values_by_corr = {}
+                # First, store mono RA values (for mono corridor tickers)
+                for i, corr in enumerate(mono_corr_order):
+                    if corr not in ra_values_by_corr and ra_mono_values_list[i] is not None:
+                        ra_values_by_corr[corr] = ra_mono_values_list[i]
+                # Then, store cross RA values (for cross corridor tickers)
+                for idx, corr in enumerate(corr_assets):
+                    if corr not in ra_values_by_corr and idx < len(all_ra) and all_ra[idx] is not None:
+                        ra_values_by_corr[corr] = all_ra[idx]
 
             t_price_done = time.time() - t_price_call
             self._batch_timings['http_price'] = t_price_done
@@ -3312,6 +3306,11 @@ class PricingEngine(VolSwapMixin):
                 ]
                 batch_metrics.append(pricing_portal.create_metric("QueryLocalCcyVol", atms_params))
             batch_metrics.append(pricing_portal.create_metric("Correlation", corr_params))
+            if cfg.use_payout_trace_ra:
+                # E[n_corridor_obs] on the EV instruments — replaces RA instruments
+                batch_metrics.append(pricing_portal.create_metric(
+                    _PAYOUT_TRACE_METRIC,
+                    [pricing_portal.create_metric_parameter("DumpStateNames", _PAYOUT_TRACE_VAR)]))
 
             batch_res = _price_in_batches(
                 instruments,
@@ -3347,6 +3346,63 @@ class PricingEngine(VolSwapMixin):
             # ── Step 4: Extract results ──
             results_map = batch_res
             results_map_atms = batch_res_atms if batch_res_atms else {}
+
+            if cfg.use_payout_trace_ra:
+                def _pt_extract_n_obs(global_idx):
+                    """E[n_corridor_obs] for instrument at global_idx from the batch
+                    response — direct entry, SimpleScenarioBump, or named bump (LV)."""
+                    running_idx = 0
+                    for chunk_start in sorted(results_map.keys()):
+                        chunk_data = results_map[chunk_start]
+                        chunk_size = chunk_data["chunk_size"]
+                        if global_idx < running_idx + chunk_size:
+                            local_idx = global_idx - running_idx
+                            raw = chunk_data["raw"]
+                            key = "Price" if local_idx == 0 else f"Price_{local_idx}"
+                            entry = raw.get(key)
+                            candidates = [entry]
+                            if isinstance(entry, dict):
+                                for bn in ("LV", "LSV", "LSV0", "LCM"):
+                                    bd = entry.get(bn)
+                                    if isinstance(bd, list) and bd:
+                                        candidates.insert(0, bd[0])
+                                bumps = entry.get("SimpleScenarioBump")
+                                if isinstance(bumps, list) and bumps:
+                                    candidates.insert(0, bumps[0])
+                            for cand in candidates:
+                                if not isinstance(cand, dict):
+                                    continue
+                                for item in cand.get(_PAYOUT_TRACE_METRIC, []):
+                                    v = _parse_payout_trace_value(item)
+                                    if v is not None:
+                                        return v
+                            return None
+                        running_idx += chunk_size
+                    return None
+
+                # RA = unfunded ZCB(leg currency) × E[n_corridor_obs] / n_total_obs.
+                # Mono and cross legs of a line share the corridor asset and the
+                # barriers → E[n] is computed once per UNIQUE corridor asset (from
+                # the mono EV instrument) and reused by the cross legs; n_total is
+                # read from each FPF's own observation schedule.
+                _corr_ccy = {}
+                for _i, _c in enumerate(corr_assets):
+                    _corr_ccy.setdefault(_c, currencies[_i])
+                ra_values_by_corr = {}
+                for _m_idx, _corr in enumerate(mono_corr_order):
+                    _n_obs = _pt_extract_n_obs(n_ev + _m_idx)
+                    _mono_obj = mono_ref_objs.get(_corr, (None,))[0]
+                    _od = getattr(_mono_obj, "observationDates", None)
+                    _n_total = (len(_od) - 1) if _od else None
+                    if _n_obs is not None and _n_total:
+                        _zcb = _unfunded_zcb(_corr_ccy.get(_corr, ref_currency),
+                                             cfg.strike_date, cfg.last_obs_date,
+                                             live_snap["name"])
+                        ra_values_by_corr[_corr] = _ra_from_payout_trace(_n_obs, _n_total, _zcb)
+                    else:
+                        ra_values_by_corr[_corr] = None
+                        dbg.warn("batch", f"PayoutTrace RA: n_obs={_n_obs}, n_total={_n_total} "
+                                          f"for {_corr} — RA unavailable for this leg")
 
 
         # ── Unified metric extraction ──
@@ -3668,7 +3724,8 @@ class PricingEngine(VolSwapMixin):
                 # Layout: [EV_cross×N, EV_mono×M, RA×M]
                 ev_cross_values = [_get_bump_fv(i, "LV") for i in range(n_ev)]
                 ev_mono_values = [_get_bump_fv(n_ev + i, "LV") for i in range(n_ev_mono)]
-                ra_values_by_corr = {mono_corr_order[i]: _get_bump_fv(n_ev + n_ev_mono + i, "LV") for i in range(n_ra)}
+                if not cfg.use_payout_trace_ra:
+                    ra_values_by_corr = {mono_corr_order[i]: _get_bump_fv(n_ev + n_ev_mono + i, "LV") for i in range(n_ra)}
 
                 # Extract LSV bumps (EV-cross only)
                 ev_cross_lsv_zero_values = [_get_bump_fv(i, "LSV0") for i in range(n_ev)]
@@ -3716,7 +3773,8 @@ class PricingEngine(VolSwapMixin):
                 ev_cross_lsv_values = [None] * n_ev
                 ev_cross_lcm_values = [None] * n_ev
                 ev_mono_values = [_get_fv(n_ev + i) for i in range(n_ev_mono)]
-                ra_values_by_corr = {mono_corr_order[i]: _get_fv(n_ev + n_ev_mono + i) for i in range(n_ra)}
+                if not cfg.use_payout_trace_ra:
+                    ra_values_by_corr = {mono_corr_order[i]: _get_fv(n_ev + n_ev_mono + i) for i in range(n_ra)}
                 # Mono LSV values (not supported in non-scenario mode)
                 ev_mono_lsv_zero_values = [None] * n_ev_mono
                 ev_mono_lsv_values = [None] * n_ev_mono
