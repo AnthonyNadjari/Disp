@@ -4841,16 +4841,17 @@ class PricingEngine(VolSwapMixin):
                         row['Mid Price'] = f"{r.mid_variance_asset * 100:.2f}%"
                     if r.zero_strike_mid_variance_asset is not None:
                         row['Realized Var (%)'] = f"{r.zero_strike_mid_variance_asset * 100:.2f}%"
-                    # ── FPF columns (Cross/Mono × Uncapped/Cap) ──
-                    row['FPF Cross Uncapped'] = r.fpf_string_cross if r.fpf_string_cross else ''
-                    row['FPF Cross LSV Uncapped'] = r.fpf_string_lsv if r.fpf_string_lsv else ''
-                    row['FPF Cross LCM Uncapped'] = r.fpf_string_lcm if r.fpf_string_lcm else ''
-                    row['FPF Cross Cap'] = r.fpf_string_cap_lv if r.fpf_string_cap_lv else ''
-                    row['FPF Cross LSV Cap'] = r.fpf_string_cap_lsv if r.fpf_string_cap_lsv else ''
-                    row['FPF Cross LCM Cap'] = r.fpf_string_cap_lcm if r.fpf_string_cap_lcm else ''
-                    row['FPF Mono Uncapped'] = r.fpf_string_mono if r.fpf_string_mono else ''
-                    row['FPF Mono Cap'] = r.fpf_string_cap_mono if r.fpf_string_cap_mono else ''
-                    row['FPF Mono LSV Cap'] = r.fpf_string_cap_lsv_mono if r.fpf_string_cap_lsv_mono else ''
+                    # ── FPF columns (mono mode: ONE structure — no Cross/Mono split;
+                    #    only non-empty columns are shown, matching the cross branch) ──
+                    for _fpf_col, _fpf_val in [
+                            ('FPF LV Uncapped',  r.fpf_string_mono or r.fpf_string_cross),
+                            ('FPF LSV Uncapped', r.fpf_string_lsv),
+                            ('FPF LCM Uncapped', r.fpf_string_lcm),
+                            ('FPF LV Cap',       r.fpf_string_cap_mono or r.fpf_string_cap_lv),
+                            ('FPF LSV Cap',      r.fpf_string_cap_lsv_mono or r.fpf_string_cap_lsv),
+                            ('FPF LCM Cap',      r.fpf_string_cap_lcm)]:
+                        if _fpf_val:
+                            row[_fpf_col] = _fpf_val
                     if r.strike_variance_asset:
                         row['Sparx Notional per 1k EUR Vega'] = f"{100 * 1000 / (2 * r.strike_variance_asset):,.2f}"
                     # ── Display extras (ZCB, barriers, tenor, vanilla strike) ──
