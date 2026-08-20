@@ -25,7 +25,6 @@ from functions.dispersion._pricing import (
     get_live_snap,
     _n_corridor_obs,
     _unfunded_zcb,
-    _ra_from_payout_trace,
 )
 
 MODEL_CONTEXT_NAME = "EMEA-Stocks-MC-LV-MultiAsset"
@@ -127,8 +126,7 @@ if run:
                 zcb = _unfunded_zcb(currency, strike_date, last_obs_date)
                 rows.append({"case": "mono", "ticker": tr.ticker,
                              "RA_old": tr.range_accrual,
-                             "RA_new": _ra_from_payout_trace(n_obs, n_total, zcb) if n_obs is not None else None,
-                             "n_total_obs": n_total})
+                             "n_obs": n_obs, "n_total_obs": n_total, "ZCB": zcb})
 
         # Cross
         if cross_pairs:
@@ -147,8 +145,7 @@ if run:
                 zcb = _unfunded_zcb(currency, strike_date, last_obs_date)
                 rows.append({"case": "cross (index leg)", "ticker": f"{tr.ticker}/{tr.corridor_asset}",
                              "RA_old": tr.range_accrual,
-                             "RA_new": _ra_from_payout_trace(n_obs, n_total, zcb) if n_obs is not None else None,
-                             "n_total_obs": n_total})
+                             "n_obs": n_obs, "n_total_obs": n_total, "ZCB": zcb})
                 # mono leg — same corridor asset, same n_obs (no extra call needed in prod)
                 nova_m, _ = _build_instrument(tr.corridor_asset, tr.corridor_asset, True,
                                               strike_date, last_obs_date,
@@ -156,17 +153,26 @@ if run:
                 n_obs_m = _n_corridor_obs([nova_m], datetime.now(), model_context, snap["name"])[0]
                 rows.append({"case": "cross (mono leg)", "ticker": tr.corridor_asset,
                              "RA_old": tr.range_accrual_mono,
-                             "RA_new": _ra_from_payout_trace(n_obs_m, n_total, zcb) if n_obs_m is not None else None,
-                             "n_total_obs": n_total})
+                             "n_obs": n_obs_m, "n_total_obs": n_total, "ZCB": zcb})
 
     out = pd.DataFrame(rows)
-    out["rel_diff_%"] = ((out["RA_new"] - out["RA_old"]).abs()
-                         / out["RA_old"].abs() * 100).round(4)
-
-    worst = out["rel_diff_%"].max()
-    if worst < 0.1:
-        st.success(f"✅ PASS — worst relative diff: {worst:.4f}% (threshold 0.1%)")
-    else:
-        st.error(f"⚠️ CHECK NEEDED — worst relative diff: {worst:.4f}% (threshold 0.1%)")
+    # Three candidate formulas side by side — the run tells us which one the
+    # portal's metric semantics match (×ZCB = we discount; ÷ZCB or plain = the
+    # metric is already discounted / RA instrument is undiscounted).
+    frac = out["n_obs"] / out["n_total_obs"]
+    out["RA_×zcb"] = (out["ZCB"] * frac).round(6)
+    out["RA_÷zcb"] = (frac / out["ZCB"]).round(6)
+    out["RA_no_zcb"] = frac.round(6)
+    for variant in ["RA_×zcb", "RA_÷zcb", "RA_no_zcb"]:
+        out[f"diff_%_{variant}"] = ((out[variant] - out["RA_old"]).abs()
+                                    / out["RA_old"].abs() * 100).round(4)
 
     st.dataframe(out, use_container_width=True)
+
+    st.caption("Compare each variant column against **RA_old** — the matching "
+               "formula is the one with all diffs ≈ 0 (MC noise aside). "
+               "Report back which variant wins and the engine switches to it.")
+    for variant in ["RA_×zcb", "RA_÷zcb", "RA_no_zcb"]:
+        worst_v = out[f"diff_%_{variant}"].max()
+        (st.success if worst_v < 0.1 else st.warning)(
+            f"{variant}: worst diff {worst_v:.4f}%")

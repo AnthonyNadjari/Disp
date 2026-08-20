@@ -503,6 +503,9 @@ class SolveResult:
     success: bool = True
     failed_tickers: List[str] = field(default_factory=list)
     error: Optional[str] = None
+    # Raw per-ticker engine results (strikes, EV/RA, FPF strings) — passthrough
+    # from PricingEngine.run(); empty when the engine stack is unavailable.
+    ticker_results: List = field(default_factory=list)
 
 @dataclass
 class PriceResult:
@@ -511,6 +514,8 @@ class PriceResult:
     success: bool = True
     failed_tickers: List[str] = field(default_factory=list)
     error: Optional[str] = None
+    # Same passthrough as SolveResult.
+    ticker_results: List = field(default_factory=list)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

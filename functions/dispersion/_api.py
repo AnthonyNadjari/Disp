@@ -405,6 +405,7 @@ def solve(
         success=result.success,
         failed_tickers=result.failed_tickers,
         error=result.error,
+        ticker_results=getattr(result, "ticker_results", []) or [],
     )
 
 
@@ -482,6 +483,7 @@ def price(
         success=result.success,
         failed_tickers=result.failed_tickers,
         error=result.error,
+        ticker_results=getattr(result, "ticker_results", []) or [],
     )
 
 
