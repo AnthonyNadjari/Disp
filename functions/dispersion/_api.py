@@ -194,6 +194,22 @@ def _to_bbg(name) -> str:
     return _ticker_conv_cache[name]
 
 
+def _to_ric(name) -> str:
+    """Normalize a ticker to RIC form if it is a BBG name (the pricing portal
+    resolves RIC identifiers); pass RICs through. Unrecognized names are kept
+    as-is (the portal error will say why)."""
+    name = str(name).strip()
+    if not name or _looks_like_ric(name):
+        return name
+    if name not in _ticker_conv_cache:
+        try:
+            from functions.common.tickers import bbg_to_ric
+            _ticker_conv_cache[name] = bbg_to_ric(name) or name
+        except Exception:
+            _ticker_conv_cache[name] = name
+    return _ticker_conv_cache[name]
+
+
 def _df_to_legs(df: pd.DataFrame, is_cross_corridor: bool) -> List[DispersionLeg]:
     """Parse a tickers DataFrame into DispersionLeg objects with unit conversions."""
     legs = []
@@ -404,6 +420,11 @@ def solve(
     _validate_columns(df, ['Variance Asset', 'Corridor Condition Asset', 'Currency'], 'solve')
     from functions.dispersion._pricing import PricingEngine, PricingConfig
 
+    # The pricing portal resolves RIC identifiers — accept BBG names too and
+    # convert them (cached desk lookup; RICs pass through unchanged).
+    df['Variance Asset'] = df['Variance Asset'].map(_to_ric)
+    df['Corridor Condition Asset'] = df['Corridor Condition Asset'].map(_to_ric)
+
     # Internally, PricingEngine expects 'Tickers' column
     engine_df = df.rename(columns={'Variance Asset': 'Tickers'})
 
@@ -482,6 +503,10 @@ def price(
     _validate_columns(df, ['Variance Asset', 'Corridor Condition Asset', 'Currency'], 'price')
 
     from functions.dispersion._pricing import PricingEngine, PricingConfig
+
+    # The pricing portal resolves RIC identifiers — accept BBG names too.
+    df['Variance Asset'] = df['Variance Asset'].map(_to_ric)
+    df['Corridor Condition Asset'] = df['Corridor Condition Asset'].map(_to_ric)
 
     # Internally, PricingEngine expects 'Tickers' column
     engine_df = df.rename(columns={'Variance Asset': 'Tickers'})

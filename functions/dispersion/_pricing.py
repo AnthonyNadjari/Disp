@@ -1477,9 +1477,13 @@ class TickerResult:
     ev_cap_mono_lsv: Optional[float] = None  # capped EV mono under LSV
     error: Optional[str] = None
     # Display extras (both solve paths): unfunded ZCB of the leg currency and
-    # the as-if-vanilla strike sqrt(-EV/ZCB) of the corridor EV.
+    # the as-if-vanilla strikes sqrt(-EV/ZCB) — variance and corridor legs,
+    # uncapped and capped.
     discount_factor: Optional[float] = None
     strike_vanilla_var: Optional[float] = None
+    strike_vanilla_var_cap: Optional[float] = None
+    strike_vanilla_mono: Optional[float] = None
+    strike_vanilla_mono_cap: Optional[float] = None
 
 @dataclass
 class PricingResult:
@@ -4017,11 +4021,19 @@ class PricingEngine(VolSwapMixin):
                     except Exception:
                         _zcb_leg = None
                 _vanilla_var = None
+                _vanilla_mono = None
                 if _zcb_leg and ev_val is not None and ev_val != 0:
                     try:
                         _vanilla_var = math.sqrt(abs(-ev_val / _zcb_leg))
                     except Exception:
                         _vanilla_var = None
+                _m_idx_v = mono_corr_order.index(corr_assets[idx]) if corr_assets[idx] in mono_corr_order else None
+                if (_zcb_leg and _m_idx_v is not None and ev_mono_values
+                        and ev_mono_values[_m_idx_v] is not None and ev_mono_values[_m_idx_v] != 0):
+                    try:
+                        _vanilla_mono = math.sqrt(abs(-ev_mono_values[_m_idx_v] / _zcb_leg))
+                    except Exception:
+                        _vanilla_mono = None
 
                 indexed_results[idx] = (TickerResult(
                     ticker=ticker,
@@ -4070,6 +4082,7 @@ class PricingEngine(VolSwapMixin):
                     correlation=corr_value,
                     discount_factor=_zcb_leg,
                     strike_vanilla_var=_vanilla_var,
+                    strike_vanilla_mono=_vanilla_mono,
                 ), None)
 
             except Exception as e:
@@ -4289,6 +4302,13 @@ class PricingEngine(VolSwapMixin):
                             result_obj.ev_cap_cross_lv = ev_cap
                             result_obj.fpf_string_cap_lv = _build_capped_fpf_string(ref_obj, ticker, corr,
                                                                                     real_cap_strike)
+                            try:
+                                _zcb_cap = _unfunded_zcb(result_obj.currency or ref_currency,
+                                                         cfg.strike_date, cfg.last_obs_date,
+                                                         live_snap["name"])
+                                result_obj.strike_vanilla_var_cap = math.sqrt(abs(-ev_cap / _zcb_cap))
+                            except Exception:
+                                pass
                             dbg.ok("CAP-PRICED", f"{ticker}: LV capped strike = {real_cap_strike * 100:.2f}%")
 
                     elif variant == 'lsv':
@@ -4332,6 +4352,13 @@ class PricingEngine(VolSwapMixin):
                             result_obj.ev_cap_mono_lv = ev_cap_mono
                             result_obj.fpf_string_cap_mono = _build_capped_fpf_string(mono_ref_obj, corr, corr,
                                                                                       real_cap_strike)
+                            try:
+                                _zcb_cap = _unfunded_zcb(result_obj.currency or ref_currency,
+                                                         cfg.strike_date, cfg.last_obs_date,
+                                                         live_snap["name"])
+                                result_obj.strike_vanilla_mono_cap = math.sqrt(abs(-ev_cap_mono / _zcb_cap))
+                            except Exception:
+                                pass
                             dbg.ok("CAP-PRICED", f"{corr}: Mono capped strike = {real_cap_strike * 100:.2f}%")
 
                     elif variant == 'lsv_mono':
@@ -4693,9 +4720,8 @@ class PricingEngine(VolSwapMixin):
                         row['EV Cross LCM (%)'] = f"{r.ev_cross_lcm:.2f}%"
 
                     if r.range_accrual is not None:
-                        row['RA Cross (%)'] = f"{r.range_accrual:.2f}%"
-                    if r.range_accrual_mono is not None:
-                        row['RA Mono (%)'] = f"{r.range_accrual_mono:.2f}%"
+                        # Mono and cross legs share the corridor asset → one RA column
+                        row['RA (%)'] = f"{r.range_accrual:.2f}%"
 
                     if r.ev_mono is not None:
                         row['EV Mono LV (%)'] = f"{r.ev_mono:.2f}%"
@@ -4786,15 +4812,20 @@ class PricingEngine(VolSwapMixin):
                             'Sparx Notional per 1k EUR Vega (Cross)'] = f"{100 * 1000 / (2 * r.strike_variance_asset):,.2f}"
                         row[
                             'Sparx Notional per 1k EUR Vega (Mono)'] = f"{100 * 1000 / (2 * r.strike_corridor_asset):,.2f}"
-                    # ── Display extras (ZCB, barriers, tenor, vanilla strike) ──
+                    # ── Display extras (ZCB, barriers, tenor, vanilla strikes) ──
                     if r.discount_factor is not None:
-                        row['Discount Factor'] = f"{r.discount_factor:.6f}"
+                        row['Discount Factor (%)'] = f"{r.discount_factor * 100:.2f}%"
                     row['Barrier Down (%)'] = f"{cfg.dvar * 100:.0f}%"
                     row['Barrier Up (%)'] = f"{cfg.uvar * 100:.0f}%"
-                    if r.obs_dates_cross is not None:
-                        row['Tenor (bd)'] = r.obs_dates_cross
+                    row['Tenor'] = cfg.last_obs_date.strftime("%d/%m/%Y")
                     if r.strike_vanilla_var is not None:
-                        row['Strike Vanilla Var (%)'] = f"{r.strike_vanilla_var * 100:.2f}%"
+                        row['Vanilla Var Variance (%)'] = f"{r.strike_vanilla_var * 100:.2f}%"
+                    if r.strike_vanilla_var_cap is not None:
+                        row['Vanilla Var Variance Cap (%)'] = f"{r.strike_vanilla_var_cap * 100:.2f}%"
+                    if r.strike_vanilla_mono is not None:
+                        row['Vanilla Var Corridor (%)'] = f"{r.strike_vanilla_mono * 100:.2f}%"
+                    if r.strike_vanilla_mono_cap is not None:
+                        row['Vanilla Var Corridor Cap (%)'] = f"{r.strike_vanilla_mono_cap * 100:.2f}%"
                 else:
                     row['Status'] = r.error or 'Failed'
             else:
@@ -4811,7 +4842,7 @@ class PricingEngine(VolSwapMixin):
 
 
                     if r.range_accrual_mono is not None:
-                        row['RA Mono (%)'] = f"{r.range_accrual_mono:.2f}%"
+                        row['RA (%)'] = f"{r.range_accrual_mono:.2f}%"
 
                     if r.obs_dates_cross is not None:
                         row['Obs Dates'] = r.obs_dates_cross
@@ -4836,15 +4867,20 @@ class PricingEngine(VolSwapMixin):
                             row[_fpf_col] = _fpf_val
                     if r.strike_variance_asset:
                         row['Sparx Notional per 1k EUR Vega'] = f"{100 * 1000 / (2 * r.strike_variance_asset):,.2f}"
-                    # ── Display extras (ZCB, barriers, tenor, vanilla strike) ──
+                    # ── Display extras (ZCB, barriers, tenor, vanilla strikes) ──
                     if r.discount_factor is not None:
-                        row['Discount Factor'] = f"{r.discount_factor:.6f}"
+                        row['Discount Factor (%)'] = f"{r.discount_factor * 100:.2f}%"
                     row['Barrier Down (%)'] = f"{cfg.dvar * 100:.0f}%"
                     row['Barrier Up (%)'] = f"{cfg.uvar * 100:.0f}%"
-                    if r.obs_dates_cross is not None:
-                        row['Tenor (bd)'] = r.obs_dates_cross
+                    row['Tenor'] = cfg.last_obs_date.strftime("%d/%m/%Y")
                     if r.strike_vanilla_var is not None:
-                        row['Strike Vanilla Var (%)'] = f"{r.strike_vanilla_var * 100:.2f}%"
+                        row['Vanilla Var Variance (%)'] = f"{r.strike_vanilla_var * 100:.2f}%"
+                    if r.strike_vanilla_var_cap is not None:
+                        row['Vanilla Var Variance Cap (%)'] = f"{r.strike_vanilla_var_cap * 100:.2f}%"
+                    if r.strike_vanilla_mono is not None:
+                        row['Vanilla Var Corridor (%)'] = f"{r.strike_vanilla_mono * 100:.2f}%"
+                    if r.strike_vanilla_mono_cap is not None:
+                        row['Vanilla Var Corridor Cap (%)'] = f"{r.strike_vanilla_mono_cap * 100:.2f}%"
                 else:
                     row['Status'] = r.error or 'Failed'
             rows.append(row)
