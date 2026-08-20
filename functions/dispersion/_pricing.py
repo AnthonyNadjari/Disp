@@ -2653,23 +2653,6 @@ class PricingEngine(VolSwapMixin):
                     ),
                 )
 
-                mono_ra_obj = None  # RA instruments removed — RA comes from the PayoutTrace metric
-                if False: mono_ev_obj.clone(
-                    varianceDetails=mono_ev_obj.varianceDetails.clone(
-                        varianceAssetsAndIndexLegDetails=[
-                            mono_ev_obj.varianceDetails.varianceAssetsAndIndexLegDetails[0].clone(
-                                asset=corr,
-                                basketMultiplier=-1,
-                                strike=-1,
-                                legCap=Just(-1),
-                                legFloor=Just(-1),
-                                legMultiplier=1.0,
-                            )
-                        ],
-                        isOptionOnVariance=True,
-                    )
-                )
-
                 if use_lsv_mono_ev:
                     mono_ev_lsv_obj = mono_ev_obj.clone(
                         varianceDetails=mono_ev_obj.varianceDetails.clone(
@@ -2745,14 +2728,14 @@ class PricingEngine(VolSwapMixin):
 
                     mono_ref_objs[corr] = (
                         mono_ev_obj,
-                        mono_ra_obj,
+                        None,
                         mono_ev_lsv_obj,
                         mono_ev_lsv_zero_obj,
                     )
                 else:
                     mono_ref_objs[corr] = (
                         mono_ev_obj,
-                        mono_ra_obj,
+                        None,
                         None,
                         None,
                     )
@@ -2905,7 +2888,6 @@ class PricingEngine(VolSwapMixin):
             instruments.append(_make_instrument(ev_mono_fpfs[corr], [corr]))
         n_ev_mono = len(mono_corr_order)
         # No dedicated RA instruments: RA comes from the PayoutTrace metric.
-        n_ra = 0
         # LSV versions for mono EV (if enabled)
         n_ev_mono_lsv = 0
         n_ev_mono_lsv_zero = 0
@@ -2919,7 +2901,6 @@ class PricingEngine(VolSwapMixin):
                     instruments.append(_make_instrument(ev_mono_lsv_zero_fpfs[corr], [corr]))
                     n_ev_mono_lsv_zero += 1
         # Build corridor asset → RA index mapping for cross strike lookup
-        _corr_to_ra_idx = {corr: i for i, corr in enumerate(mono_corr_order)}
         dbg.info("batch", f"[TIMING] Instruments created: {time.time() - t_instr:.3f}s ({len(instruments)} total)")
         self._batch_timings['instruments'] = time.time() - t_instr
 
@@ -2929,7 +2910,7 @@ class PricingEngine(VolSwapMixin):
         _scenario_label = " | Scenario=enabled" if _has_scenario else ""
         _lsv_label = f" | LSV_mono×{n_ev_mono_lsv}" if n_ev_mono_lsv > 0 else ""
         _safe_print(f"\n[BATCH] Model={_model} | Tickers={len(tickers)} | Instruments={len(instruments)} "
-                    f"(EV_cross×{n_ev}, EV_linked×{n_ev_mono}, RA×{n_ra}{_lsv_label}) | Corr assets={len(unique_corr_assets)}{_scenario_label}")
+                    f"(EV_cross×{n_ev}, EV_linked×{n_ev_mono}{_lsv_label}) | Corr assets={len(unique_corr_assets)}{_scenario_label}")
 
         t_http = time.time()
 
@@ -3110,9 +3091,7 @@ class PricingEngine(VolSwapMixin):
                 )
 
                 # Extract results back into position
-                n_group = len(ticker_indices)
                 for local_i, global_i in enumerate(ticker_indices):
-                    # EV-cross is at position local_i, RA at n_group + local_i
                     all_ev_cross[global_i] = _pt_fv_at(group_res, local_i)
 
             # Mono instruments: price without per-ticker correlation (they use the corridor asset itself)
