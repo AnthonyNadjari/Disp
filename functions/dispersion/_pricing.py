@@ -3339,6 +3339,9 @@ class PricingEngine(VolSwapMixin):
                     price_id="Price",
                     batch_label="atms",
                 )
+                if not batch_res_atms:
+                    dbg.warn("batch", "ATMS batch returned NO results — ATMS columns will be "
+                                      "empty (the second pricing call failed)")
             dbg.ok("batch", f"priced in {time.time() - t_price_call:.1f}s (main: {t_price_done:.1f}s)")
 
             # ── Step 4: Extract results ──
@@ -3418,48 +3421,98 @@ class PricingEngine(VolSwapMixin):
 
             return None
 
-        def _get_atmf(idx):
-            if not include_atmf:
-                return None
-            return _get_metric_for_instrument(idx, "QueryLocalCcyVol")
+        def _unwrap_vol_list(entry, bump_name=None):
+            """QueryLocalCcyVol list from a result entry, wherever the portal
+            put it: top level, inside a named bump (entry['LV'][0]), or inside
+            a SimpleScenarioBump wrapper. Returns [] when absent."""
+            if not isinstance(entry, dict):
+                return []
+            vol_list = entry.get("QueryLocalCcyVol", [])
+            if isinstance(vol_list, list) and vol_list:
+                return vol_list
+            bump_names = [bump_name] if bump_name else ["LV", "LSV", "LSV0", "LCM"]
+            for bn in bump_names:
+                bump_data = entry.get(bn, [])
+                if isinstance(bump_data, list) and bump_data and isinstance(bump_data[0], dict):
+                    vol_list = bump_data[0].get("QueryLocalCcyVol", [])
+                    if isinstance(vol_list, list) and vol_list:
+                        return vol_list
+            bumps = entry.get("SimpleScenarioBump", [])
+            if isinstance(bumps, list) and bumps and isinstance(bumps[0], dict):
+                for bn in bump_names:
+                    bump_data = bumps[0].get(bn, [])
+                    if isinstance(bump_data, list) and bump_data and isinstance(bump_data[0], dict):
+                        vol_list = bump_data[0].get("QueryLocalCcyVol", [])
+                        if isinstance(vol_list, list) and vol_list:
+                            return vol_list
+            return []
 
-        def _get_atms(idx):
-            """Extract ATMS vol from results.
-            - In ATMS-only mode: ATMS is the QueryLocalCcyVol in main batch.
-            - In ATMF+ATMS mode: ATMS is in the separate batch_res_atms.
-            """
-            if not include_atms:
-                return None
-            if not include_atmf:
-                # ATMS-only mode: ATMS is in the main results as QueryLocalCcyVol
-                return _get_metric_for_instrument(idx, "QueryLocalCcyVol")
-            # ATMF+ATMS mode: ATMS is in the separate batch
-            if not results_map_atms:
-                return None
+        def _get_metric_list_for_instrument(idx, metric_name, results):
+            """Full metric LIST for instrument at global idx (every entry,
+            not just [0]) — QueryLocalCcyVol goes through _unwrap_vol_list
+            so bump-wrapped (scenario) responses are handled too."""
             running_idx = 0
-            for chunk_start in sorted(results_map_atms.keys()):
-                chunk_data = results_map_atms[chunk_start]
+            for chunk_start in sorted(results.keys()):
+                chunk_data = results[chunk_start]
                 chunk_size = chunk_data["chunk_size"]
                 if idx < running_idx + chunk_size:
                     local_idx = idx - running_idx
                     raw = chunk_data["raw"]
                     key = "Price" if local_idx == 0 else f"Price_{local_idx}"
+                    # Format B: one "Price_N" key per instrument
                     if key in raw:
                         entry = raw[key]
+                        if metric_name == "QueryLocalCcyVol":
+                            return _unwrap_vol_list(entry)
                         if isinstance(entry, dict):
-                            vol_list = entry.get("QueryLocalCcyVol", [])
-                            if vol_list and isinstance(vol_list, list) and len(vol_list) > 0:
-                                return vol_list[0].get("value") if isinstance(vol_list[0], dict) else None
+                            metric_list = entry.get(metric_name, [])
+                            if isinstance(metric_list, list) and metric_list:
+                                return metric_list
+                        return []
+                    # Format A fallback: single "Price" key, one entry per
+                    # instrument — wrapped so the caller can still match by
+                    # PrimaryAssetRef (None instead of a wrong asset).
                     if "Price" in raw:
                         entry = raw["Price"]
                         if isinstance(entry, dict):
-                            vol_list = entry.get("QueryLocalCcyVol", [])
-                            if vol_list and isinstance(vol_list, list) and local_idx < len(vol_list):
-                                return vol_list[local_idx].get("value") if isinstance(vol_list[local_idx],
-                                                                                      dict) else None
-                    return None
+                            metric_list = entry.get(metric_name, [])
+                            if (isinstance(metric_list, list)
+                                    and local_idx < len(metric_list)
+                                    and isinstance(metric_list[local_idx], dict)):
+                                return [metric_list[local_idx]]
+                    return []
                 running_idx += chunk_size
-            return None
+            return []
+
+        def _get_atmf(idx, expected_asset):
+            """ATMF vol of `expected_asset` from instrument idx — ALWAYS
+            matched by PrimaryAssetRef, never by position (the portal's
+            entry order is unstable per instrument)."""
+            if not include_atmf:
+                return None
+            vol_list = _get_metric_list_for_instrument(idx, "QueryLocalCcyVol", results_map)
+            val = _extract_vol(vol_list, expected_asset)
+            if val is None and vol_list:
+                dbg.warn("batch", f"_get_atmf({idx}): no vol entry for "
+                                  f"{expected_asset} in {[v.get('PrimaryAssetRef') for v in vol_list if isinstance(v, dict)]}")
+            return val
+
+        def _get_atms(idx, expected_asset):
+            """ATMS vol of `expected_asset` from instrument idx.
+            - ATMS-only mode: QueryLocalCcyVol in the main batch.
+            - ATMF+ATMS mode: QueryLocalCcyVol in the separate ATMS batch.
+            Matched by PrimaryAssetRef in both modes."""
+            if not include_atms:
+                return None
+            if not include_atmf:
+                vol_list = _get_metric_list_for_instrument(idx, "QueryLocalCcyVol", results_map)
+                return _extract_vol(vol_list, expected_asset)
+            if not results_map_atms:
+                dbg.warn("batch", f"_get_atms({idx}): ATMS batch is EMPTY — the second "
+                                  f"pricing call failed; ATMS for {expected_asset} will be blank")
+                return None
+            vol_list = _get_metric_list_for_instrument(idx, "QueryLocalCcyVol", results_map_atms)
+            return _extract_vol(vol_list, expected_asset)
 
         def _get_corr(idx):
             val = _get_metric_for_instrument(idx, "Correlation")
@@ -3522,15 +3575,16 @@ class PricingEngine(VolSwapMixin):
                             local_idx = global_idx - running_idx
                             raw = chunk_data["raw"]
                             key = "Price" if local_idx == 0 else f"Price_{local_idx}"
-                            entry = raw.get(key)
-
-                            if not isinstance(entry, dict):
-                                return None
-
-                            return _extract_vol(
-                                entry.get("QueryLocalCcyVol", []),
-                                expected_asset,
-                            )
+                            # Scenario mode nests metrics INSIDE the bump —
+                            # _unwrap_vol_list handles top level / bump / wrapper.
+                            vol_list = _unwrap_vol_list(raw.get(key), bump_name)
+                            val = _extract_vol(vol_list, expected_asset)
+                            if val is None:
+                                found = [v.get("PrimaryAssetRef") for v in vol_list
+                                         if isinstance(v, dict)] or "EMPTY"
+                                dbg.warn("batch", f"_get_bump_vol({global_idx}, {bump_name}): "
+                                                  f"no vol for {expected_asset}, response had {found}")
+                            return val
                         running_idx += chunk_size
 
                     return None
@@ -3543,30 +3597,36 @@ class PricingEngine(VolSwapMixin):
                         return _get_bump_vol(global_idx, bump_name, expected_asset)
 
                     if not results_map_atms:
+                        dbg.warn("batch", f"_get_bump_atms({global_idx}): ATMS batch is EMPTY "
+                                          f"— the second pricing call failed; ATMS for "
+                                          f"{expected_asset} will be blank")
                         return None
 
                     running_idx = 0
 
                     for chunk_start in sorted(results_map_atms.keys()):
-                        chunk_data = results_map_atms[chunk_start]
+                        chunk_data = results_map[chunk_start]
                         chunk_size = chunk_data["chunk_size"]
 
                         if global_idx < running_idx + chunk_size:
                             local_idx = global_idx - running_idx
                             raw = chunk_data["raw"]
                             key = "Price" if local_idx == 0 else f"Price_{local_idx}"
-                            entry = raw.get(key)
-
-                            if not isinstance(entry, dict):
-                                return None
-
-                            return _extract_vol(
-                                entry.get("QueryLocalCcyVol", []),
-                                expected_asset,
-                            )
+                            # ATMS batch is priced WITHOUT the scenario → usually
+                            # top-level, but _unwrap_vol_list covers both shapes.
+                            vol_list = _unwrap_vol_list(raw.get(key))
+                            val = _extract_vol(vol_list, expected_asset)
+                            if val is None:
+                                found = [v.get("PrimaryAssetRef") for v in vol_list
+                                         if isinstance(v, dict)] or "EMPTY (chunk failed?)"
+                                dbg.warn("batch", f"_get_bump_atms({global_idx}): no ATMS for "
+                                                  f"{expected_asset}, response had {found}")
+                            return val
 
                         running_idx += chunk_size
 
+                    dbg.warn("batch", f"_get_bump_atms({global_idx}): index beyond ATMS chunks "
+                                      f"(a chunk errored and was stored empty?)")
                     return None
 
 
@@ -3662,10 +3722,10 @@ class PricingEngine(VolSwapMixin):
                 ev_mono_lsv_values = [None] * n_ev_mono
 
                 # Vols and correlation from flat (no-scenario) response
-                atmf_vols_cross = {tickers[i]: _get_atmf(i) for i in range(n_ev)}
-                atms_vols_cross = {tickers[i]: _get_atms(i) for i in range(n_ev)}
-                atmf_vols_mono = {mono_corr_order[i]: _get_atmf(n_ev + i) for i in range(n_ev_mono)}
-                atms_vols_mono = {mono_corr_order[i]: _get_atms(n_ev + i) for i in range(n_ev_mono)}
+                atmf_vols_cross = {tickers[i]: _get_atmf(i, tickers[i]) for i in range(n_ev)}
+                atms_vols_cross = {tickers[i]: _get_atms(i, tickers[i]) for i in range(n_ev)}
+                atmf_vols_mono = {mono_corr_order[i]: _get_atmf(n_ev + i, mono_corr_order[i]) for i in range(n_ev_mono)}
+                atms_vols_mono = {mono_corr_order[i]: _get_atms(n_ev + i, mono_corr_order[i]) for i in range(n_ev_mono)}
         else:
             # Per-ticker correlation mode: values already extracted in the grouped pricing loop
             # Vols: not available from per-ticker path (mono_res doesn't have per-ticker vol)
