@@ -2479,20 +2479,36 @@ with tab4:
                         if s == 'pricing_batch':
                             batch = progress_info['batch']
                             total = progress_info['total_batches']
-                            # Clamp: engine may have more batches than initially estimated
+                            label = progress_info.get('label', 'main')
+                            # Unified bar: main/atms batches 5%→45%, capped batch 70%→85%
                             batch_display = min(batch, total)
-                            # Pricing batches occupy 10%–70% of progress bar
-                            pct = 0.10 + (min(batch, total) / max(total, 1)) * 0.60
-                            progress_bar.progress(min(pct, 1.0), text=f"Pricing batch {batch_display} / {total}...")
+                            frac = batch_display / max(total, 1)
+                            if label == 'capped':
+                                pct = 0.70 + frac * 0.15
+                            else:
+                                pct = 0.05 + frac * 0.40
+                            progress_bar.progress(min(pct, 1.0),
+                                                  text=f"Pricing batch {batch_display} / {total} ({label})...")
                         elif s in ('completed', 'started', 'pricing'):
-                            pct = 0.70 + (progress_info['completed'] / max(progress_info['total'], 1)) * 0.30
+                            # Per-ticker results: 45%→70%
+                            pct = 0.45 + (progress_info['completed'] / max(progress_info['total'], 1)) * 0.25
                             progress_bar.progress(min(pct, 1.0),
                                                   text=f"{progress_info.get('message', progress_info.get('ticker', ''))} ({progress_info['completed']}/{progress_info['total']})")
                         elif s == 'failed':
                             status_text.warning(
                                 f"⚠️ {progress_info.get('ticker', '')} - {progress_info.get('message', '')}")
                         elif s == 'phase':
-                            progress_bar.progress(0.05, text=progress_info.get('message', ''))
+                            # Named phases map to their slot in the unified bar
+                            msg = progress_info.get('message', '')
+                            if 'Serializ' in msg:
+                                pct = 0.87
+                            elif 'Capped' in msg:
+                                pct = 0.70
+                            elif 'Building' in msg:
+                                pct = 0.02
+                            else:
+                                pct = 0.05
+                            progress_bar.progress(pct, text=msg)
 
                 try:
                     tickers = [t for t in

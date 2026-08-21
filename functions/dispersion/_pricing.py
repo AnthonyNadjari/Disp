@@ -2953,9 +2953,13 @@ class PricingEngine(VolSwapMixin):
         MAX_INSTRUMENTS_PER_CALL = 100
 
         # ── Compute total batch count for progress reporting ──
+        # Upfront estimate includes the capped re-pricing batch (Phase 2b) so
+        # the counter never exceeds its own total mid-run; the dynamic adjust
+        # below stays as a safety net for unusual shapes.
         _main_chunks = (len(instruments) + MAX_INSTRUMENTS_PER_CALL - 1) // MAX_INSTRUMENTS_PER_CALL
         _atms_chunks = _main_chunks if cfg.vol_mode == "ATMF+ATMS" else 0
-        _total_batches = _main_chunks + _atms_chunks
+        _cap_chunks_est = _main_chunks if cfg.is_capped else 0
+        _total_batches = _main_chunks + _atms_chunks + _cap_chunks_est
         _batch_counter = [1]  # mutable counter for nested function
 
         def _price_in_batches(instruments, metrics, price_id="Price", scenario=None, batch_label="main"):
@@ -2984,9 +2988,9 @@ class PricingEngine(VolSwapMixin):
                     }
                     if scenario is not None:
                         price_kwargs["scenario"] = scenario
-                    # ── Progress tracking ──
-                    _safe_print(f"\r[BATCH] Sent {chunk_num} / {n_chunks} "
-                                f"({len(chunk)} instruments)       ", end="", flush=True)
+                    # ── Progress tracking (GLOBAL counter across all batches) ──
+                    _safe_print(f"\r[BATCH] Sent {_batch_counter[0]} / {_total_batches} "
+                                f"({batch_label}, {len(chunk)} instruments)       ", end="", flush=True)
 
                     dbg.step("batch", f"HTTP call: {len(chunk)} instruments (chunk start={start})...")
                     batch_res = pricing_portal.price(**price_kwargs)
@@ -4163,6 +4167,8 @@ class PricingEngine(VolSwapMixin):
         # Errors are per-item: a failed serialization marks its ticker failed
         # (same semantics as the old inline try/except).
         if _fpf_serial_jobs:
+            if progress_callback:
+                progress_callback({'status': 'phase', 'message': 'Serializing FPFs...'})
             _t_fpf_serial = time.time()
 
             def _safe_serialize(o):
@@ -4190,6 +4196,8 @@ class PricingEngine(VolSwapMixin):
         if cfg.is_capped:
             t_cap = time.time()
             dbg.step("batch", "Phase 2b: Capped re-pricing...")
+            if progress_callback:
+                progress_callback({'status': 'phase', 'message': 'Capped re-pricing...'})
 
             # Collect successful tickers that need capped pricing
             cap_tasks = []  # [(idx, variant, cap_value, strike_theo)]
