@@ -2352,6 +2352,40 @@ class PricingEngine(VolSwapMixin):
                 running += cd["chunk_size"]
             return None
 
+        def _extract_vol_ca(global_idx, expected_asset, bump_name=None):
+            """QueryLocalCcyVol of `expected_asset` at global_idx, matched by
+            PrimaryAssetRef (never positionally). Same response shapes as _extract:
+            direct entry, SimpleScenarioBump, or top-level bump name."""
+            running = 0
+            for chunk_start in sorted(all_results_raw.keys()):
+                cd = all_results_raw[chunk_start]
+                if global_idx < running + cd["chunk_size"]:
+                    local_idx = global_idx - running
+                    raw = cd["raw"]
+                    key = "Price" if local_idx == 0 else f"Price_{local_idx}"
+                    vol_list = []
+                    if key in raw and isinstance(raw[key], dict):
+                        entry = raw[key]
+                        if bump_name is not None and use_scenario:
+                            if "SimpleScenarioBump" in entry:
+                                bumps = entry["SimpleScenarioBump"]
+                                if bumps and isinstance(bumps, list) and bumps:
+                                    bump_data = bumps[0].get(bump_name, [])
+                                    if isinstance(bump_data, list) and bump_data and isinstance(bump_data[0], dict):
+                                        vol_list = bump_data[0].get("QueryLocalCcyVol", [])
+                            elif bump_name in entry:
+                                bump_data = entry[bump_name]
+                                if isinstance(bump_data, list) and bump_data and isinstance(bump_data[0], dict):
+                                    vol_list = bump_data[0].get("QueryLocalCcyVol", [])
+                        if not vol_list:
+                            vol_list = entry.get("QueryLocalCcyVol", [])
+                    for item in vol_list:
+                        if isinstance(item, dict) and item.get("PrimaryAssetRef") == expected_asset:
+                            return item.get("value")
+                    return None
+                running += cd["chunk_size"]
+            return None
+
         # ── Step 3: Extract results ──
         # Pre-compute ATMF Vol for unique Variance Assets (deduplicated)
         # The cross FPF's QueryLocalCcyVol returns corridor asset vol, NOT variance asset vol.
@@ -2396,10 +2430,10 @@ class PricingEngine(VolSwapMixin):
                     mono_global_idx = n_cross + mono_indices.index(idx)
                     if use_scenario:
                         mid_ca = _extract(mono_global_idx, "FairValue", "LV")
-                        atmf_vol_ca = _extract(mono_global_idx, "QueryLocalCcyVol", "LV")
+                        atmf_vol_ca = _extract_vol_ca(mono_global_idx, corr_assets[idx], "LV")
                     else:
                         mid_ca = _extract(mono_global_idx, "FairValue")
-                        atmf_vol_ca = _extract(mono_global_idx, "QueryLocalCcyVol")
+                        atmf_vol_ca = _extract_vol_ca(mono_global_idx, corr_assets[idx])
                 elif ticker == corr_assets[idx]:
                     mid_ca = mid_va
                     atmf_vol_ca = atmf_vol_va
