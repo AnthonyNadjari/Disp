@@ -4160,13 +4160,29 @@ class PricingEngine(VolSwapMixin):
 
         # ── Pooled FPF serialization: ONE parallel pass for all solved FPF
         # clone objects queued during the loop (was ~2-4s each, sequential).
+        # Errors are per-item: a failed serialization marks its ticker failed
+        # (same semantics as the old inline try/except).
         if _fpf_serial_jobs:
             _t_fpf_serial = time.time()
+
+            def _safe_serialize(o):
+                try:
+                    return o.to_fpf_string(), None
+                except Exception as _se:
+                    return None, _se
+
             with ThreadPoolExecutor(max_workers=8) as pool:
-                _fpf_strings = list(pool.map(lambda o: o.to_fpf_string(),
-                                             [j[2] for j in _fpf_serial_jobs]))
-            for (result_obj, attr, _), fpf_str in zip(_fpf_serial_jobs, _fpf_strings):
-                setattr(result_obj, attr, fpf_str)
+                _fpf_strings = list(pool.map(_safe_serialize, [j[2] for j in _fpf_serial_jobs]))
+            _failed_tickers = set()
+            for (result_obj, attr, _), (fpf_str, err) in zip(_fpf_serial_jobs, _fpf_strings):
+                if err is not None:
+                    _failed_tickers.add((result_obj.ticker, str(err)))
+                    result_obj.success = False
+                    result_obj.error = f"FPF serialization failed: {err}"
+                else:
+                    setattr(result_obj, attr, fpf_str)
+            if _failed_tickers:
+                dbg.warn("batch", f"FPF serialization failed for: {sorted(_failed_tickers)}")
             dbg.info("batch", f"[TIMING] FPF serialization (solved, pooled): "
                               f"{time.time() - _t_fpf_serial:.2f}s ({len(_fpf_serial_jobs)} FPFs, 8 threads)")
 
@@ -4255,15 +4271,30 @@ class PricingEngine(VolSwapMixin):
                     cap_task_map.append((idx, variant))
 
                 # Pooled serialization of the capped FPF clones (CPU-bound)
+                _cap_task_map_aligned = []
                 if _cap_clone_jobs:
                     _t_cap_serial = time.time()
+
+                    def _safe_serialize_inst(o):
+                        try:
+                            return o.to_fpf_string(), None
+                        except Exception as _se:
+                            return None, _se
+
                     with ThreadPoolExecutor(max_workers=8) as pool:
-                        _cap_fpf_strs = list(pool.map(lambda o: o.to_fpf_string(),
+                        _cap_fpf_strs = list(pool.map(_safe_serialize_inst,
                                                       [j[0] for j in _cap_clone_jobs]))
                     dbg.info("batch", f"[TIMING] FPF serialization (cap instruments, pooled): "
                                       f"{time.time() - _t_cap_serial:.2f}s ({len(_cap_fpf_strs)} FPFs, 8 threads)")
-                    for (_, rics), capped_fpf_str in zip(_cap_clone_jobs, _cap_fpf_strs):
+                    for (idx_v, variant_v), (_, rics), (capped_fpf_str, err) in zip(
+                            cap_task_map, _cap_clone_jobs, _cap_fpf_strs):
+                        if err is not None:
+                            dbg.warn("batch", f"capped instrument serialization failed for "
+                                              f"{tickers[idx_v]} ({variant_v}): {err}")
+                            continue
                         cap_instruments.append(_make_instrument(capped_fpf_str, rics))
+                        _cap_task_map_aligned.append((idx_v, variant_v))
+                    cap_task_map = _cap_task_map_aligned
 
                 # Price capped batch (reuse same scenario as Phase 1)
                 effective_cap_scenario = None
@@ -4446,11 +4477,22 @@ class PricingEngine(VolSwapMixin):
                 # Pooled serialization of the solved capped FPF clones
                 if _cap_str_serial_jobs:
                     _t_cap_str = time.time()
+
+                    def _safe_serialize_cap(o):
+                        try:
+                            return o.to_fpf_string(), None
+                        except Exception as _se:
+                            return None, _se
+
                     with ThreadPoolExecutor(max_workers=8) as pool:
-                        _cap_str_strs = list(pool.map(lambda o: o.to_fpf_string(),
+                        _cap_str_strs = list(pool.map(_safe_serialize_cap,
                                                       [j[2] for j in _cap_str_serial_jobs]))
-                    for (result_obj, attr, _), fpf_str in zip(_cap_str_serial_jobs, _cap_str_strs):
-                        setattr(result_obj, attr, fpf_str)
+                    for (result_obj, attr, _), (fpf_str, err) in zip(_cap_str_serial_jobs, _cap_str_strs):
+                        if err is not None:
+                            dbg.warn("batch", f"capped FPF serialization failed for "
+                                              f"{result_obj.ticker} ({attr}): {err}")
+                        else:
+                            setattr(result_obj, attr, fpf_str)
                     dbg.info("batch", f"[TIMING] FPF serialization (solved capped, pooled): "
                                       f"{time.time() - _t_cap_str:.2f}s ({len(_cap_str_strs)} FPFs, 8 threads)")
 
