@@ -2392,12 +2392,14 @@ class PricingEngine(VolSwapMixin):
         # So we must fetch variance asset vol separately.
         matu_ex_0, matu_stl_0 = calculate_payment_dates(cfg.last_obs_date, currencies[0])
         _unique_vas = set(tickers)
-        _va_atmf_cache = {}
-        for _va in _unique_vas:
+        def _fetch_va_vol(_va):
             try:
-                _va_atmf_cache[_va] = compute_implied_vol(_va, matu_stl_0, "Forward")
+                return _va, compute_implied_vol(_va, matu_stl_0, "Forward")
             except Exception:
-                _va_atmf_cache[_va] = None
+                return _va, None
+
+        with ThreadPoolExecutor(max_workers=min(8, max(1, len(_unique_vas)))) as pool:
+            _va_atmf_cache = dict(pool.map(_fetch_va_vol, _unique_vas))
         if _unique_vas:
             _safe_print(f"[BATCH-PRICE] ATMF vol lookup: {len(_unique_vas)} unique Variance Asset(s)")
 
@@ -2616,13 +2618,14 @@ class PricingEngine(VolSwapMixin):
             for idx, (ticker, corr, sched) in enumerate(zip(tickers, corr_assets, schedule_assets)):
                 schedule_groups[sched].append((idx, ticker, corr))
 
-            # Build one reference FPF per schedule_asset group
+            # Build one reference FPF per schedule_asset group — in parallel
+            # (calendar intersections are independent per group)
             ev_cross_ref_objs = {}  # schedule_asset -> ev_ref_obj
-            for sched_asset, members in schedule_groups.items():
+
+            def _build_group_ref(item):
+                sched_asset, members = item
                 ref_idx, ref_ticker, ref_corr = members[0]
                 ref_currency_sched = currencies[ref_idx]
-                dbg.ok("SCHEDULE-ASSET-GROUP", f"schedule_asset={sched_asset}: {len(members)} tickers")
-
                 ev_cross_ref_fpf = build_corridor_fpf(
                     tickers=[ref_ticker], last_obs_date=cfg.last_obs_date,
                     strike_date=cfg.strike_date, strikes=[0.000001], weights=[1.0],
@@ -2630,11 +2633,13 @@ class PricingEngine(VolSwapMixin):
                     corr_asset=ref_corr, schedule_calendar_asset=sched_asset,
                     currency=ref_currency_sched, use_parameters=False,
                 )
+                return sched_asset, FPFUnifiedEconomicsWrapper.from_data(
+                    ev_cross_ref_fpf, script_cls=corridorCovarianceSwap_v4)
 
-                ev_cross_ref_obj = FPFUnifiedEconomicsWrapper.from_data(ev_cross_ref_fpf,
-                                                                        script_cls=corridorCovarianceSwap_v4)
-                ev_cross_ref_objs[sched_asset] = ev_cross_ref_obj
-                dbg.ok("SCHEDULE-ASSET-GROUP", f"  built ref FPF for schedule_asset={sched_asset}")
+            with ThreadPoolExecutor(max_workers=min(8, max(1, len(schedule_groups)))) as pool:
+                for sched_asset, ev_cross_ref_obj in pool.map(_build_group_ref, schedule_groups.items()):
+                    ev_cross_ref_objs[sched_asset] = ev_cross_ref_obj
+                    dbg.ok("SCHEDULE-ASSET-GROUP", f"  built ref FPF for schedule_asset={sched_asset}")
 
             # (RA is now built only per unique corridor asset via mono_ref_objs below)
 
@@ -3777,6 +3782,10 @@ class PricingEngine(VolSwapMixin):
                 dbg.warn("batch", f"mono {corr}: pricing failed")
 
         # ── Step 5: Compute per-ticker results + build solved FPFs ──
+        # FPF clone objects are built inline (cheap); the expensive
+        # to_fpf_string() serialization runs ONCE in a parallel pool after the
+        # loop (CPU-bound, thread-safe) — see _fpf_serial_jobs.
+        _fpf_serial_jobs = []  # [(result_obj, attr_name, clone_obj)]
         for idx, ticker in enumerate(tickers):
             # Mono corridor index (for LSV extraction)
             m_idx = mono_corr_order.index(corr_assets[idx]) if corr_assets[idx] in mono_corr_order else None
@@ -3901,7 +3910,9 @@ class PricingEngine(VolSwapMixin):
                     strike_lcm_vol = math.sqrt(lcm_variance)
 
                 # Build solved FPFs using object clone (no HTTP)
-                def _solved_fpf(ref_obj, ticker_name, corr_name, strike_variance):
+                def _solved_fpf_obj(ref_obj, ticker_name, corr_name, strike_variance):
+                    """Clone the ref FPF with the solved strike (cheap — the
+                    expensive part is to_fpf_string(), pooled after the loop)."""
                     cap = Just((2.5 ** 2 - 1) * strike_variance) if cfg.is_capped else "Nothing"
                     return ref_obj.clone(
                         varianceDetails=ref_obj.varianceDetails.clone(
@@ -3923,11 +3934,11 @@ class PricingEngine(VolSwapMixin):
                                 koAsset=ticker_name, koAssetMultiplier=1.0, koAssetLag=0
                             )]
                         ),
-                    ).to_fpf_string()
+                    )
 
                 ticker_ref_obj = ev_cross_ref_objs[schedule_assets[idx]]
 
-                fpf_cross = _solved_fpf(
+                _fpf_obj_cross = _solved_fpf_obj(
                     ticker_ref_obj,
                     ticker,
                     corr_assets[idx],
@@ -3935,17 +3946,17 @@ class PricingEngine(VolSwapMixin):
                 )
 
                 mono_ev_obj = mono_ref_objs[corr_assets[idx]][0]
-                fpf_mono = _solved_fpf(mono_ev_obj, corr_assets[idx], corr_assets[idx], linked_variance)
+                _fpf_obj_mono = _solved_fpf_obj(mono_ev_obj, corr_assets[idx], corr_assets[idx], linked_variance)
 
                 # LSV/LCM FPFs (uncapped, with their respective strikes)
-                fpf_lsv = None
+                _fpf_obj_lsv = None
                 if strike_lsv_vol is not None:
                     lsv_var = strike_lsv_vol ** 2
-                    fpf_lsv = _solved_fpf(ev_cross_ref_obj, ticker, corr_assets[idx], lsv_var)
-                fpf_lcm = None
+                    _fpf_obj_lsv = _solved_fpf_obj(ev_cross_ref_obj, ticker, corr_assets[idx], lsv_var)
+                _fpf_obj_lcm = None
                 if strike_lcm_vol is not None:
                     lcm_var = strike_lcm_vol ** 2
-                    fpf_lcm = _solved_fpf(ev_cross_ref_obj, ticker, corr_assets[idx], lcm_var)
+                    _fpf_obj_lcm = _solved_fpf_obj(ev_cross_ref_obj, ticker, corr_assets[idx], lcm_var)
 
                 # ATMF vols — straight from the batch extraction (correct per
                 # asset, verified per asset in production). The (ticker,
@@ -4102,10 +4113,11 @@ class PricingEngine(VolSwapMixin):
                     strike_cap_priced_lsv_mono=strike_cap_vol_mono_lsv,
                     strike_cap_priced_lcm=strike_cap_vol_lcm,
                     currency=currencies[idx],
-                    fpf_string_cross=fpf_cross,
-                    fpf_string_mono=fpf_mono,
-                    fpf_string_lsv=fpf_lsv,
-                    fpf_string_lcm=fpf_lcm,
+                    # FPF strings: objects queued now, serialized in parallel after the loop
+                    fpf_string_cross=None,
+                    fpf_string_mono=None,
+                    fpf_string_lsv=None,
+                    fpf_string_lcm=None,
                     obs_dates_cross=_obs_count if _obs_count > 0 else None,
                     obs_dates_mono=_obs_count if _obs_count > 0 else None,
                     atmf_vol_variance_asset=atmf_ref,
@@ -4118,6 +4130,15 @@ class PricingEngine(VolSwapMixin):
                     strike_vanilla_var=_vanilla_var,
                     strike_vanilla_mono=_vanilla_mono,
                 ), None)
+
+                # Queue the FPF clone objects for pooled serialization
+                _result_obj = indexed_results[idx][0]
+                _fpf_serial_jobs.append((_result_obj, 'fpf_string_cross', _fpf_obj_cross))
+                _fpf_serial_jobs.append((_result_obj, 'fpf_string_mono', _fpf_obj_mono))
+                if _fpf_obj_lsv is not None:
+                    _fpf_serial_jobs.append((_result_obj, 'fpf_string_lsv', _fpf_obj_lsv))
+                if _fpf_obj_lcm is not None:
+                    _fpf_serial_jobs.append((_result_obj, 'fpf_string_lcm', _fpf_obj_lcm))
 
             except Exception as e:
                 dbg.err("batch", f"{corr_assets[idx]}: {e}")
@@ -4136,6 +4157,18 @@ class PricingEngine(VolSwapMixin):
                     })
                 except Exception:
                     pass
+
+        # ── Pooled FPF serialization: ONE parallel pass for all solved FPF
+        # clone objects queued during the loop (was ~2-4s each, sequential).
+        if _fpf_serial_jobs:
+            _t_fpf_serial = time.time()
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                _fpf_strings = list(pool.map(lambda o: o.to_fpf_string(),
+                                             [j[2] for j in _fpf_serial_jobs]))
+            for (result_obj, attr, _), fpf_str in zip(_fpf_serial_jobs, _fpf_strings):
+                setattr(result_obj, attr, fpf_str)
+            dbg.info("batch", f"[TIMING] FPF serialization (solved, pooled): "
+                              f"{time.time() - _t_fpf_serial:.2f}s ({len(_fpf_serial_jobs)} FPFs, 8 threads)")
 
         # ── Phase 2b: Capped re-pricing (only if is_capped) ──
         if cfg.is_capped:
@@ -4179,6 +4212,7 @@ class PricingEngine(VolSwapMixin):
                 # Build capped FPF instruments
                 cap_instruments = []
                 cap_task_map = []  # [(idx, variant)] parallel to cap_instruments
+                _cap_clone_jobs = []  # (clone_obj, rics) — serialized in pool below
                 for idx, variant, cap_value, _ in cap_tasks:
                     ticker = tickers[idx]
                     corr = corr_assets[idx]
@@ -4189,56 +4223,47 @@ class PricingEngine(VolSwapMixin):
                         if ref_pair is None:
                             continue
                         ref_obj = ref_pair[0]  # ev_obj
-                        # Mono: corridor asset = variance asset = corr
-                        capped_fpf_str = ref_obj.clone(
-                            varianceDetails=ref_obj.varianceDetails.clone(
-                                varianceAssetsAndIndexLegDetails=[
-                                    ref_obj.varianceDetails.varianceAssetsAndIndexLegDetails[0].clone(
-                                        asset=corr, basketMultiplier=1, strike=0.000001,
-                                        legCap=Just(cap_value), legFloor="Nothing", legMultiplier=1.0,
-                                    )
-                                ],
-                                isOptionOnVariance=True,
-                            ),
-                            corridorDefinition=Just(ref_obj.corridorDefinition.value.clone(
-                                corridorAssets=[corridorCovarianceSwap_v4.CorridorAssets(
-                                    corridorAsset=corr, corridorMultiplier=1.0, corridorAssetLag=0
-                                )]
-                            )),
-                            koDetails=ref_obj.koDetails.clone(
-                                koAssets=[corridorCovarianceSwap_v4.KoAssets(
-                                    koAsset=corr, koAssetMultiplier=1.0, koAssetLag=0
-                                )]
-                            ),
-                        ).to_fpf_string()
+                        rics = [corr]
                     else:
                         ref_obj = ev_cross_ref_objs[sched_asset]
-                        # Clone with cap set (strike=0.000001 — we only need EV, not solved FPF)
-                        capped_fpf_str = ref_obj.clone(
-                            varianceDetails=ref_obj.varianceDetails.clone(
-                                varianceAssetsAndIndexLegDetails=[
-                                    ref_obj.varianceDetails.varianceAssetsAndIndexLegDetails[0].clone(
-                                        asset=ticker, basketMultiplier=1, strike=0.000001,
-                                        legCap=Just(cap_value), legFloor="Nothing", legMultiplier=1.0,
-                                    )
-                                ],
-                                isOptionOnVariance=True,
-                            ),
-                            corridorDefinition=Just(ref_obj.corridorDefinition.value.clone(
-                                corridorAssets=[corridorCovarianceSwap_v4.CorridorAssets(
-                                    corridorAsset=corr, corridorMultiplier=1.0, corridorAssetLag=0
-                                )]
-                            )),
-                            koDetails=ref_obj.koDetails.clone(
-                                koAssets=[corridorCovarianceSwap_v4.KoAssets(
-                                    koAsset=ticker, koAssetMultiplier=1.0, koAssetLag=0
-                                )]
-                            ),
-                        ).to_fpf_string()
-                    cap_instruments.append(_make_instrument(capped_fpf_str,
-                                                            [ticker, corr] if variant not in ('mono', 'lsv_mono') else [
-                                                                corr]))
+                        rics = [ticker, corr]
+                    # Clone with cap set (strike=0.000001 — we only need EV, not solved FPF)
+                    _cap_clone = ref_obj.clone(
+                        varianceDetails=ref_obj.varianceDetails.clone(
+                            varianceAssetsAndIndexLegDetails=[
+                                ref_obj.varianceDetails.varianceAssetsAndIndexLegDetails[0].clone(
+                                    asset=corr if variant in ('mono', 'lsv_mono') else ticker,
+                                    basketMultiplier=1, strike=0.000001,
+                                    legCap=Just(cap_value), legFloor="Nothing", legMultiplier=1.0,
+                                )
+                            ],
+                            isOptionOnVariance=True,
+                        ),
+                        corridorDefinition=Just(ref_obj.corridorDefinition.value.clone(
+                            corridorAssets=[corridorCovarianceSwap_v4.CorridorAssets(
+                                corridorAsset=corr, corridorMultiplier=1.0, corridorAssetLag=0
+                            )]
+                        )),
+                        koDetails=ref_obj.koDetails.clone(
+                            koAssets=[corridorCovarianceSwap_v4.KoAssets(
+                                koAsset=corr if variant in ('mono', 'lsv_mono') else ticker,
+                                koAssetMultiplier=1.0, koAssetLag=0
+                            )]
+                        ),
+                    )
+                    _cap_clone_jobs.append((_cap_clone, rics))
                     cap_task_map.append((idx, variant))
+
+                # Pooled serialization of the capped FPF clones (CPU-bound)
+                if _cap_clone_jobs:
+                    _t_cap_serial = time.time()
+                    with ThreadPoolExecutor(max_workers=8) as pool:
+                        _cap_fpf_strs = list(pool.map(lambda o: o.to_fpf_string(),
+                                                      [j[0] for j in _cap_clone_jobs]))
+                    dbg.info("batch", f"[TIMING] FPF serialization (cap instruments, pooled): "
+                                      f"{time.time() - _t_cap_serial:.2f}s ({len(_cap_fpf_strs)} FPFs, 8 threads)")
+                    for (_, rics), capped_fpf_str in zip(_cap_clone_jobs, _cap_fpf_strs):
+                        cap_instruments.append(_make_instrument(capped_fpf_str, rics))
 
                 # Price capped batch (reuse same scenario as Phase 1)
                 effective_cap_scenario = None
@@ -4291,8 +4316,8 @@ class PricingEngine(VolSwapMixin):
                     return None
 
                 # Compute real priced capped strikes and build final FPF strings
-                def _build_capped_fpf_string(ref_obj, ticker, corr, strike_vol):
-                    """Build solved capped FPF string with final priced strike."""
+                def _build_capped_fpf_obj(ref_obj, ticker, corr, strike_vol):
+                    """Clone the capped FPF with the final priced strike (serialization pooled)."""
                     strike_var = strike_vol ** 2
                     cap_val = (2.5 ** 2 - 1) * strike_var
                     return ref_obj.clone(
@@ -4315,8 +4340,9 @@ class PricingEngine(VolSwapMixin):
                                 koAsset=ticker, koAssetMultiplier=1.0, koAssetLag=0
                             )]
                         ),
-                    ).to_fpf_string()
+                    )
 
+                _cap_str_serial_jobs = []  # [(result_obj, attr_name, clone_obj)]
                 for inst_idx, (idx, variant) in enumerate(cap_task_map):
                     ra_val = ra_values_by_corr.get(corr_assets[idx])
                     if ra_val is None or ra_val == 0:
@@ -4334,8 +4360,8 @@ class PricingEngine(VolSwapMixin):
                             real_cap_strike = math.sqrt(abs(-ev_cap / ra_val))
                             result_obj.strike_cap_priced_lv = real_cap_strike
                             result_obj.ev_cap_cross_lv = ev_cap
-                            result_obj.fpf_string_cap_lv = _build_capped_fpf_string(ref_obj, ticker, corr,
-                                                                                    real_cap_strike)
+                            _cap_str_serial_jobs.append((result_obj, 'fpf_string_cap_lv',
+                                                          _build_capped_fpf_obj(ref_obj, ticker, corr, real_cap_strike)))
                             try:
                                 _zcb_cap = _unfunded_zcb(result_obj.currency or ref_currency,
                                                          cfg.strike_date, cfg.last_obs_date,
@@ -4359,8 +4385,8 @@ class PricingEngine(VolSwapMixin):
                             result_obj.strike_cap_priced_lsv = real_cap_strike
                             result_obj.ev_cap_cross_lsv0 = ev_cap_lsv0
                             result_obj.ev_cap_cross_lsv = ev_cap_lsv
-                            result_obj.fpf_string_cap_lsv = _build_capped_fpf_string(ref_obj, ticker, corr,
-                                                                                     real_cap_strike)
+                            _cap_str_serial_jobs.append((result_obj, 'fpf_string_cap_lsv',
+                                                          _build_capped_fpf_obj(ref_obj, ticker, corr, real_cap_strike)))
                             dbg.ok("CAP-PRICED", f"{ticker}: LSV capped strike = {real_cap_strike * 100:.2f}%")
 
                     elif variant == 'lcm':
@@ -4369,8 +4395,8 @@ class PricingEngine(VolSwapMixin):
                             real_cap_strike = math.sqrt(abs(-ev_cap_lcm / ra_val))
                             result_obj.strike_cap_priced_lcm = real_cap_strike
                             result_obj.ev_cap_cross_lcm = ev_cap_lcm
-                            result_obj.fpf_string_cap_lcm = _build_capped_fpf_string(ref_obj, ticker, corr,
-                                                                                     real_cap_strike)
+                            _cap_str_serial_jobs.append((result_obj, 'fpf_string_cap_lcm',
+                                                          _build_capped_fpf_obj(ref_obj, ticker, corr, real_cap_strike)))
                             dbg.ok("CAP-PRICED", f"{ticker}: LCM capped strike = {real_cap_strike * 100:.2f}%")
 
                     elif variant == 'mono':
@@ -4384,8 +4410,8 @@ class PricingEngine(VolSwapMixin):
                             real_cap_strike = math.sqrt(abs(-ev_cap_mono / ra_val))
                             result_obj.strike_cap_priced_mono = real_cap_strike
                             result_obj.ev_cap_mono_lv = ev_cap_mono
-                            result_obj.fpf_string_cap_mono = _build_capped_fpf_string(mono_ref_obj, corr, corr,
-                                                                                      real_cap_strike)
+                            _cap_str_serial_jobs.append((result_obj, 'fpf_string_cap_mono',
+                                                          _build_capped_fpf_obj(mono_ref_obj, corr, corr, real_cap_strike)))
                             try:
                                 _zcb_cap = _unfunded_zcb(result_obj.currency or ref_currency,
                                                          cfg.strike_date, cfg.last_obs_date,
@@ -4413,9 +4439,20 @@ class PricingEngine(VolSwapMixin):
                             result_obj.strike_cap_priced_lsv_mono = real_cap_strike
                             result_obj.ev_cap_mono_lsv0 = ev_cap_lsv0
                             result_obj.ev_cap_mono_lsv = ev_cap_lsv
-                            result_obj.fpf_string_cap_lsv_mono = _build_capped_fpf_string(mono_ref_obj, corr, corr,
-                                                                                          real_cap_strike)
+                            _cap_str_serial_jobs.append((result_obj, 'fpf_string_cap_lsv_mono',
+                                                          _build_capped_fpf_obj(mono_ref_obj, corr, corr, real_cap_strike)))
                             dbg.ok("CAP-PRICED", f"{corr}: LSV Mono capped strike = {real_cap_strike * 100:.2f}%")
+
+                # Pooled serialization of the solved capped FPF clones
+                if _cap_str_serial_jobs:
+                    _t_cap_str = time.time()
+                    with ThreadPoolExecutor(max_workers=8) as pool:
+                        _cap_str_strs = list(pool.map(lambda o: o.to_fpf_string(),
+                                                      [j[2] for j in _cap_str_serial_jobs]))
+                    for (result_obj, attr, _), fpf_str in zip(_cap_str_serial_jobs, _cap_str_strs):
+                        setattr(result_obj, attr, fpf_str)
+                    dbg.info("batch", f"[TIMING] FPF serialization (solved capped, pooled): "
+                                      f"{time.time() - _t_cap_str:.2f}s ({len(_cap_str_strs)} FPFs, 8 threads)")
 
                 dbg.ok("batch",
                        f"Phase 2b capped pricing: {len(cap_instruments)} instruments in {time.time() - t_cap:.1f}s")
