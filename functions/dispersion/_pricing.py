@@ -207,17 +207,26 @@ def _parse_payout_trace_value(raw) -> Optional[float]:
     """Recursively find ``var_calculatePayoff_nCorridorObs`` in a portal response
     (the metric payload is a SERIALIZED JSON string under extraResults)."""
     import json as _json
+    import re as _re
     if raw is None:
         return None
     if isinstance(raw, str):
+        # Aleph-encoded tagged scalar, e.g. ".double.354" (portal emits this
+        # when the expectation is integral — typically all days in corridor)
+        _m = _re.match(r"^\.(?:double|float|int|long)\.(-?\d+(?:\.\d+)?)$", raw.strip())
+        if _m:
+            return float(_m.group(1))
         try:
             return _parse_payout_trace_value(_json.loads(raw))
         except (ValueError, TypeError):
             return None
     if isinstance(raw, dict):
         if _PAYOUT_TRACE_VAR in raw:
+            v = raw[_PAYOUT_TRACE_VAR]
+            if isinstance(v, str):
+                return _parse_payout_trace_value(v)
             try:
-                return float(raw[_PAYOUT_TRACE_VAR])
+                return float(v)
             except (TypeError, ValueError):
                 return None
         for v in raw.values():
@@ -297,7 +306,8 @@ def build_corridor_fpf(
         corr_asset: str,
         currency: str,
         schedule_calendar_asset: str = None,
-        use_parameters: bool = False
+        use_parameters: bool = False,
+        cap_multiplier: float = 2.5
 ) -> str:
     """
     Generate an FPF string for a corridor covariance swap.
@@ -468,7 +478,7 @@ def build_corridor_fpf(
                     asset=ticker,
                     basketMultiplier=1,
                     strike=strikes[idx],
-                    legCap=Just((2.5 ** 2 - 1) * strikes[idx]) if is_capped else "Nothing",
+                    legCap=Just((cap_multiplier ** 2 - 1) * strikes[idx]) if is_capped else "Nothing",
                     legFloor="Nothing",
                     legMultiplier=weights[idx]
                 ) for idx, ticker in enumerate(tickers)
@@ -627,6 +637,7 @@ def _solve_single_ev_ra(
             is_capped=True, corr_asset=corr_asset,
             schedule_calendar_asset=schedule_calendar_asset, currency=currency,
             use_parameters=False,
+            cap_multiplier=getattr(self, 'cap_multiplier', 2.5),
         )
         fpf_obj = FPFUnifiedEconomicsWrapper.from_data(ra_fpf_base, script_cls=corridorCovarianceSwap_v4)
         new_variance_details = fpf_obj.varianceDetails.clone(
@@ -1389,6 +1400,7 @@ class PricingConfig:
     dvar: float = -2.5
     is_solve: bool = True
     is_capped: bool = True
+    cap_multiplier: float = 2.5  # leg cap = (cap_multiplier²−1) × strike² in the FPF
     is_cross_corridor: bool = True
     eqeq_lambda: float = 0.10
     correl_floor: float = 0.0
@@ -3917,7 +3929,7 @@ class PricingEngine(VolSwapMixin):
                 def _solved_fpf_obj(ref_obj, ticker_name, corr_name, strike_variance):
                     """Clone the ref FPF with the solved strike (cheap — the
                     expensive part is to_fpf_string(), pooled after the loop)."""
-                    cap = Just((2.5 ** 2 - 1) * strike_variance) if cfg.is_capped else "Nothing"
+                    cap = Just((cfg.cap_multiplier ** 2 - 1) * strike_variance) if cfg.is_capped else "Nothing"
                     return ref_obj.clone(
                         varianceDetails=ref_obj.varianceDetails.clone(
                             varianceAssetsAndIndexLegDetails=[
@@ -4046,17 +4058,10 @@ class PricingEngine(VolSwapMixin):
                 except Exception:
                     pass
 
-                # Displayed RA: undiscounted day fraction in PayoutTrace mode
-                # (ZCB only enters the strike); legacy path shows the
-                # (discounted) instrument value as before.
-                if ra_val is not None:
-                    _ra_disp = ra_val / (ra_zcb_by_corr.get(corr_assets[idx]) or 1.0)
-                    _ra_mono_v = ra_values_by_corr.get(corr_assets[idx])
-                    _ra_disp_mono = (_ra_mono_v / (ra_zcb_by_corr.get(corr_assets[idx]) or 1.0)
-                                     if _ra_mono_v is not None else None)
-                else:
-                    _ra_disp = ra_val
-                    _ra_disp_mono = ra_values_by_corr.get(corr_assets[idx])
+                # Displayed RA: the DISCOUNTED value (ZCB × day fraction) —
+                # same convention for every leg, matching what strikes use.
+                _ra_disp = ra_val
+                _ra_disp_mono = ra_values_by_corr.get(corr_assets[idx])
 
                 # Display extras: unfunded ZCB of the leg currency (reused from
                 # the RA computation in PayoutTrace mode) + as-if-vanilla strike
@@ -4205,11 +4210,11 @@ class PricingEngine(VolSwapMixin):
                 if not result.success or result.strike_cap_adjusted is None:
                     continue
                 # LV: always if is_capped and proxy succeeded
-                cap_lv = (2.5 ** 2 - 1) * (result.strike_cap_adjusted ** 2)
+                cap_lv = (cfg.cap_multiplier ** 2 - 1) * (result.strike_cap_adjusted ** 2)
                 cap_tasks.append((idx, 'lv', cap_lv, result.strike_cap_adjusted))
                 # LSV: if cross LSV was computed and proxy succeeded
                 if result.strike_cross_lsv is not None:
-                    cap_lsv = (2.5 ** 2 - 1) * (
+                    cap_lsv = (cfg.cap_multiplier ** 2 - 1) * (
                                 result.strike_cap_priced_lsv ** 2) if result.strike_cap_priced_lsv is not None else (
                                                                                                                                 2.5 ** 2 - 1) * (
                                                                                                                                 result.strike_cross_lsv ** 2)
@@ -4217,7 +4222,7 @@ class PricingEngine(VolSwapMixin):
                                       result.strike_cap_priced_lsv if result.strike_cap_priced_lsv is not None else result.strike_cross_lsv))
                 # LCM: if LCM was computed and proxy succeeded
                 if result.strike_variance_asset_lcm is not None:
-                    cap_lcm = (2.5 ** 2 - 1) * (
+                    cap_lcm = (cfg.cap_multiplier ** 2 - 1) * (
                                 result.strike_cap_priced_lcm ** 2) if result.strike_cap_priced_lcm is not None else (
                                                                                                                                 2.5 ** 2 - 1) * (
                                                                                                                                 result.strike_variance_asset_lcm ** 2)
@@ -4225,11 +4230,11 @@ class PricingEngine(VolSwapMixin):
                                       result.strike_cap_priced_lcm if result.strike_cap_priced_lcm is not None else result.strike_variance_asset_lcm))
                 # MONO: if corridor asset differs from ticker (cross-corridor), build capped mono FPF
                 if corr_assets[idx] != tickers[idx] and result.strike_corridor_asset is not None:
-                    cap_mono = (2.5 ** 2 - 1) * (result.strike_corridor_asset ** 2)
+                    cap_mono = (cfg.cap_multiplier ** 2 - 1) * (result.strike_corridor_asset ** 2)
                     cap_tasks.append((idx, 'mono', cap_mono, result.strike_corridor_asset))
                     # LSV for mono: if LSV was computed for mono (use same cap as mono variant)
                     if result.strike_lsv is not None:
-                        cap_lsv_mono = (2.5 ** 2 - 1) * (result.strike_corridor_asset ** 2)
+                        cap_lsv_mono = (cfg.cap_multiplier ** 2 - 1) * (result.strike_corridor_asset ** 2)
                         cap_tasks.append((idx, 'lsv_mono', cap_lsv_mono, result.strike_corridor_asset))
 
             if cap_tasks:
@@ -4358,7 +4363,7 @@ class PricingEngine(VolSwapMixin):
                 def _build_capped_fpf_obj(ref_obj, ticker, corr, strike_vol):
                     """Clone the capped FPF with the final priced strike (serialization pooled)."""
                     strike_var = strike_vol ** 2
-                    cap_val = (2.5 ** 2 - 1) * strike_var
+                    cap_val = (cfg.cap_multiplier ** 2 - 1) * strike_var
                     return ref_obj.clone(
                         varianceDetails=ref_obj.varianceDetails.clone(
                             varianceAssetsAndIndexLegDetails=[
@@ -4939,14 +4944,6 @@ class PricingEngine(VolSwapMixin):
                     row['Barrier Down (%)'] = f"{cfg.dvar * 100:.0f}%"
                     row['Barrier Up (%)'] = f"{cfg.uvar * 100:.0f}%"
                     row['Tenor'] = cfg.last_obs_date.strftime("%d/%m/%Y")
-                    if r.strike_vanilla_var is not None:
-                        row['Vanilla Var Variance (%)'] = f"{r.strike_vanilla_var * 100:.2f}%"
-                    if r.strike_vanilla_var_cap is not None:
-                        row['Vanilla Var Variance Cap (%)'] = f"{r.strike_vanilla_var_cap * 100:.2f}%"
-                    if r.strike_vanilla_mono is not None:
-                        row['Vanilla Var Corridor (%)'] = f"{r.strike_vanilla_mono * 100:.2f}%"
-                    if r.strike_vanilla_mono_cap is not None:
-                        row['Vanilla Var Corridor Cap (%)'] = f"{r.strike_vanilla_mono_cap * 100:.2f}%"
                 else:
                     row['Status'] = r.error or 'Failed'
             else:
@@ -4994,14 +4991,6 @@ class PricingEngine(VolSwapMixin):
                     row['Barrier Down (%)'] = f"{cfg.dvar * 100:.0f}%"
                     row['Barrier Up (%)'] = f"{cfg.uvar * 100:.0f}%"
                     row['Tenor'] = cfg.last_obs_date.strftime("%d/%m/%Y")
-                    if r.strike_vanilla_var is not None:
-                        row['Vanilla Var Variance (%)'] = f"{r.strike_vanilla_var * 100:.2f}%"
-                    if r.strike_vanilla_var_cap is not None:
-                        row['Vanilla Var Variance Cap (%)'] = f"{r.strike_vanilla_var_cap * 100:.2f}%"
-                    if r.strike_vanilla_mono is not None:
-                        row['Vanilla Var Corridor (%)'] = f"{r.strike_vanilla_mono * 100:.2f}%"
-                    if r.strike_vanilla_mono_cap is not None:
-                        row['Vanilla Var Corridor Cap (%)'] = f"{r.strike_vanilla_mono_cap * 100:.2f}%"
                 else:
                     row['Status'] = r.error or 'Failed'
             rows.append(row)

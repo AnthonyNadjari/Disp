@@ -137,6 +137,10 @@ def _get_short_leg_display(tickers):
     return ', '.join(_SHORT_DISPLAY.get(t, t) for t in tickers)
 
 from functions.common.utils import *
+# Vol-swap pricing functions (solve_volswap_strikes_multithreaded,
+# generate_fpf_vol_with_dates, create_and_price_fpf) — explicit import, the
+# star import above is not a guaranteed source for `vp`.
+import functions.dispersion._volswap as vp
 from functions.dispersion.json_booking import (
     LEGS_COLS as JB_LEGS_COLS,
     EDITABLE_DEFAULTS as JB_EDITABLE_DEFAULTS,
@@ -2588,6 +2592,8 @@ with tab4:
                             if hasattr(results, 'results_df') and results.results_df is not None:
                                 st.session_state['pricing_results_df'] = results.results_df.copy()
                                 st.session_state['original_results'] = results.results_df.copy()
+                                st.session_state['pricing_ticker_results'] = getattr(results, 'ticker_results', None)
+                                st.session_state['pricing_cfg_snapshot'] = config
                         else:
                             # ── DEBUG: show full error details ──
                             error_msg = getattr(results, 'error', None) or 'No results returned'
@@ -2647,6 +2653,129 @@ with tab4:
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
                 )
+
+            # ── Package spread table + one-click backtest ──
+            _trs = st.session_state.get('pricing_ticker_results')
+            if _trs:
+                st.divider()
+                st.subheader("📦 Package — spread decomposition")
+
+                # Weights: editable table; empty = equal weights
+                _w_init = pd.DataFrame({
+                    "Ticker": [tr.ticker for tr in _trs],
+                    "Weight (%)": [""] * len(_trs),
+                })
+                st.caption("Optional weights (leave empty = equal weights):")
+                _w_df = st.data_editor(_w_init, num_rows="fixed", use_container_width=True,
+                                       key="pkg_weights_editor",
+                                       column_config={"Ticker": st.column_config.TextColumn(disabled=True)})
+                _w_raw = pd.to_numeric(_w_df["Weight (%)"], errors="coerce")
+                if _w_raw.isna().all():
+                    _w = np.full(len(_trs), 1.0 / len(_trs))
+                else:
+                    _w = _w_raw.fillna(0.0).to_numpy(dtype=float) / 100.0
+                    if abs(_w.sum()) < 1e-12:
+                        _w = np.full(len(_trs), 1.0 / len(_trs))
+                    else:
+                        _w = _w / _w.sum()
+
+                def _v(x):
+                    return float(x) if x is not None else None
+
+                def _wsum(field_vals):
+                    """Weighted sum of vols (decimals), None-safe; None if all missing."""
+                    vals = [(_v(v), float(w)) for v, w in zip(field_vals, _w) if _v(v) is not None]
+                    if not vals:
+                        return None
+                    return sum(v * w for v, w in vals)
+
+                _mono_lv = [tr.strike_corridor_asset for tr in _trs]
+                _cross_lv = [tr.strike_variance_asset for tr in _trs]
+                _mono_lv_cap = [tr.strike_cap_priced_mono for tr in _trs]
+                _cross_lv_cap = [tr.strike_cap_priced_lv for tr in _trs]
+                _mono_lsv_u = [tr.strike_lsv for tr in _trs]
+                _cross_lsv_u = [tr.strike_cross_lsv for tr in _trs]
+                _mono_lsv_c = [tr.strike_cap_priced_lsv_mono for tr in _trs]
+                _cross_lsv_c = [tr.strike_cap_priced_lsv for tr in _trs]
+                _cross_lcm = [tr.strike_variance_asset_lcm for tr in _trs]
+
+                def _diff(a_list, b_list):
+                    """Weighted Σ(a−b), None-safe per leg."""
+                    vals = [(_v(a), _v(b), float(w)) for a, b, w in zip(a_list, b_list, _w)
+                            if _v(a) is not None and _v(b) is not None]
+                    if not vals:
+                        return None
+                    return sum((a - b) * w for a, b, w in vals)
+
+                _rows = []
+                _S = _wsum(_mono_lv)
+                _I = _wsum(_cross_lv)
+                _rows.append(("LV uncapped", _S, _I))
+                if any(v is not None for v in _mono_lv_cap + _cross_lv_cap):
+                    _rows.append(("LV Cap Cost", _diff(_mono_lv_cap, _mono_lv),
+                                  _diff(_cross_lv_cap, _cross_lv)))
+                if any(v is not None for v in _mono_lsv_c + _cross_lsv_c):
+                    _rows.append(("LSV Cost Cap", _diff(_mono_lsv_c, _mono_lsv_u),
+                                  _diff(_cross_lsv_c, _cross_lsv_u)))
+                if any(v is not None for v in _cross_lcm):
+                    _rows.append(("LCM Benefit / cost", 0.0, _diff(_cross_lcm, _cross_lv)))
+                _rows.append(("charges", 0.0, 0.0))
+
+                _tbl_rows = []
+                _tot_S = 0.0
+                _tot_I = 0.0
+                for _name, _s, _i in _rows:
+                    _s = _s or 0.0
+                    _i = _i or 0.0
+                    _tot_S += _s
+                    _tot_I += _i
+                    _tbl_rows.append({"Component": _name,
+                                      "Spread": f"{(_s - _i) * 100:.2f}%",
+                                      "Stocks": f"{_s * 100:.2f}%",
+                                      "Index": f"{_i * 100:.2f}%"})
+                _tbl_rows.append({"Component": "Final Price",
+                                  "Spread": f"{(_tot_S - _tot_I) * 100:.2f}%",
+                                  "Stocks": f"{_tot_S * 100:.2f}%",
+                                  "Index": f"{_tot_I * 100:.2f}%"})
+                st.dataframe(pd.DataFrame(_tbl_rows), use_container_width=True, hide_index=True)
+
+                # ── Backtest the package (period is the only input) ──
+                st.markdown("**Backtest this package**")
+                _bt_start = st.date_input("Backtest start date",
+                                          value=datetime.date.today() - relativedelta(years=5),
+                                          key="pkg_bt_start", format="DD/MM/YYYY")
+                if st.button("🚀 Run backtest", key="pkg_bt_run"):
+                    try:
+                        _bt_rows = []
+                        for tr, w in zip(_trs, _w):
+                            _bt_rows.append({
+                                "Variance Asset": tr.ticker,
+                                "Corridor Condition Asset": tr.corridor_asset,
+                                "Strike Cross Corridor (%)": round(tr.strike_variance_asset * 100, 2),
+                                "Strike Mono Var Swap (%)": round(tr.strike_corridor_asset * 100, 2),
+                                "Weight (%)": round(float(w) * 100, 4),
+                            })
+                        _bt_df = pd.DataFrame(_bt_rows)
+                        _bt_cfg_src = st.session_state.get('pricing_cfg_snapshot')
+                        _bt_cfg = DispersionConfig(
+                            product_type=ProductType.VAR_SWAP_CORRIDOR,
+                            cross_corridor=any(tr.corridor_asset != tr.ticker for tr in _trs),
+                            n_exp=252,
+                            barrier_up=_bt_cfg_src.barrier_up if _bt_cfg_src else 1.30,
+                            barrier_down=_bt_cfg_src.barrier_down if _bt_cfg_src else 0.70,
+                            local_cap=_bt_cfg_src.local_cap if _bt_cfg_src else 2.5,
+                            is_capped=_bt_cfg_src.is_capped if _bt_cfg_src else True,
+                        )
+                        with st.spinner("Backtest running..."):
+                            _bt_res = backtest(_bt_df, _bt_cfg, start_date=_bt_start)
+                        _fig = func_graph.plot_main_backtest(_bt_res.timeseries)
+                        _fig.update_layout(height=350)
+                        st.plotly_chart(_fig, use_container_width=True)
+                        _m = _bt_res.compute_metrics()
+                        st.caption(f"hit_ratio {_m['hit_ratio']:.1f}%   mean {_m['mean_return']:.4f}   "
+                                   f"last {_m['last_value']:.2f}   max_dd {_bt_res.max_drawdown:.2f}")
+                    except Exception as _be:
+                        st.error(f"Backtest failed: {_be}")
     elif product_type == "Vol Swap":
         is_solve_vol = pricing_mode == "Solve"
         is_generate_fpf_vol = pricing_mode == "Generate FPFs"
@@ -2663,6 +2792,12 @@ with tab4:
             correl_floor_vol = st.number_input("Floor", value=0.0, key="p_floor_vol", disabled=is_solve_vol)
         with _v5:
             eqfx_shift_vol = st.number_input("EqFx", value=-0.05, key="p_eqfx_vol", disabled=is_solve_vol)
+        with _v5b:
+            model_name_vol = st.selectbox(
+                "Model", ["EMEA-Stocks-MC-LV-MultiAsset", "AMER-Stocks-MC-LV-MultiAsset",
+                          "EMEA-Index-MC-LV-MultiAsset"],
+                key="p_model_vol",
+                help="Pricing model context (portal). Default EMEA stocks.")
         with _v6:
             if is_generate_fpf_vol:
                 use_common_cal = st.toggle("Common Cal", value=True, key="p_common_cal",
@@ -2719,7 +2854,8 @@ with tab4:
                     results_df_vol = vp.solve_volswap_strikes_multithreaded(
                         tickers=tickers_vol, maturity_date=maturity_date_p, strike_date=strike_date_p,
                         currency=currency_vol, target_value=target_value_vol,
-                        eqeq_lambda=eqeq_lambda_vol, eqfx_shift=eqfx_shift_vol, progress_callback=progress_cb_vol)
+                        eqeq_lambda=eqeq_lambda_vol, eqfx_shift=eqfx_shift_vol, progress_callback=progress_cb_vol,
+                        model_name=model_name_vol)
                     progress_bar.progress(1.0)
                     status_text.text("✅ Done")
                     _s = len(results_df_vol[results_df_vol['Status'] == 'Success'])
@@ -2776,7 +2912,8 @@ with tab4:
                             strikes=(st.session_state.edited_df_volswap_p["Strikes"].astype(float) / 100).tolist(),
                             weights=(st.session_state.edited_df_volswap_p["Weights"].astype(float) / 100).tolist(),
                             is_note=is_note_vol, currency=currency_vol,
-                            eqeq_lambda=eqeq_lambda_vol, eqfx_shift=eqfx_shift_vol)
+                            eqeq_lambda=eqeq_lambda_vol, eqfx_shift=eqfx_shift_vol,
+                            model_name=model_name_vol)
                         if res['success']:
                             st.success(
                                 f"✅ Fair Value: **{res['fair_value'] * 100:.4f}%** | {'Note' if res['is_note'] else 'OTC'} | {res['currency']}")

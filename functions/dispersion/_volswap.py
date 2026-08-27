@@ -187,7 +187,7 @@ class VolSwapMixin:
                     ladder_parameters=ladder_params,
                 )
                 model_ctx = portal.create_model_context(
-                    "EMEA-Stocks-MC-LV-MultiAsset",
+                    cfg.model_name or "EMEA-Stocks-MC-LV-MultiAsset",
                     instrument_model_parameters={
                         "ACEqEqSpread": str(cfg.eqeq_lambda),
                         "ACEqFxShift": str(cfg.eqfx_shift),
@@ -355,7 +355,7 @@ class VolSwapMixin:
             underlyings=underlyings, premium_date=_dt.datetime.now().date(),
         )
         model_ctx = portal.create_model_context(
-            "EMEA-Stocks-MC-LV-MultiAsset",
+            cfg.model_name or "EMEA-Stocks-MC-LV-MultiAsset",
             instrument_model_parameters={
                 "ACEqEqSpread": str(cfg.eqeq_lambda),
                 "ACEqFxShift": str(cfg.eqfx_shift),
@@ -502,20 +502,22 @@ class VolSwapMixin:
 
 # ─── Module-level convenience functions ───────────────────────────────────────
 
-def _make_engine(strike_date: date, last_obs_date: date, eqeq_lambda: float = 0.1, eqfx_shift: float = -0.05):
+def _make_engine(strike_date: date, last_obs_date: date, eqeq_lambda: float = 0.1, eqfx_shift: float = -0.05,
+                 model_name: str = None):
     """Create a PricingEngine with vol-swap-relevant config."""
     # Import here to avoid circular dependency
     from functions.dispersion._pricing import PricingEngine, PricingConfig
     return PricingEngine(PricingConfig(
         strike_date=strike_date, last_obs_date=last_obs_date,
         eqeq_lambda=eqeq_lambda, eqfx_shift=eqfx_shift,
+        model_name=model_name,
     ))
 
 
 def create_and_price_fpf(tickers, maturity_date, strike_date, strikes, weights, is_note, currency,
-                         eqeq_lambda=0.1, eqfx_shift=-0.05):
+                         eqeq_lambda=0.1, eqfx_shift=-0.05, model_name=None):
     """Generate and price a vol swap FPF."""
-    return _make_engine(strike_date, maturity_date, eqeq_lambda, eqfx_shift).price_volswap(
+    return _make_engine(strike_date, maturity_date, eqeq_lambda, eqfx_shift, model_name).price_volswap(
         tickers=tickers, strikes=strikes, weights=weights, is_note=is_note, currency=currency)
 
 
@@ -528,8 +530,8 @@ def solve_volswap_strike_single(ticker, maturity_date, strike_date, currency,
 
 def solve_volswap_strikes_multithreaded(tickers, maturity_date, strike_date, currency,
                                         target_value=0.0, eqeq_lambda=0.1, eqfx_shift=-0.05,
-                                        progress_callback=None, max_workers=25):
+                                        progress_callback=None, max_workers=25, model_name=None):
     """Batch-solve vol swap strikes for multiple tickers (parallel)."""
-    return _make_engine(strike_date, maturity_date, eqeq_lambda, eqfx_shift).solve_volswap_batch(
+    return _make_engine(strike_date, maturity_date, eqeq_lambda, eqfx_shift, model_name).solve_volswap_batch(
         tickers=tickers, currency=currency, target_value=target_value,
         progress_callback=progress_callback, max_workers=max_workers)
