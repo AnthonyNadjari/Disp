@@ -3964,15 +3964,16 @@ class PricingEngine(VolSwapMixin):
                 mono_ev_obj = mono_ref_objs[corr_assets[idx]][0]
                 _fpf_obj_mono = _solved_fpf_obj(mono_ev_obj, corr_assets[idx], corr_assets[idx], linked_variance)
 
-                # LSV/LCM FPFs (uncapped, with their respective strikes)
+                # LSV/LCM FPFs (uncapped, with their respective strikes) —
+                # cloned from THIS ticker's cross ref (not a stale loop variable)
                 _fpf_obj_lsv = None
                 if strike_lsv_vol is not None:
                     lsv_var = strike_lsv_vol ** 2
-                    _fpf_obj_lsv = _solved_fpf_obj(ev_cross_ref_obj, ticker, corr_assets[idx], lsv_var)
+                    _fpf_obj_lsv = _solved_fpf_obj(ticker_ref_obj, ticker, corr_assets[idx], lsv_var)
                 _fpf_obj_lcm = None
                 if strike_lcm_vol is not None:
                     lcm_var = strike_lcm_vol ** 2
-                    _fpf_obj_lcm = _solved_fpf_obj(ev_cross_ref_obj, ticker, corr_assets[idx], lcm_var)
+                    _fpf_obj_lcm = _solved_fpf_obj(ticker_ref_obj, ticker, corr_assets[idx], lcm_var)
 
                 # ATMF vols — straight from the batch extraction (correct per
                 # asset, verified per asset in production). The (ticker,

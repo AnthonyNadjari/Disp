@@ -2730,6 +2730,10 @@ with tab4:
                 _rows.append(("charges", 0.0, 0.0))
 
                 _tbl_rows = []
+                # Labels as a DATA ROW (not headers) so the table copies cleanly
+                # into Excel, labels included.
+                _tbl_rows.append({"Component": "Component",
+                                  "Spread": "Spread", "Stocks": "Stocks", "Index": "Index"})
                 _tot_S = 0.0
                 _tot_I = 0.0
                 for _name, _s, _i in _rows:
