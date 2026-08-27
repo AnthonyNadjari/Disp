@@ -2666,39 +2666,58 @@ with tab4:
                 st.divider()
                 st.subheader("📦 Package — spread decomposition")
 
-                # Weights: editable table OR paste; empty = equal weights
-                if 'pkg_weights_df' not in st.session_state or \
-                        list(st.session_state['pkg_weights_df'].get('Ticker', [])) != [tr.ticker for tr in _trs]:
-                    st.session_state['pkg_weights_df'] = pd.DataFrame({
-                        "Ticker": [tr.ticker for tr in _trs],
-                        "Weight (%)": [""] * len(_trs),
-                    })
-                st.caption("Optional weights (leave empty = equal weights) — edit the table or paste `Ticker, Weight (%)` lines:")
+                # Weights editor — dynamic rows: DELETE a row to exclude the name
+                # (sub-basket). Cross mode shows Variance + Corridor asset (the leg
+                # key is the corridor asset, unique per leg); mono shows corridor only.
+                _is_xc_pkg = any(tr.corridor_asset != tr.ticker for tr in _trs)
+                if _is_xc_pkg:
+                    _wcols = ['Variance Asset', 'Corridor Condition Asset', 'Weight (%)']
+                    _wrows = [{"Variance Asset": tr.ticker,
+                               "Corridor Condition Asset": tr.corridor_asset,
+                               "Weight (%)": ""} for tr in _trs]
+                else:
+                    _wcols = ['Corridor Condition Asset', 'Weight (%)']
+                    _wrows = [{"Corridor Condition Asset": tr.corridor_asset, "Weight (%)": ""}
+                              for tr in _trs]
+                _sig = [(tr.ticker, tr.corridor_asset) for tr in _trs]
+                if st.session_state.get('pkg_weights_sig') != _sig:
+                    st.session_state['pkg_weights_df'] = pd.DataFrame(_wrows)
+                    st.session_state['pkg_weights_sig'] = _sig
+                st.caption("Edit names/weights, delete rows for a sub-basket, or paste "
+                           "`Variance Asset, Corridor Condition Asset, Weight (%)` lines "
+                           "(leave weights empty = equal weights):")
                 _w_paste = st.text_area("Paste weights here:", height=68, key="pkg_weights_paste",
-                                        label_visibility="collapsed", placeholder="ISP.MI, 25\nASML.AS, 30")
+                                        label_visibility="collapsed",
+                                        placeholder=".STOXX50E, ISP.MI, 25" if _is_xc_pkg else "ISP.MI, 25")
                 if st.button("📋 Fill weights", key="pkg_weights_fill") and _w_paste.strip():
                     try:
-                        st.session_state['pkg_weights_df'] = _df_from_paste(
-                            _w_paste, ['Ticker', 'Weight (%)'])
+                        st.session_state['pkg_weights_df'] = _df_from_paste(_w_paste, _wcols)
                         st.rerun()
                     except Exception as _we:
                         st.error(f"Weights paste error: {_we}")
-                _w_df = st.data_editor(st.session_state['pkg_weights_df'], num_rows="fixed",
+                _w_df = st.data_editor(st.session_state['pkg_weights_df'], num_rows="dynamic",
                                        use_container_width=True,
-                                       key="pkg_weights_editor",
-                                       column_config={"Ticker": st.column_config.TextColumn(disabled=True)})
+                                       key="pkg_weights_editor")
                 st.session_state['pkg_weights_df'] = _w_df
-                # Align weights to the solved tickers BY NAME (paste order may differ)
-                _w_map = {str(t).strip().casefold(): w for t, w in
-                          zip(_w_df["Ticker"], _w_df["Weight (%)"])}
-                _w_aligned = [_w_map.get(str(tr.ticker).strip().casefold(), "") for tr in _trs]
-                _w_raw = pd.to_numeric(pd.Series(_w_aligned), errors="coerce")
-                if _w_raw.isna().all():
-                    _w = np.full(len(_trs), 1.0 / len(_trs))
+
+                # Filter to the kept legs (corridor asset = per-leg key)
+                _keep = {str(c).strip().casefold() for c in _w_df.get('Corridor Condition Asset', pd.Series(dtype=str))
+                         if str(c).strip()}
+                _trs = [tr for tr in _trs
+                        if str(tr.corridor_asset).strip().casefold() in _keep]
+
+                # Weights aligned BY NAME over the kept subset; empty = equal weights
+                _w_map = {str(r.get('Corridor Condition Asset', '')).strip().casefold(): r.get('Weight (%)', '')
+                          for _, r in _w_df.iterrows()}
+                _w_raw = pd.to_numeric(pd.Series(
+                    [_w_map.get(str(tr.corridor_asset).strip().casefold(), "") for tr in _trs]),
+                    errors="coerce")
+                if _w_raw.isna().all() or len(_trs) == 0:
+                    _w = np.full(len(_trs), 1.0 / max(len(_trs), 1))
                 else:
                     _w = _w_raw.fillna(0.0).to_numpy(dtype=float) / 100.0
                     if abs(_w.sum()) < 1e-12:
-                        _w = np.full(len(_trs), 1.0 / len(_trs))
+                        _w = np.full(len(_trs), 1.0 / max(len(_trs), 1))
                     else:
                         _w = _w / _w.sum()
 
