@@ -2010,6 +2010,7 @@ with tab3:
                                         hole=0.35, textinfo="label+percent"))
             _pie_fig.update_layout(title="Weights by stock", height=350,
                                    margin=dict(t=40, b=20, l=20, r=20))
+            st.session_state['fig_weights_pie'] = _pie_fig
             st.plotly_chart(_pie_fig, use_container_width=True, key="plotly_weights_pie")
         is_dual = st.session_state.get('is_dual_sectorial', False)
         if is_dual:
@@ -2158,7 +2159,8 @@ with tab3:
                         'split_60d': st.session_state.get('fig_60d_split'),
                         'is_cross_corridor': is_cross_corridor,
                         'has_short_leg': st.session_state.ds_res.iloc[:, 1].abs().sum() > 0,
-                        'is_dual_sectorial': st.session_state.get('is_dual_sectorial', False)
+                        'is_dual_sectorial': st.session_state.get('is_dual_sectorial', False),
+                        'weights_pie': st.session_state.get('fig_weights_pie'),
                     }
                     # Add sectorial graphs
                     if charts_data['is_dual_sectorial']:
