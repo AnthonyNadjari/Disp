@@ -2705,6 +2705,10 @@ with tab4:
                          if str(c).strip()}
                 _trs = [tr for tr in _trs
                         if str(tr.corridor_asset).strip().casefold() in _keep]
+                if not _trs:
+                    st.warning("No legs kept — the weights table is empty or its names don't "
+                               "match the solved corridor assets. Re-fill or restore the rows.")
+                    st.stop()
 
                 # Weights aligned BY NAME over the kept subset; empty = equal weights
                 _w_map = {str(r.get('Corridor Condition Asset', '')).strip().casefold(): r.get('Weight (%)', '')
@@ -2816,6 +2820,10 @@ with tab4:
                         )
                         with st.spinner("Backtest running..."):
                             _bt_res = backtest(_bt_df, _bt_cfg, start_date=_bt_start)
+                        if _bt_res.timeseries is None or _bt_res.timeseries.empty:
+                            st.error("Backtest returned no data — check that the tickers loaded "
+                                     "(RIC/BBG conversion needs the desk network for RIC inputs).")
+                            st.stop()
                         _fig = func_graph.plot_main_backtest(_bt_res.timeseries)
                         _fig.update_layout(height=350)
                         st.plotly_chart(_fig, use_container_width=True)
