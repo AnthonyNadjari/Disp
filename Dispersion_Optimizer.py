@@ -2666,16 +2666,33 @@ with tab4:
                 st.divider()
                 st.subheader("📦 Package — spread decomposition")
 
-                # Weights: editable table; empty = equal weights
-                _w_init = pd.DataFrame({
-                    "Ticker": [tr.ticker for tr in _trs],
-                    "Weight (%)": [""] * len(_trs),
-                })
-                st.caption("Optional weights (leave empty = equal weights):")
-                _w_df = st.data_editor(_w_init, num_rows="fixed", use_container_width=True,
+                # Weights: editable table OR paste; empty = equal weights
+                if 'pkg_weights_df' not in st.session_state or \
+                        list(st.session_state['pkg_weights_df'].get('Ticker', [])) != [tr.ticker for tr in _trs]:
+                    st.session_state['pkg_weights_df'] = pd.DataFrame({
+                        "Ticker": [tr.ticker for tr in _trs],
+                        "Weight (%)": [""] * len(_trs),
+                    })
+                st.caption("Optional weights (leave empty = equal weights) — edit the table or paste `Ticker, Weight (%)` lines:")
+                _w_paste = st.text_area("Paste weights here:", height=68, key="pkg_weights_paste",
+                                        label_visibility="collapsed", placeholder="ISP.MI, 25\nASML.AS, 30")
+                if st.button("📋 Fill weights", key="pkg_weights_fill") and _w_paste.strip():
+                    try:
+                        st.session_state['pkg_weights_df'] = _df_from_paste(
+                            _w_paste, ['Ticker', 'Weight (%)'])
+                        st.rerun()
+                    except Exception as _we:
+                        st.error(f"Weights paste error: {_we}")
+                _w_df = st.data_editor(st.session_state['pkg_weights_df'], num_rows="fixed",
+                                       use_container_width=True,
                                        key="pkg_weights_editor",
                                        column_config={"Ticker": st.column_config.TextColumn(disabled=True)})
-                _w_raw = pd.to_numeric(_w_df["Weight (%)"], errors="coerce")
+                st.session_state['pkg_weights_df'] = _w_df
+                # Align weights to the solved tickers BY NAME (paste order may differ)
+                _w_map = {str(t).strip().casefold(): w for t, w in
+                          zip(_w_df["Ticker"], _w_df["Weight (%)"])}
+                _w_aligned = [_w_map.get(str(tr.ticker).strip().casefold(), "") for tr in _trs]
+                _w_raw = pd.to_numeric(pd.Series(_w_aligned), errors="coerce")
                 if _w_raw.isna().all():
                     _w = np.full(len(_trs), 1.0 / len(_trs))
                 else:
