@@ -4848,6 +4848,8 @@ class PricingEngine(VolSwapMixin):
                     if r.range_accrual is not None:
                         # Mono and cross legs share the corridor asset → one RA column
                         row['RA (%)'] = f"{r.range_accrual:.2f}%"
+                        if r.discount_factor:
+                            row['RA Undiscounted (%)'] = f"{r.range_accrual / r.discount_factor:.2f}%"
 
                     if r.ev_mono is not None:
                         row['EV Mono LV (%)'] = f"{r.ev_mono:.2f}%"
@@ -4961,6 +4963,8 @@ class PricingEngine(VolSwapMixin):
 
                     if r.range_accrual_mono is not None:
                         row['RA (%)'] = f"{r.range_accrual_mono:.2f}%"
+                        if r.discount_factor:
+                            row['RA Undiscounted (%)'] = f"{r.range_accrual_mono / r.discount_factor:.2f}%"
 
                     if r.obs_dates_cross is not None:
                         row['Obs Dates'] = r.obs_dates_cross

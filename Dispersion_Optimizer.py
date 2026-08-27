@@ -2234,6 +2234,9 @@ with tab4:
         with _r6:
             uvar_var = st.number_input("Up Var", value=130.00, step=0.01, format="%.2f",
                                        key="p_uvar") / 100 if is_corr_var else 1.30
+        with _r6b:
+            local_cap_var = st.number_input("Local cap", value=2.50, step=0.10, key="p_local_cap",
+                                            help="Per-leg cap multiplier x — the FPF leg cap is (x²−1)×strike²")
         with _r7_ev:
             expected_var_mode = False  # Expected Var is now computed inside solve_strike automatically
         with _r8_fv:
@@ -2522,12 +2525,15 @@ with tab4:
                         st.warning("Add data first.")
                     else:
                         # Build product config (structure only — no business data)
+                        # Corridor toggle OFF = no corridor: extreme barriers
+                        # (every day in corridor, RA = discount factor)
                         config = DispersionConfig(
                             product_type=ProductType.VAR_SWAP_CORRIDOR,
                             cross_corridor=is_x_corr_var,
-                            barrier_up=uvar_var,
-                            barrier_down=dvar_var,
+                            barrier_up=uvar_var if is_corr_var else 9999.99,
+                            barrier_down=dvar_var if is_corr_var else 0.0001,
                             is_capped=is_capped_var,
+                            local_cap=local_cap_var,
                         )
                         # Build DataFrame with required columns for solve()/price()
                         pricing_df = st.session_state.edited_df_corr_p.copy()
@@ -2690,14 +2696,16 @@ with tab4:
                     return sum(v * w for v, w in vals)
 
                 _mono_lv = [tr.strike_corridor_asset for tr in _trs]
-                _cross_lv = [tr.strike_variance_asset for tr in _trs]
+                # Index leg only exists for true cross legs (ticker != corridor asset)
+                _is_cross_leg = [tr.corridor_asset != tr.ticker for tr in _trs]
+                _cross_lv = [tr.strike_variance_asset if xc else None for tr, xc in zip(_trs, _is_cross_leg)]
                 _mono_lv_cap = [tr.strike_cap_priced_mono for tr in _trs]
-                _cross_lv_cap = [tr.strike_cap_priced_lv for tr in _trs]
+                _cross_lv_cap = [tr.strike_cap_priced_lv if xc else None for tr, xc in zip(_trs, _is_cross_leg)]
                 _mono_lsv_u = [tr.strike_lsv for tr in _trs]
-                _cross_lsv_u = [tr.strike_cross_lsv for tr in _trs]
+                _cross_lsv_u = [tr.strike_cross_lsv if xc else None for tr, xc in zip(_trs, _is_cross_leg)]
                 _mono_lsv_c = [tr.strike_cap_priced_lsv_mono for tr in _trs]
-                _cross_lsv_c = [tr.strike_cap_priced_lsv for tr in _trs]
-                _cross_lcm = [tr.strike_variance_asset_lcm for tr in _trs]
+                _cross_lsv_c = [tr.strike_cap_priced_lsv if xc else None for tr, xc in zip(_trs, _is_cross_leg)]
+                _cross_lcm = [tr.strike_variance_asset_lcm if xc else None for tr, xc in zip(_trs, _is_cross_leg)]
 
                 def _diff(a_list, b_list):
                     """Weighted Σ(a−b), None-safe per leg."""
