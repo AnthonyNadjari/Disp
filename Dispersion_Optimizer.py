@@ -2000,6 +2000,17 @@ with tab3:
                 st.plotly_chart(st.session_state['graph_backtest'], use_container_width=True, key="plotly_bt_main")
         # Display sectorial analysis
         st.subheader("📊 Sectorial Analysis")
+        # Weights pie per stock (corridor asset) — cross-corridor shows the
+        # per-stock split directly; mono shows the long legs.
+        _lt = st.session_state.get('long_tickers')
+        _lw = st.session_state.get('long_weights')
+        if _lt and _lw:
+            _pie_fig = go.Figure(go.Pie(labels=list(_lt),
+                                        values=[abs(float(w)) for w in _lw],
+                                        hole=0.35, textinfo="label+percent"))
+            _pie_fig.update_layout(title="Weights by stock", height=350,
+                                   margin=dict(t=40, b=20, l=20, r=20))
+            st.plotly_chart(_pie_fig, use_container_width=True, key="plotly_weights_pie")
         is_dual = st.session_state.get('is_dual_sectorial', False)
         if is_dual:
             if 'fig_sectorial_long' in st.session_state and 'fig_sectorial_short' in st.session_state:
