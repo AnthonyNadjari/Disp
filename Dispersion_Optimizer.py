@@ -2219,7 +2219,7 @@ with tab4:
         is_solve_var = pricing_mode == "Solve"
         is_generate_fpf_var = pricing_mode == "Generate FPFs"
         # ── Config row ──
-        _r1, _r2, _r3, _r4, _r5, _r6, _r7_ev, _r8_fv, _r9_model = st.columns([1, 1, 1, 1, 1.2, 1.2, 1.2, 1.2, 1.5])
+        _r1, _r2, _r3, _r4, _r5, _r6, _r6b, _r7_ev, _r8_fv, _r9_model = st.columns([1, 1, 1, 1, 1.2, 1.2, 1.2, 1.2, 1.2, 1.5])
         with _r1:
             is_x_corr_var = st.toggle("Cross Corridor", value=True, key="p_is_x_corr")
         with _r2:
