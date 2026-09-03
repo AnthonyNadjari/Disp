@@ -4960,6 +4960,13 @@ class PricingEngine(VolSwapMixin):
                     row['Up Var (%)'] = f"{cfg.uvar * 100:.2f}%"
                     # NOTE: strike values are stored as vol (e.g. 0.2168), not variance
                     row['Strike (%)'] = f"{r.strike_variance_asset * 100:.2f}%" if r.strike_variance_asset else 'FAILED'
+                    # ── EV (mono corridor) — was missing in mono mode ──
+                    if r.ev_mono is not None:
+                        row['EV Mono LV (%)'] = f"{r.ev_mono:.2f}%"
+                    if r.ev_mono_lsv is not None:
+                        row['EV Mono LSV (%)'] = f"{r.ev_mono_lsv:.2f}%"
+                    if r.ev_mono_lsv0 is not None:
+                        row['EV Mono LSV0 (%)'] = f"{r.ev_mono_lsv0:.2f}%"
 
 
                     if r.range_accrual_mono is not None:
