@@ -307,7 +307,8 @@ def build_corridor_fpf(
         currency: str,
         schedule_calendar_asset: str = None,
         use_parameters: bool = False,
-        cap_multiplier: float = 2.5
+        cap_multiplier: float = 2.5,
+        obs_start_date: datetime.date = None
 ) -> str:
     """
     Generate an FPF string for a corridor covariance swap.
@@ -326,7 +327,13 @@ def build_corridor_fpf(
     last_obs_date : date
         Last observation / maturity date.
     strike_date : date
-        Trade inception date (start of observation window).
+        Trade strike-setting date written to the FPF strikeDate field.
+        For forward-starting trades this stays at today; only the
+        observation window moves (see obs_start_date).
+    obs_start_date : date, optional
+        First observation date of the corridor window. Defaults to
+        strike_date (spot-starting). Set it in the future for
+        forward-starting trades.
     strikes : List[float]
         Strike level per asset (as decimal, e.g. 0.25).
     weights : List[float]
@@ -424,7 +431,7 @@ def build_corridor_fpf(
     # Build observation schedules.
     # The extended schedule (last_obs + 10 days) is always needed for T+2 computation.
     # If both calendars are the same, one call serves all purposes.
-    _sched_start = strike_date.strftime("%Y-%m-%d")
+    _sched_start = (obs_start_date or strike_date).strftime("%Y-%m-%d")
     _sched_end = last_obs_date.strftime("%Y-%m-%d")
     _sched_end_ext = (last_obs_date + datetime.timedelta(days=10)).strftime("%Y-%m-%d")
 
@@ -611,6 +618,8 @@ def _solve_single_ev_ra(
         eqfx_shift: float,
         individual_correlation: float = None,
         schedule_calendar_asset: str = None,
+        obs_start_date=None,
+        cap_multiplier: float = 2.5,
 ) -> Optional[float]:
     """
     Solve a single ticker's strike via EV/RA ratio method (1 HTTP call).
@@ -624,6 +633,7 @@ def _solve_single_ev_ra(
         # a cap would clamp EV to ~0 for ALL tickers, producing identical values.
         ev_fpf = build_corridor_fpf(
             tickers=[ticker], last_obs_date=last_obs_date, strike_date=strike_date,
+            obs_start_date=obs_start_date,
             strikes=[0.000001], weights=[1.0], low_barrier=dvar, high_barrier=uvar,
             is_capped=False, corr_asset=corr_asset,
             schedule_calendar_asset=schedule_calendar_asset, currency=currency,
@@ -633,11 +643,12 @@ def _solve_single_ev_ra(
         # Build RA FPF (range accrual variant)
         ra_fpf_base = build_corridor_fpf(
             tickers=[ticker], last_obs_date=last_obs_date, strike_date=strike_date,
+            obs_start_date=obs_start_date,
             strikes=[0.000001], weights=[1.0], low_barrier=dvar, high_barrier=uvar,
             is_capped=True, corr_asset=corr_asset,
             schedule_calendar_asset=schedule_calendar_asset, currency=currency,
             use_parameters=False,
-            cap_multiplier=getattr(self, 'cap_multiplier', 2.5),
+            cap_multiplier=cap_multiplier,
         )
         fpf_obj = FPFUnifiedEconomicsWrapper.from_data(ra_fpf_base, script_cls=corridorCovarianceSwap_v4)
         new_variance_details = fpf_obj.varianceDetails.clone(
@@ -781,10 +792,12 @@ class CrossCorridorVarianceSwap:
     def __init__(self, ref_asset, last_obs_date, strike_date, uvar, dvar, linked_asset, is_capped,
                  strike_variance_asset=None, strike_corridor_asset=None, eqeq_lambda=0.10, correl_floor=0.0,
                  eqfx_shift=0.0,
-                 individual_correlation=None, currency=None, compute_atmf=True, model_name=None):
+                 individual_correlation=None, currency=None, compute_atmf=True, model_name=None,
+                 obs_start_date=None):
         self.ref_asset = ref_asset
         self.last_obs_date = last_obs_date
         self.strike_date = strike_date
+        self.obs_start_date = obs_start_date
         self.linked_asset = linked_asset
         self.uvar = uvar
         self.dvar = dvar
@@ -860,7 +873,8 @@ class CrossCorridorVarianceSwap:
             ref_result = _solve_single_ev_ra(
                 ticker=self.ref_asset, corr_asset=self.linked_asset,
                 currency=self.currency, last_obs_date=self.last_obs_date,
-                strike_date=self.strike_date, is_capped=self.is_capped,
+                strike_date=self.strike_date,
+            obs_start_date=self.obs_start_date, is_capped=self.is_capped,
                 dvar=self.dvar, uvar=self.uvar, eqeq_lambda=self.eqeq_lambda,
                 correl_floor=self.correl_floor, eqfx_shift=self.eqfx_shift,
                 individual_correlation=self.individual_correlation,
@@ -877,7 +891,7 @@ class CrossCorridorVarianceSwap:
             # Solve linked asset (if cross-corridor)
             if is_cross:
                 cache_key = (self.linked_asset, str(self.last_obs_date), str(self.strike_date),
-                             self.dvar, self.uvar, self.eqeq_lambda)
+                             str(self.obs_start_date), self.dvar, self.uvar, self.eqeq_lambda)
                 cached = self._ev_mono_cache.get(f"linked_strike_{cache_key}")
                 if cached is not None:
                     self.strike_corridor_asset = cached
@@ -885,7 +899,8 @@ class CrossCorridorVarianceSwap:
                     linked_strike = _solve_single_ev_ra(
                         ticker=self.linked_asset, corr_asset=self.linked_asset,
                         currency=self.currency, last_obs_date=self.last_obs_date,
-                        strike_date=self.strike_date, is_capped=self.is_capped,
+                        strike_date=self.strike_date,
+            obs_start_date=self.obs_start_date, is_capped=self.is_capped,
                         dvar=self.dvar, uvar=self.uvar, eqeq_lambda=self.eqeq_lambda,
                         correl_floor=self.correl_floor, eqfx_shift=self.eqfx_shift,
                         individual_correlation=None,
@@ -921,6 +936,7 @@ class CrossCorridorVarianceSwap:
             tickers=[self.ref_asset],
             last_obs_date=self.last_obs_date,
             strike_date=self.strike_date,
+            obs_start_date=self.obs_start_date,
             is_capped=self.is_capped,
             dvar=self.dvar,
             uvar=self.uvar,
@@ -948,6 +964,7 @@ class CrossCorridorVarianceSwap:
                 tickers=[self.linked_asset],
                 last_obs_date=self.last_obs_date,
                 strike_date=self.strike_date,
+            obs_start_date=self.obs_start_date,
                 is_capped=self.is_capped,
                 dvar=self.dvar,
                 uvar=self.uvar,
@@ -986,6 +1003,7 @@ class CrossCorridorVarianceSwap:
                 tickers=[self.ref_asset],
                 last_obs_date=self.last_obs_date,
                 strike_date=self.strike_date,
+            obs_start_date=self.obs_start_date,
                 is_capped=False,
                 dvar=self.dvar,
                 uvar=self.uvar,
@@ -1007,6 +1025,7 @@ class CrossCorridorVarianceSwap:
                     tickers=[self.linked_asset],
                     last_obs_date=self.last_obs_date,
                     strike_date=self.strike_date,
+            obs_start_date=self.obs_start_date,
                     is_capped=False,
                     dvar=self.dvar,
                     uvar=self.uvar,
@@ -1046,6 +1065,7 @@ class CrossCorridorVarianceSwap:
                 tickers=[self.ref_asset],
                 last_obs_date=self.last_obs_date,
                 strike_date=self.strike_date,
+            obs_start_date=self.obs_start_date,
                 is_capped=True,
                 dvar=1.0,
                 uvar=1.0,
@@ -1067,6 +1087,7 @@ class CrossCorridorVarianceSwap:
                     tickers=[self.linked_asset],
                     last_obs_date=self.last_obs_date,
                     strike_date=self.strike_date,
+            obs_start_date=self.obs_start_date,
                     is_capped=True,
                     dvar=1.0,
                     uvar=1.0,
@@ -1167,6 +1188,7 @@ class CrossCorridorVarianceSwap:
                 tickers=[self.ref_asset],
                 last_obs_date=self.last_obs_date,
                 strike_date=self.strike_date,
+            obs_start_date=self.obs_start_date,
                 strikes=[self.strike_variance_asset],
                 weights=[1.0],
                 low_barrier=self.dvar,
@@ -1252,6 +1274,7 @@ class CrossCorridorVarianceSwap:
             tickers=[self.ref_asset],
             last_obs_date=self.last_obs_date,
             strike_date=self.strike_date,
+            obs_start_date=self.obs_start_date,
             strikes=[self.strike_variance_asset],
             weights=[1.0],
             low_barrier=self.dvar,
@@ -1276,6 +1299,7 @@ class CrossCorridorVarianceSwap:
                 tickers=[self.linked_asset],
                 last_obs_date=self.last_obs_date,
                 strike_date=self.strike_date,
+            obs_start_date=self.obs_start_date,
                 strikes=[self.strike_corridor_asset],
                 weights=[1.0],
                 low_barrier=self.dvar,
@@ -1396,6 +1420,9 @@ class PricingConfig:
     """All parameters for a pricing run. Immutable after creation."""
     strike_date: date
     last_obs_date: date
+    # Forward-start: first observation date. None → obs window starts at strike_date.
+    # strike_date itself is the strike-setting date written to the FPF (keep = today).
+    obs_start_date: Optional[date] = None
     uvar: float = 2.5
     dvar: float = -2.5
     is_solve: bool = True
@@ -2056,6 +2083,7 @@ class PricingEngine(VolSwapMixin):
                     tickers=[ticker],
                     last_obs_date=cfg.last_obs_date,
                     strike_date=cfg.strike_date,
+                    obs_start_date=cfg.obs_start_date,
                     strikes=[strike_var],
                     weights=[1.0],
                     low_barrier=cfg.dvar,
@@ -2089,6 +2117,7 @@ class PricingEngine(VolSwapMixin):
                         tickers=[corr_asset],
                         last_obs_date=cfg.last_obs_date,
                         strike_date=cfg.strike_date,
+                    obs_start_date=cfg.obs_start_date,
                         strikes=[mono_strike_var],
                         weights=[1.0],
                         low_barrier=cfg.dvar,
@@ -2640,7 +2669,8 @@ class PricingEngine(VolSwapMixin):
                 ref_currency_sched = currencies[ref_idx]
                 ev_cross_ref_fpf = build_corridor_fpf(
                     tickers=[ref_ticker], last_obs_date=cfg.last_obs_date,
-                    strike_date=cfg.strike_date, strikes=[0.000001], weights=[1.0],
+                    strike_date=cfg.strike_date,
+                    obs_start_date=cfg.obs_start_date, strikes=[0.000001], weights=[1.0],
                     low_barrier=cfg.dvar, high_barrier=cfg.uvar, is_capped=False,
                     corr_asset=ref_corr, schedule_calendar_asset=sched_asset,
                     currency=ref_currency_sched, use_parameters=False,
@@ -4548,6 +4578,7 @@ class PricingEngine(VolSwapMixin):
             ref_asset=ticker,
             last_obs_date=cfg.last_obs_date,
             strike_date=cfg.strike_date,
+                    obs_start_date=cfg.obs_start_date,
             uvar=cfg.uvar,
             dvar=cfg.dvar,
             linked_asset=corridor_asset,
@@ -4614,7 +4645,8 @@ class PricingEngine(VolSwapMixin):
 
         ev_fpf = build_corridor_fpf(
             tickers=[ticker], last_obs_date=cfg.last_obs_date,
-            strike_date=cfg.strike_date, strikes=[strike_var_ref], weights=[1.0],
+            strike_date=cfg.strike_date,
+                    obs_start_date=cfg.obs_start_date, strikes=[strike_var_ref], weights=[1.0],
             low_barrier=cfg.dvar, high_barrier=cfg.uvar, is_capped=cfg.is_capped,
             corr_asset=corridor_asset, schedule_calendar_asset=corridor_asset if ticker != corridor_asset else None,
             currency=currency, use_parameters=False,
@@ -4662,7 +4694,8 @@ class PricingEngine(VolSwapMixin):
         if ticker != corridor_asset:
             mono_fpf = build_corridor_fpf(
                 tickers=[corridor_asset], last_obs_date=cfg.last_obs_date,
-                strike_date=cfg.strike_date, strikes=[strike_var_linked], weights=[1.0],
+                strike_date=cfg.strike_date,
+                    obs_start_date=cfg.obs_start_date, strikes=[strike_var_linked], weights=[1.0],
                 low_barrier=cfg.dvar, high_barrier=cfg.uvar, is_capped=cfg.is_capped,
                 corr_asset=corridor_asset, schedule_calendar_asset=None,
                 currency=currency, use_parameters=False,
@@ -5054,6 +5087,7 @@ class PricingEngine(VolSwapMixin):
             tickers=[ticker],
             last_obs_date=cfg.last_obs_date,
             strike_date=cfg.strike_date,
+                    obs_start_date=cfg.obs_start_date,
             is_capped=cfg.is_capped,
             dvar=cfg.dvar,
             uvar=cfg.uvar,
@@ -5087,6 +5121,7 @@ def price_corridor_swap(
         individual_correlation: Optional[float] = None,
         model_name: Optional[str] = None,
         schedule_calendar_asset: Optional[str] = None,
+        obs_start_date: Optional[date] = None,
 ) -> float:
     """
     Price a corridor variance swap with a single ticker or cross-corridor with two tickers.
@@ -5133,6 +5168,7 @@ def price_corridor_swap(
         tickers=tickers,
         last_obs_date=last_obs_date,
         strike_date=strike_date,
+            obs_start_date=obs_start_date,
         strikes=strikes,
         weights=weights,
         low_barrier=dvar,

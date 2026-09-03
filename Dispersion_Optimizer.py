@@ -2220,7 +2220,8 @@ with tab4:
         _mode_key = "pricing_mode_unified_var" if product_type == "Variance Swap" else "pricing_mode_unified_vol"
         pricing_mode = st.radio("Mode", ["Solve", "Price", "Generate FPFs"], horizontal=True, key=_mode_key)
     with _c3:
-        strike_date_p = st.date_input("Start", value=datetime.datetime.now(), format="DD/MM/YYYY", key="p_strike_date")
+        strike_date_p = st.date_input("Obs Start", value=datetime.datetime.now(), format="DD/MM/YYYY", key="p_strike_date",
+                                      help="First corridor observation date. Set it in the future for a forward-starting trade — the FPF strike date and the valuation stay at today.")
     with _c4:
         maturity_date_p = st.date_input("Maturity", value=datetime.date(2026, 6, 23), format="DD/MM/YYYY",
                                         key="p_maturity_date")
@@ -2569,7 +2570,7 @@ with tab4:
                                 df=pricing_df,
                                 config=config,
                                 last_obs_date=maturity_date_p,
-                                strike_date=strike_date_p,
+                                obs_start_date=strike_date_p,
                                 eqeq_lambda=eqeq_lambda_var,
                                 correl_floor=correl_floor_var,
                                 eqfx_shift=eqfx_shift_var,
@@ -2589,7 +2590,7 @@ with tab4:
                                 df=pricing_df,
                                 config=config,
                                 last_obs_date=maturity_date_p,
-                                strike_date=strike_date_p,
+                                obs_start_date=strike_date_p,
                                 eqeq_lambda=eqeq_lambda_var,
                                 correl_floor=correl_floor_var,
                                 eqfx_shift=eqfx_shift_var,

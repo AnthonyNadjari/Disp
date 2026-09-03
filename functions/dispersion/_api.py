@@ -369,6 +369,7 @@ def solve(
     last_obs_date: date,
     *,
     strike_date: date = None,
+    obs_start_date: date = None,
     eqeq_lambda: float = 0.10,
     correl_floor: float = 0.0,
     eqfx_shift: float = -0.05,
@@ -399,7 +400,12 @@ def solve(
         Product maturity (last observation date). Together with strike_date,
         defines the observation schedule via calendar intersection.
     strike_date : date, optional
-        Trade inception (when the strike is set). Defaults to today.
+        Trade strike-setting date written to the FPF strikeDate field.
+        Defaults to today. Keep it at today for forward-starting trades.
+    obs_start_date : date, optional
+        First observation date of the corridor window. Defaults to
+        strike_date (spot-starting). Set it in the future to price a
+        forward-starting corridor.
     eqeq_lambda, correl_floor, eqfx_shift : float
         Model parameters (defaults = desk standard).
     vol_mode : str
@@ -431,6 +437,7 @@ def solve(
     pricing_cfg = PricingConfig(
         strike_date=strike_date or date.today(),
         last_obs_date=last_obs_date,
+        obs_start_date=obs_start_date,
         uvar=config.barrier_up,
         dvar=config.barrier_down,
         is_solve=True,
@@ -471,6 +478,7 @@ def price(
     last_obs_date: date,
     *,
     strike_date: date = None,
+    obs_start_date: date = None,
     eqeq_lambda: float = 0.10,
     correl_floor: float = 0.0,
     eqfx_shift: float = -0.05,
@@ -515,6 +523,7 @@ def price(
     pricing_cfg = PricingConfig(
         strike_date=strike_date or date.today(),
         last_obs_date=last_obs_date,
+        obs_start_date=obs_start_date,
         uvar=config.barrier_up,
         dvar=config.barrier_down,
         is_solve=False,
