@@ -512,6 +512,7 @@ with tab1:
     optimization_start = st.date_input(
         "Optimization Start Date",
         value=date.today() - relativedelta(years=5),
+        min_value=date(1990, 1, 1),
         key="opt_start_date",
         format="DD/MM/YYYY"
     )
@@ -2222,9 +2223,11 @@ with tab4:
         pricing_mode = st.radio("Mode", ["Solve", "Price", "Generate FPFs"], horizontal=True, key=_mode_key)
     with _c3:
         strike_date_p = st.date_input("Obs Start", value=datetime.datetime.now(), format="DD/MM/YYYY", key="p_strike_date",
+                                      min_value=datetime.date(1990, 1, 1), max_value=datetime.date(2040, 12, 31),
                                       help="First corridor observation date. Set it in the future for a forward-starting trade — the FPF strike date and the valuation stay at today.")
     with _c4:
         maturity_date_p = st.date_input("Maturity", value=datetime.date(2026, 6, 23), format="DD/MM/YYYY",
+                                        min_value=datetime.date(1990, 1, 1), max_value=datetime.date(2060, 12, 31),
                                         key="p_maturity_date")
     st.divider()
     # ══════════════════════════════════════════════════════════════════════════
