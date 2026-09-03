@@ -1693,6 +1693,7 @@ with tab3:
     bt_start_date = st.date_input(
         "Backtest Start Date",
         value=date.today() - relativedelta(years=5),
+        min_value=date(1990, 1, 1),
         key="bt_start_date_tab3",
         format="DD/MM/YYYY",
         help="Start date for the backtest lookback period"
@@ -2809,6 +2810,7 @@ with tab4:
                 st.markdown("**Backtest this package**")
                 _bt_start = st.date_input("Backtest start date",
                                           value=datetime.date.today() - relativedelta(years=5),
+                                          min_value=datetime.date(1990, 1, 1),
                                           key="pkg_bt_start", format="DD/MM/YYYY")
                 if st.button("🚀 Run backtest", key="pkg_bt_run"):
                     try:
