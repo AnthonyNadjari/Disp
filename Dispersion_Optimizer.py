@@ -2910,7 +2910,7 @@ with tab4:
         _vbtn = {"Solve": "🔍 Solve Strikes", "Price": "💰 Price Vol Swap", "Generate FPFs": "🔧 Generate FPFs"}[
             pricing_mode]
         if st.button(_vbtn, type="primary", use_container_width=True, key="p_run_vol"):
-            tickers_vol = [t for t in
+            tickers_vol = [vp._vs_to_ric(t) for t in
                            st.session_state.edited_df_volswap_p["Variance Asset"].astype(str).str.strip().tolist() if
                            t and t != 'nan']
             if not tickers_vol:

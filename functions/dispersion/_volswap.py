@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import time
 import math
+import re
 import threading
 import numpy as np
 import pandas as pd
@@ -36,6 +37,27 @@ _VOLSWAP_STRIKE_WINDOWS = [
     (0.55, 0.85, 0.0005),
     (0.85, 1.20, 0.001),   # high-vol window (coarser step to limit scenarios)
 ]
+
+# ─── Ticker normalization ────────────────────────────────────────────────────
+# The pricing portal resolves RIC identifiers; BBG names pasted from a terminal
+# (e.g. "NVDA UW") must be converted first — otherwise instrument loading fails
+# and the solver misleadingly reports "no root found".
+_VS_RIC_RE = re.compile(r"^[A-Z0-9]{1,12}\.[A-Z]{1,4}$")
+_VS_RIC_CACHE: Dict[str, str] = {}
+
+
+def _vs_to_ric(name) -> str:
+    """Normalize to RIC form; RICs and unrecognized names pass through."""
+    name = str(name).strip()
+    if not name or name.startswith(".") or _VS_RIC_RE.match(name):
+        return name
+    if name not in _VS_RIC_CACHE:
+        try:
+            from functions.common.tickers import bbg_to_ric
+            _VS_RIC_CACHE[name] = bbg_to_ric(name) or name
+        except Exception:
+            _VS_RIC_CACHE[name] = name
+    return _VS_RIC_CACHE[name]
 
 _VOLSWAP_BASE_FPF_TEMPLATE = """
 corridorCovarianceSwap_v4 (19-Jun-2026;19-Jun-2026, ([("DLTR.O", 1, 0.445, 0.05, 0.6675, NA, 0)], GeometricBasket, 0, NA, NA, 0, 1, 1, SumSquares, 1, False, 0.1, -0.1), 252, False, Forward, 11-Jun-2025, [(11-Jun-2025, False, 11-Jun-2025;11-Jun-2025)], (FilterOff, False, GeometricBasket, [(".SPX", 1, 0)], 1, -Infinity, Up, 0, Infinity, Down, 0), (False, [(".SPX", 1, 0)], GeometricBasket, CurrentDate, 1, Infinity, Up, Spread, 0), [(0, 19-Jun-2026, 19-Jun-2026;19-Jun-2026)])"""
@@ -72,6 +94,7 @@ def generate_fpf_vol(
     When *observation_dates* is None the schedule is derived internally.
     When a list of ISO-format date strings is supplied, FPF uses those directly.
     """
+    tickers = [_vs_to_ric(t) for t in tickers]
     matu_ex, matu_stl = calculate_payment_dates(last_obs_date, tickers[0])
     if observation_dates is None:
         engine = _make_engine(strike_date, last_obs_date)
@@ -141,9 +164,11 @@ class VolSwapMixin:
             strike (float) or None; or (strike, ladder_data) if return_ladder
         """
         import datetime as _dt
+        ticker = _vs_to_ric(ticker)
         ccy = currency or self.cache.get_currency(ticker)
         cfg = self.config
         dbg.step("volswap-solve", f"{ticker} target={target_value*100:.4f}%")
+        fail_reasons = []
         try:
             portal = self.cache.portal
             snap = self.cache.snap
@@ -178,6 +203,7 @@ class VolSwapMixin:
                     underlying = self.cache.get_instrument(ticker)
                     if underlying is None:
                         dbg.err("volswap-solve", f"{ticker}: instrument not found")
+                        fail_reasons.append("instrument load failed (ticker not resolved)")
                         continue
                 nova_fpf = portal.create_fpf(
                     fpf_string=fpf,
@@ -211,6 +237,7 @@ class VolSwapMixin:
                     ]
                 except (KeyError, IndexError, TypeError) as e:
                     dbg.err("volswap-solve", f"extraction failed: {e}")
+                    fail_reasons.append(f"w{window_idx+1}: unreadable response ({e})")
                     continue
                 # Find sign change (linear interpolation)
                 strikes_list = raw_strikes.tolist()
@@ -233,10 +260,24 @@ class VolSwapMixin:
                                 "solved_strike": root,
                             }
                         return root
+                _fvs = [v for v in fair_values if v is not None]
+                if _fvs:
+                    fail_reasons.append(
+                        f"[{lo*100:.0f}-{hi*100:.0f}%] FV {min(_fvs)*100:+.3f}%..{max(_fvs)*100:+.3f}% "
+                        f"vs target {target_value*100:+.3f}%")
+                else:
+                    fail_reasons.append(f"[{lo*100:.0f}-{hi*100:.0f}%] no fair values returned")
                 dbg.warn("volswap-solve", f"no root in window {window_idx+1}")
-            dbg.err("volswap-solve", "no root found in any window")
+            _reason = " | ".join(fail_reasons) or "no strike window brackets the target"
+            if not hasattr(self, "_volswap_errors"):
+                self._volswap_errors = {}
+            self._volswap_errors[ticker] = _reason
+            dbg.err("volswap-solve", f"{ticker}: no root found — {_reason}")
             return (None, None) if return_ladder else None
         except Exception as e:
+            if not hasattr(self, "_volswap_errors"):
+                self._volswap_errors = {}
+            self._volswap_errors[ticker] = str(e)
             dbg.err("volswap-solve", f"{ticker}: {e}")
             return (None, None) if return_ladder else None
 
@@ -255,6 +296,7 @@ class VolSwapMixin:
         """
         import datetime as _dt
         ccy = currency or "EUR"
+        tickers = [_vs_to_ric(t) for t in tickers]
         total = len(tickers)
         results: Dict[int, dict] = {}
         completed = [0]
@@ -285,7 +327,8 @@ class VolSwapMixin:
                     return idx, {
                         "Ticker": ticker, "Strike (%)": "FAILED",
                         "Target FV (%)": f"{target_value*100:.2f}%",
-                        "Status": "Solving failed - no root found", "FPF": "N/A",
+                        "Status": f"Failed - {getattr(self, '_volswap_errors', {}).get(ticker, 'no root found')[:180]}",
+                        "FPF": "N/A",
                     }
                 # Generate concrete FPF with solved strike
                 matu_ex, matu_stl = self._volswap_payment_dates(self.config.last_obs_date, ticker)
@@ -336,6 +379,7 @@ class VolSwapMixin:
         """
         import datetime as _dt
         ccy = currency or "EUR"
+        tickers = [_vs_to_ric(t) for t in tickers]
         cfg = self.config
         portal = self.cache.portal
         snap = self.cache.snap
