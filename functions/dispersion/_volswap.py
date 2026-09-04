@@ -36,6 +36,7 @@ _VOLSWAP_STRIKE_WINDOWS = [
     (0.30, 0.55, 0.0005),
     (0.55, 0.85, 0.0005),
     (0.85, 1.20, 0.001),   # high-vol window (coarser step to limit scenarios)
+    (1.20, 1.80, 0.002),   # very-high-vol window (only scanned when no root below 120%)
 ]
 
 # ─── Ticker normalization ────────────────────────────────────────────────────
