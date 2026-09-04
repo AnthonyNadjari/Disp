@@ -2855,7 +2855,7 @@ with tab4:
         is_solve_vol = pricing_mode == "Solve"
         is_generate_fpf_vol = pricing_mode == "Generate FPFs"
         # ── Config row ──
-        _v1, _v2, _v3, _v4, _v5, _v6 = st.columns(6)
+        _v1, _v2, _v3, _v4, _v5, _v5b, _v6 = st.columns(7)
         with _v1:
             is_note_vol = st.toggle("Note", value=True, key="p_is_note_vol", disabled=is_solve_vol,
                                     help="±10% global caps")
