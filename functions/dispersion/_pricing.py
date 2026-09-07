@@ -172,25 +172,37 @@ _PAYOUT_TRACE_METRIC = "PayoutTraceVariableExpectation"
 _PAYOUT_TRACE_VAR = "var_calculatePayoff_nCorridorObs"
 _ZCB_CACHE: Dict[tuple, float] = {}
 
-# ── CorrelationSens (exploration) ─────────────────────────────────────────────
-# New portal metric under evaluation — a variance-asset / corridor-asset
-# correlation sensitivity, so it is requested for CROSS instruments only (a
-# mono leg has a single asset).  It goes in a SEPARATE pricing call (never in
-# the main batch) so an unsupported/rejected metric can only cost one extra
-# HTTP round-trip, never the solve itself.  The raw response is dumped per
-# instrument so the shape (per-pair entries, extraResults, MetricNotSupported
-# flags) and the values can be studied before wiring it in.
+# ── CorrelationSens ───────────────────────────────────────────────────────────
+# Portal metric: the sensitivity of the instrument's FairValue to the pairwise
+# correlation, returned as a full n×n matrix over the instrument's assets
+# (diagonal 0, symmetric).  For a cross leg the only informative number is the
+# (variance asset, corridor asset) off-diagonal entry — `_corrsens_offdiag`.
+# Requested in the main batch alongside Correlation; a mono leg has a single
+# asset and yields nothing.  Units as returned by the portal (raw).
 #
-#   DISP_PRICING_CORRSENS=0                    disable the extra call (default: on)
-#   DISP_PRICING_CORRSENS_PARAMS='{"BumpSize": "0.01"}'
-#                                              optional metric parameters (JSON
-#                                              dict, values sent as strings) —
-#                                              lets you iterate without code edits
+#   DISP_PRICING_CORRSENS_DEBUG=1              dump the raw per-instrument response
+#   DISP_PRICING_CORRSENS_PARAMS='{"k": "v"}'  optional metric parameters (JSON
+#                                              dict, values sent as strings)
 _CORRSENS_METRIC = "CorrelationSens"
 
 
-def _corrsens_enabled() -> bool:
-    return os.environ.get("DISP_PRICING_CORRSENS", "1").strip().lower() not in ("0", "false", "no", "off")
+def _corrsens_debug() -> bool:
+    return os.environ.get("DISP_PRICING_CORRSENS_DEBUG", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _corrsens_offdiag(entries) -> Optional[float]:
+    """The (variance asset, corridor asset) entry of the CorrelationSens matrix:
+    the first pair whose two asset refs differ.  None when absent (mono leg,
+    unsupported metric, failed chunk)."""
+    for e in entries or []:
+        if isinstance(e, dict):
+            p, s = e.get("PrimaryAssetRef"), e.get("SecondaryAssetRef")
+            if p is not None and s is not None and p != s and e.get("value") is not None:
+                try:
+                    return float(e["value"])
+                except (TypeError, ValueError):
+                    return None
+    return None
 
 
 def _corrsens_metric(pricing_portal):
@@ -1602,6 +1614,7 @@ class TickerResult:
     lsv_charge: Optional[float] = None
     lcm_impact: Optional[float] = None
     correlation: Optional[float] = None
+    correlation_sens: Optional[float] = None  # portal CorrelationSens, (variance asset, corridor asset) entry; cross legs only
     # Price-mode LSV fields (FV under 3 model configs, same user-provided strike)
     mid_variance_asset_lv: Optional[float] = None  # FV_LV (variance asset)
     mid_variance_asset_lsv0: Optional[float] = None  # FV_LSV0 (variance asset)
@@ -3444,6 +3457,7 @@ class PricingEngine(VolSwapMixin):
                 ]
                 batch_metrics.append(pricing_portal.create_metric("QueryLocalCcyVol", atms_params))
             batch_metrics.append(pricing_portal.create_metric("Correlation", corr_params))
+            batch_metrics.append(_corrsens_metric(pricing_portal))  # CorrelationSens (cross legs)
             # E[n_corridor_obs] on the EV instruments — replaces RA instruments
             batch_metrics.append(pricing_portal.create_metric(
                 _PAYOUT_TRACE_METRIC,
@@ -3478,32 +3492,6 @@ class PricingEngine(VolSwapMixin):
                 if not batch_res_atms:
                     dbg.warn("batch", "ATMS batch returned NO results — ATMS columns will be "
                                       "empty (the second pricing call failed)")
-
-            # ── CorrelationSens exploration: CROSS instruments only (the metric
-            # is a variance-asset / corridor-asset correlation sensitivity — a
-            # mono leg has a single asset).  Separate call, never in the main
-            # batch, no scenario, raw response dumped per instrument.  Wrapped
-            # so nothing here can ever affect the solve.  Index i of the dump
-            # == cross leg i (same order as `tickers`). ──
-            self._corrsens_raw = {}
-            if _corrsens_enabled() and n_ev > 0:
-                try:
-                    _cs_labels = [f"EV_CROSS variance={tickers[_i]} corridor={corr_assets[_i]}"
-                                  for _i in range(n_ev)]
-                    _t_cs = time.time()
-                    batch_res_corrsens = _price_in_batches(
-                        instruments[:n_ev],
-                        metrics=[_corrsens_metric(pricing_portal)],
-                        price_id="Price",
-                        batch_label="corrsens",
-                    )
-                    self._corrsens_raw = _dump_corrsens(
-                        batch_res_corrsens, _cs_labels,
-                        f"{_CORRSENS_METRIC} — solve batch, {n_ev} cross instruments, "
-                        f"params={os.environ.get('DISP_PRICING_CORRSENS_PARAMS', '') or 'none'} "
-                        f"({time.time() - _t_cs:.1f}s)")
-                except Exception as _cs_e:
-                    _safe_print(f"[CORRSENS] debug call failed: {type(_cs_e).__name__}: {_cs_e}")
             dbg.ok("batch", f"priced in {time.time() - t_price_call:.1f}s (main: {t_price_done:.1f}s)")
 
             # ── Step 4: Extract results ──
@@ -3736,6 +3724,27 @@ class PricingEngine(VolSwapMixin):
                 return None
             vol_list = _get_metric_list_for_instrument(idx, "QueryLocalCcyVol", results_map_atms)
             return _extract_vol(vol_list, expected_asset)
+
+        def _get_corrsens(idx):
+            """CorrelationSens (variance asset, corridor asset) entry for the cross
+            instrument at global idx — plain or scenario-nested response alike."""
+            running_idx = 0
+            for chunk_start in sorted(results_map.keys()):
+                chunk_data = results_map[chunk_start]
+                chunk_size = chunk_data["chunk_size"]
+                if idx < running_idx + chunk_size:
+                    local_idx = idx - running_idx
+                    key = "Price" if local_idx == 0 else f"Price_{local_idx}"
+                    return _corrsens_offdiag(_corrsens_entries(chunk_data["raw"].get(key)))
+                running_idx += chunk_size
+            return None
+
+        if _corrsens_debug() and n_ev > 0:
+            _dump_corrsens(
+                results_map,
+                [f"EV_CROSS variance={tickers[_i]} corridor={corr_assets[_i]}" for _i in range(n_ev)]
+                + ["(non-cross instrument)"] * max(0, len(instruments) - n_ev),
+                f"{_CORRSENS_METRIC} — solve batch ({n_ev} cross legs)")
 
         def _get_corr(idx):
             val = _get_metric_for_instrument(idx, "Correlation")
@@ -4174,6 +4183,7 @@ class PricingEngine(VolSwapMixin):
                     corr_value = _get_bump_corr(idx, "LV")
                 else:
                     corr_value = _get_corr(idx)
+                corrsens_value = _get_corrsens(idx)
 
                 # Cap adjustment — analytical proxy for all variants (LV, LSV, LCM)
                 _corridor_vol_pct = None
@@ -4305,6 +4315,7 @@ class PricingEngine(VolSwapMixin):
                     atms_vol_corridor_asset=atms_linked,
                     vol_spread=vol_spread,
                     correlation=corr_value,
+                    correlation_sens=corrsens_value,
                     discount_factor=_zcb_leg,
                     strike_vanilla_var=_vanilla_var,
                     strike_vanilla_mono=_vanilla_mono,
@@ -4826,6 +4837,7 @@ class PricingEngine(VolSwapMixin):
                 pricing_portal.create_metric_parameter("MaturityList", str(excel_date)),
                 pricing_portal.create_metric_parameter("MaturityType", "Absolute"),
             ]),
+            _corrsens_metric(pricing_portal),  # CorrelationSens (cross instrument)
         ]
 
         # Build instrument list — cross + mono if different assets
@@ -4881,31 +4893,13 @@ class PricingEngine(VolSwapMixin):
         # Extract results
         results_map = batch_res.get("results", {})
 
-        # ── CorrelationSens exploration (price mode): the CROSS instrument
-        # only (index 0; the mono leg has no correlation).  Separate call so an
-        # unsupported metric can never break the price itself. ──
-        if _corrsens_enabled() and ticker != corridor_asset:
-            try:
-                _cs_res = pricing_portal.price(
-                    price_id="Price",
-                    instruments=instruments[:1],
-                    valuation_date=valuation_date,
-                    calculation_parameters={},
-                    model_context=model_context,
-                    overridden_snap_name=live_snap["name"],
-                    metrics=[_corrsens_metric(pricing_portal)],
-                )
-                _cs_labels = [f"EV_CROSS variance={ticker} corridor={corridor_asset}"]
-                _cs_entries = _dump_corrsens(
-                    {0: {"raw": _cs_res.get("results", {}), "chunk_size": 1}},
-                    _cs_labels,
-                    f"{_CORRSENS_METRIC} — price mode, {ticker} / {corridor_asset}, "
-                    f"params={os.environ.get('DISP_PRICING_CORRSENS_PARAMS', '') or 'none'}")
-                if not hasattr(self, "_corrsens_raw_by_ticker"):
-                    self._corrsens_raw_by_ticker = {}
-                self._corrsens_raw_by_ticker[ticker] = _cs_entries
-            except Exception as _cs_e:
-                _safe_print(f"[CORRSENS] debug call failed for {ticker}: {type(_cs_e).__name__}: {_cs_e}")
+        # CorrelationSens: cross instrument is index 0 ("Price"); the
+        # (variance asset, corridor asset) entry of its sensitivity matrix.
+        correlation_sens = _corrsens_offdiag(_corrsens_entries(results_map.get("Price")))
+        if _corrsens_debug():
+            _dump_corrsens({0: {"raw": results_map, "chunk_size": 1}},
+                           [f"EV_CROSS variance={ticker} corridor={corridor_asset}"],
+                           f"{_CORRSENS_METRIC} — price mode {ticker} / {corridor_asset}")
 
         def _get_fv(idx):
             key = "Price" if idx == 0 else f"Price_{idx}"
@@ -4949,6 +4943,7 @@ class PricingEngine(VolSwapMixin):
             atmf_vol_variance_asset=atmf_vol_va,
             atmf_vol_corridor_asset=atmf_vol_ca,
             correlation=correlation,
+            correlation_sens=correlation_sens,
             currency=currency,
             obs_dates_cross=obs_counts.get("Cross Corridor Obs Dates") or obs_counts.get("Obs Dates"),
             obs_dates_mono=obs_counts.get("Mono Corridor Obs Dates"),
@@ -5090,6 +5085,8 @@ class PricingEngine(VolSwapMixin):
                         row['Vol Spread (%)'] = f"{r.vol_spread * 100:.2f}%"
                     if r.correlation is not None:
                         row['Correlation'] = f"{r.correlation * 100:.2f}%"
+                    if r.correlation_sens is not None:
+                        row['Correl Sens'] = f"{r.correlation_sens:.6f}"   # raw portal units
                     if r.mid_variance_asset is not None:
                         row['Mid Variance Asset (%)'] = f"{r.mid_variance_asset * 100:.2f}%"
                     if r.mid_corridor_asset is not None:
