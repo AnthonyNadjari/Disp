@@ -2764,6 +2764,7 @@ with tab4:
                 _mono_lsv_c = [tr.strike_cap_priced_lsv_mono for tr in _trs]
                 _cross_lsv_c = [tr.strike_cap_priced_lsv if xc else None for tr, xc in zip(_trs, _is_cross_leg)]
                 _cross_lcm = [tr.strike_variance_asset_lcm if xc else None for tr, xc in zip(_trs, _is_cross_leg)]
+                _cross_lcm_c = [tr.strike_cap_priced_lcm if xc else None for tr, xc in zip(_trs, _is_cross_leg)]
 
                 def _diff(a_list, b_list):
                     """Weighted Σ(a−b), None-safe per leg."""
@@ -2773,17 +2774,27 @@ with tab4:
                         return None
                     return sum((a - b) * w for a, b, w in vals)
 
+                # Decomposition convention: rows are INCREMENTS that sum to the final
+                # strike.  When the package is capped (cap-priced strikes present),
+                # every increment after "LV Cap Cost" is measured on the CAPPED
+                # prices (vs the capped LV); otherwise on the uncapped LV.
                 _rows = []
                 _S = _wsum(_mono_lv)
                 _I = _wsum(_cross_lv)
                 _rows.append(("LV uncapped", _S, _I))
-                if any(v is not None for v in _mono_lv_cap + _cross_lv_cap):
+                _pkg_capped = any(v is not None for v in _mono_lv_cap + _cross_lv_cap)
+                if _pkg_capped:
                     _rows.append(("LV Cap Cost", _diff(_mono_lv_cap, _mono_lv),
                                   _diff(_cross_lv_cap, _cross_lv)))
-                if any(v is not None for v in _mono_lsv_c + _cross_lsv_c):
-                    _rows.append(("LSV Cost Cap", _diff(_mono_lsv_c, _mono_lsv_u),
-                                  _diff(_cross_lsv_c, _cross_lsv_u)))
-                if any(v is not None for v in _cross_lcm):
+                if _pkg_capped and any(v is not None for v in _mono_lsv_c + _cross_lsv_c):
+                    _rows.append(("LSV Cost (on capped)", _diff(_mono_lsv_c, _mono_lv_cap),
+                                  _diff(_cross_lsv_c, _cross_lv_cap)))
+                elif not _pkg_capped and any(v is not None for v in _mono_lsv_u + _cross_lsv_u):
+                    _rows.append(("LSV Cost", _diff(_mono_lsv_u, _mono_lv),
+                                  _diff(_cross_lsv_u, _cross_lv)))
+                if _pkg_capped and any(v is not None for v in _cross_lcm_c):
+                    _rows.append(("LCM Benefit / cost (on capped)", 0.0, _diff(_cross_lcm_c, _cross_lv_cap)))
+                elif not _pkg_capped and any(v is not None for v in _cross_lcm):
                     _rows.append(("LCM Benefit / cost", 0.0, _diff(_cross_lcm, _cross_lv)))
                 _rows.append(("charges", 0.0, 0.0))
 
@@ -2808,6 +2819,14 @@ with tab4:
                                   "Stocks": f"{_tot_S * 100:.2f}%",
                                   "Index": f"{_tot_I * 100:.2f}%"})
                 st.dataframe(pd.DataFrame(_tbl_rows), use_container_width=True, hide_index=True)
+                st.caption(
+                    "Rows are increments summing to Final Price (weighted Σ over legs). "
+                    + ("Package is capped: LV Cap Cost = cap-priced LV − uncapped LV; "
+                       "LSV Cost and LCM Benefit / cost are measured on the CAPPED prices "
+                       "(cap-priced LSV / LCM strike − cap-priced LV strike)."
+                       if _pkg_capped else
+                       "Package is uncapped: LSV Cost and LCM Benefit / cost are measured "
+                       "against the uncapped LV strike."))
 
                 # ── Backtest the package (period is the only input) ──
                 st.markdown("**Backtest this package**")
