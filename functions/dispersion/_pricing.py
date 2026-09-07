@@ -180,10 +180,32 @@ _ZCB_CACHE: Dict[tuple, float] = {}
 # Requested in the main batch alongside Correlation; a mono leg has a single
 # asset and yields nothing.  Units as returned by the portal (raw).
 #
+# Portal definition (zenithName CorrelationDelta): parameters BumpSize
+# (default 0.01), ScalingFactor (default 0.01), Differencing (default
+# "ForwardNormalized"), UseAngularBump.  ForwardNormalized returns
+# (FV(ρ+Bump) − FV(ρ)) / Bump × Scaling, so sending Bump = Scaling = b gives
+# exactly the EV change for a +b correlation move — that single number is
+# the knob below, and the "Correl Sens" column is the strike differential
+# for that move.
+#
+#   _CORRSENS_BUMP (below)                     correlation move, absolute (0.01 = +1 pt)
+#   DISP_PRICING_CORRSENS_BUMP=0.05            env override of the move
+#   DISP_PRICING_CORRSENS_PARAMS='{"k": "v"}'  extra/override metric parameters
+#                                              (JSON dict, e.g. {"UseAngularBump": "true"})
 #   DISP_PRICING_CORRSENS_DEBUG=1              dump the raw per-instrument response
-#   DISP_PRICING_CORRSENS_PARAMS='{"k": "v"}'  optional metric parameters (JSON
-#                                              dict, values sent as strings)
 _CORRSENS_METRIC = "CorrelationSens"
+_CORRSENS_BUMP = 0.01   # ← change here (or via DISP_PRICING_CORRSENS_BUMP)
+
+
+def _corrsens_bump() -> float:
+    """The correlation move the Sens refers to (absolute, 0.01 = one point)."""
+    raw = os.environ.get("DISP_PRICING_CORRSENS_BUMP", "").strip()
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            _safe_print(f"[CORRSENS] ignoring DISP_PRICING_CORRSENS_BUMP={raw!r} (not a number)")
+    return float(_CORRSENS_BUMP)
 
 
 def _corrsens_debug() -> bool:
@@ -206,19 +228,25 @@ def _corrsens_offdiag(entries) -> Optional[float]:
 
 
 def _corrsens_metric(pricing_portal):
-    """Build the CorrelationSens metric, with optional env-driven parameters."""
+    """Build the CorrelationSens metric for a +_corrsens_bump() correlation
+    move: BumpSize = ScalingFactor = bump, ForwardNormalized differencing.
+    DISP_PRICING_CORRSENS_PARAMS (JSON dict) can add/override parameters."""
     import json
+    bump = _corrsens_bump()
+    params = {
+        "BumpSize": f"{bump:g}",
+        "ScalingFactor": f"{bump:g}",
+        "Differencing": "ForwardNormalized",
+    }
     raw = os.environ.get("DISP_PRICING_CORRSENS_PARAMS", "").strip()
-    params = []
     if raw:
         try:
-            for k, v in json.loads(raw).items():
-                params.append(pricing_portal.create_metric_parameter(str(k), str(v)))
-        except Exception as e:  # malformed JSON must not kill pricing — say so and send no params
+            params.update({str(k): str(v) for k, v in json.loads(raw).items()})
+        except Exception as e:  # malformed JSON must not kill pricing — say so and keep defaults
             _safe_print(f"[CORRSENS] ignoring DISP_PRICING_CORRSENS_PARAMS ({type(e).__name__}: {e})")
-            params = []
-    return pricing_portal.create_metric(_CORRSENS_METRIC, params) if params else \
-        pricing_portal.create_metric(_CORRSENS_METRIC)
+    return pricing_portal.create_metric(
+        _CORRSENS_METRIC,
+        [pricing_portal.create_metric_parameter(k, v) for k, v in params.items()])
 
 
 def _corrsens_entries(entry) -> list:
@@ -4620,32 +4648,15 @@ class PricingEngine(VolSwapMixin):
                             # strike under the +1 correl point bump of the capped EV:
                             #   √(−(EV_cap + Sens_cap)/RA) − √(−EV_cap/RA)   (Sens = ΔEV)
                             sens_cap = _get_cap_corrsens(inst_idx)
-                            _sens_unc = result_obj.correlation_sens          # main-batch (uncapped) Sens
                             if sens_cap is not None:
                                 result_obj.correlation_sens = sens_cap
                                 _bumped_cap_var = -(ev_cap + sens_cap) / ra_val
                                 result_obj.correlation_sens_strike = (
                                     math.sqrt(_bumped_cap_var) - real_cap_strike
                                     if _bumped_cap_var > 0 else None)
-                            # Diagnostic (plain print — the dbg.info channel is filtered
-                            # in the app console): uncapped vs capped, raw Sens and dK.
-                            try:
-                                _ev_unc = ev_cross_values[idx]
-                                _k_unc = math.sqrt(abs(-_ev_unc / ra_val))
-                                _dk_unc = (math.sqrt(-(_ev_unc + _sens_unc) / ra_val) - _k_unc
-                                           if _sens_unc is not None and -(_ev_unc + _sens_unc) / ra_val > 0 else None)
-                                _dk_cap = result_obj.correlation_sens_strike if sens_cap is not None else None
-                                _fmt = lambda v, f: 'n/a' if v is None else format(v, f)
-                                _safe_print(
-                                    f"[CORRSENS] {ticker}/{corr}: RA={ra_val:.4f}"
-                                    f" | uncapped EV={_ev_unc:.6f} Sens={_fmt(_sens_unc, '.3e')}"
-                                    f" K={_k_unc*100:.2f}% dK={_fmt(None if _dk_unc is None else _dk_unc*100, '+.3f')}%"
-                                    f" | capped EV={ev_cap:.6f} Sens={_fmt(sens_cap, '.3e')}"
-                                    f" K={real_cap_strike*100:.2f}% dK={_fmt(None if _dk_cap is None else _dk_cap*100, '+.3f')}%"
-                                    + ("" if sens_cap is not None else
-                                       "   <- capped instrument returned NO CorrelationSens"))
-                            except Exception as _cs_e:
-                                _safe_print(f"[CORRSENS] diagnostic failed for {ticker}: {type(_cs_e).__name__}: {_cs_e}")
+                            elif _corrsens_debug():
+                                _safe_print(f"[CORRSENS] {ticker}/{corr}: capped instrument returned no "
+                                            f"{_CORRSENS_METRIC} — column left as uncapped/None")
                             _cap_str_serial_jobs.append((result_obj, 'fpf_string_cap_lv',
                                                           _build_capped_fpf_obj(ref_obj, ticker, corr, real_cap_strike)))
                             try:
@@ -5147,8 +5158,8 @@ class PricingEngine(VolSwapMixin):
                     if r.correlation is not None:
                         row['Correlation'] = f"{r.correlation * 100:.2f}%"
                     if r.correlation_sens_strike is not None:
-                        # strike differential for a +1 correlation point bump (capped if capped)
-                        row['Correl Sens (%)'] = f"{r.correlation_sens_strike * 100:.2f}%"
+                        # strike differential for a +bump correlation move (capped if capped)
+                        row[f'Correl Sens (+{_corrsens_bump() * 100:g}pt, %)'] = f"{r.correlation_sens_strike * 100:.2f}%"
                     elif r.correlation_sens is not None:
                         row['Correl Sens raw'] = f"{r.correlation_sens:.6f}"   # price mode: no EV/RA re-solve
                     if r.mid_variance_asset is not None:
