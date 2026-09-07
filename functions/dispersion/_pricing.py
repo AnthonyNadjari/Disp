@@ -4621,11 +4621,27 @@ class PricingEngine(VolSwapMixin):
                             #   √((−EV_cap + Sens_cap)/RA) − √(−EV_cap/RA)
                             sens_cap = _get_cap_corrsens(inst_idx)
                             if sens_cap is not None:
+                                _sens_unc = result_obj.correlation_sens      # main-batch (uncapped) Sens
                                 result_obj.correlation_sens = sens_cap
                                 _bumped_cap_var = (-ev_cap + sens_cap) / ra_val
                                 result_obj.correlation_sens_strike = (
                                     math.sqrt(_bumped_cap_var) - real_cap_strike
                                     if _bumped_cap_var > 0 else None)
+                                # Diagnostic: uncapped vs capped, raw Sens and strike differential
+                                try:
+                                    _ev_unc = ev_cross_values[idx]
+                                    _k_unc = math.sqrt(abs(-_ev_unc / ra_val))
+                                    _dk_unc = (math.sqrt((-_ev_unc + _sens_unc) / ra_val) - _k_unc
+                                               if _sens_unc is not None and (-_ev_unc + _sens_unc) / ra_val > 0 else None)
+                                    _dk_cap = result_obj.correlation_sens_strike
+                                    dbg.info("CORRSENS",
+                                             f"{ticker}/{corr}: RA={ra_val:.4f} | uncapped EV={_ev_unc:.6f} "
+                                             f"Sens={_sens_unc if _sens_unc is None else f'{_sens_unc:.3e}'} "
+                                             f"K={_k_unc*100:.2f}% dK={'n/a' if _dk_unc is None else f'{_dk_unc*100:+.3f}%'} "
+                                             f"| capped EV={ev_cap:.6f} Sens={sens_cap:.3e} K={real_cap_strike*100:.2f}% "
+                                             f"dK={'n/a' if _dk_cap is None else f'{_dk_cap*100:+.3f}%'}")
+                                except Exception:
+                                    pass
                             _cap_str_serial_jobs.append((result_obj, 'fpf_string_cap_lv',
                                                           _build_capped_fpf_obj(ref_obj, ticker, corr, real_cap_strike)))
                             try:
