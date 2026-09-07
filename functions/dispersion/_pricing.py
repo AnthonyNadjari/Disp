@@ -1615,7 +1615,7 @@ class TickerResult:
     lcm_impact: Optional[float] = None
     correlation: Optional[float] = None
     correlation_sens: Optional[float] = None  # portal CorrelationSens, (variance asset, corridor asset) entry; cross legs only
-    correlation_sens_strike: Optional[float] = None  # strike differential for +1 correl point: √((−EV+Sens)/RA) − K (capped if capped), vol decimal
+    correlation_sens_strike: Optional[float] = None  # strike differential for +1 correl point: √((−EV+Sens)/RA) − K; capped: on the priced capped EV vs cap-priced strike (vol decimal)
     # Price-mode LSV fields (FV under 3 model configs, same user-provided strike)
     mid_variance_asset_lv: Optional[float] = None  # FV_LV (variance asset)
     mid_variance_asset_lsv0: Optional[float] = None  # FV_LSV0 (variance asset)
@@ -4228,25 +4228,16 @@ class PricingEngine(VolSwapMixin):
 
                 # CorrelationSens → strike differential for a +1 correlation
                 # point bump.  Sens is the EV change under that bump, so the
-                # strike is re-solved exactly: K_bumped = √((−EV + Sens)/RA),
-                # differential = K_bumped − K.  When capped, the bumped strike
-                # goes through the same cap proxy (with the bumped correlation)
-                # and is compared to the capped strike.
+                # strike is re-solved exactly: √((−EV + Sens)/RA) − K.
+                # Uncapped products only here; capped products get it from the
+                # capped batch (√((−EV_cap + Sens_cap)/RA) − cap-priced strike).
                 corrsens_strike = None
                 try:
-                    if corrsens_value is not None and ra_val not in (None, 0) and ev_val is not None:
+                    if (not cfg.is_capped and corrsens_value is not None
+                            and ra_val not in (None, 0) and ev_val is not None):
                         _bumped_var = (-ev_val + corrsens_value) / ra_val
                         if _bumped_var > 0:
-                            _k_bumped = math.sqrt(_bumped_var)
-                            if cfg.is_capped and strike_cap_vol is not None:
-                                _k_bumped_cap, _ = compute_cap_adjusted_strike(
-                                    k_raw=_k_bumped, ra=ra_val, correlation=_cap_corr + 0.01,
-                                    corridor_vol_pct=_corridor_vol_pct if _corridor_vol_pct is not None else 30.0,
-                                    is_capped=True, region=_cap_region,
-                                )
-                                corrsens_strike = _k_bumped_cap - strike_cap_vol
-                            else:
-                                corrsens_strike = _k_bumped - strike_variance_asset_vol
+                            corrsens_strike = math.sqrt(_bumped_var) - strike_variance_asset_vol
                 except Exception:
                     corrsens_strike = None
 
@@ -4525,7 +4516,8 @@ class PricingEngine(VolSwapMixin):
 
                 cap_results_map = _price_in_batches(
                     cap_instruments,
-                    metrics=[pricing_portal.create_metric("FairValue")],
+                    metrics=[pricing_portal.create_metric("FairValue"),
+                             _corrsens_metric(pricing_portal)],   # CorrelationSens on the CAPPED EV
                     price_id="Price",
                     scenario=effective_cap_scenario,
                     batch_label="capped",
@@ -4563,6 +4555,19 @@ class PricingEngine(VolSwapMixin):
                                         val = fv_list[local_idx]
                                         return val.get("value") if isinstance(val, dict) else val
                             return None
+                        running += cd["chunk_size"]
+                    return None
+
+                def _get_cap_corrsens(inst_idx):
+                    """CorrelationSens (variance asset, corridor asset) entry of the
+                    capped instrument at inst_idx — plain or scenario-nested."""
+                    running = 0
+                    for cs in sorted(cap_results_map.keys()):
+                        cd = cap_results_map[cs]
+                        if inst_idx < running + cd["chunk_size"]:
+                            local_idx = inst_idx - running
+                            key = "Price" if local_idx == 0 else f"Price_{local_idx}"
+                            return _corrsens_offdiag(_corrsens_entries(cd["raw"].get(key)))
                         running += cd["chunk_size"]
                     return None
 
@@ -4611,6 +4616,16 @@ class PricingEngine(VolSwapMixin):
                             real_cap_strike = math.sqrt(abs(-ev_cap / ra_val))
                             result_obj.strike_cap_priced_lv = real_cap_strike
                             result_obj.ev_cap_cross_lv = ev_cap
+                            # Correl Sens on the capped product: re-solve the CAPPED
+                            # strike under the +1 correl point bump of the capped EV:
+                            #   √((−EV_cap + Sens_cap)/RA) − √(−EV_cap/RA)
+                            sens_cap = _get_cap_corrsens(inst_idx)
+                            if sens_cap is not None:
+                                result_obj.correlation_sens = sens_cap
+                                _bumped_cap_var = (-ev_cap + sens_cap) / ra_val
+                                result_obj.correlation_sens_strike = (
+                                    math.sqrt(_bumped_cap_var) - real_cap_strike
+                                    if _bumped_cap_var > 0 else None)
                             _cap_str_serial_jobs.append((result_obj, 'fpf_string_cap_lv',
                                                           _build_capped_fpf_obj(ref_obj, ticker, corr, real_cap_strike)))
                             try:
