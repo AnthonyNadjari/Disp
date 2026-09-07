@@ -2774,29 +2774,30 @@ with tab4:
                         return None
                     return sum((a - b) * w for a, b, w in vals)
 
-                # Decomposition convention: rows are INCREMENTS that sum to the final
-                # strike.  When the package is capped (cap-priced strikes present),
-                # every increment after "LV Cap Cost" is measured on the CAPPED
-                # prices (vs the capped LV); otherwise on the uncapped LV.
-                _rows = []
+                # Decomposition: Final Price = LV uncapped
+                #   + max(LV Cap Cost, LSV Cap Cost)   (per column — NOT their sum)
+                #   + LCM Benefit / cost + charges.
+                # Cap costs = cap-priced − uncapped strike under the same model
+                # (LV: cap LV − LV; LSV: cap LSV − LSV).  LCM is measured on the
+                # capped prices when the package is capped (cap-priced LCM −
+                # cap-priced LV), on the uncapped LV otherwise.
+                _rows = []          # (name, stocks, index, group); group "cap" → max rule
                 _S = _wsum(_mono_lv)
                 _I = _wsum(_cross_lv)
-                _rows.append(("LV uncapped", _S, _I))
+                _rows.append(("LV uncapped", _S, _I, "base"))
                 _pkg_capped = any(v is not None for v in _mono_lv_cap + _cross_lv_cap)
                 if _pkg_capped:
                     _rows.append(("LV Cap Cost", _diff(_mono_lv_cap, _mono_lv),
-                                  _diff(_cross_lv_cap, _cross_lv)))
-                if _pkg_capped and any(v is not None for v in _mono_lsv_c + _cross_lsv_c):
-                    _rows.append(("LSV Cost (on capped)", _diff(_mono_lsv_c, _mono_lv_cap),
-                                  _diff(_cross_lsv_c, _cross_lv_cap)))
-                elif not _pkg_capped and any(v is not None for v in _mono_lsv_u + _cross_lsv_u):
-                    _rows.append(("LSV Cost", _diff(_mono_lsv_u, _mono_lv),
-                                  _diff(_cross_lsv_u, _cross_lv)))
+                                  _diff(_cross_lv_cap, _cross_lv), "cap"))
+                if any(v is not None for v in _mono_lsv_c + _cross_lsv_c):
+                    _rows.append(("LSV Cap Cost", _diff(_mono_lsv_c, _mono_lsv_u),
+                                  _diff(_cross_lsv_c, _cross_lsv_u), "cap"))
                 if _pkg_capped and any(v is not None for v in _cross_lcm_c):
-                    _rows.append(("LCM Benefit / cost (on capped)", 0.0, _diff(_cross_lcm_c, _cross_lv_cap)))
+                    _rows.append(("LCM Benefit / cost (on capped)", 0.0,
+                                  _diff(_cross_lcm_c, _cross_lv_cap), "base"))
                 elif not _pkg_capped and any(v is not None for v in _cross_lcm):
-                    _rows.append(("LCM Benefit / cost", 0.0, _diff(_cross_lcm, _cross_lv)))
-                _rows.append(("charges", 0.0, 0.0))
+                    _rows.append(("LCM Benefit / cost", 0.0, _diff(_cross_lcm, _cross_lv), "base"))
+                _rows.append(("charges", 0.0, 0.0, "base"))
 
                 _tbl_rows = []
                 # Labels as a DATA ROW (not headers) so the table copies cleanly
@@ -2805,28 +2806,36 @@ with tab4:
                                   "Spread": "Spread", "Stocks": "Stocks", "Index": "Index"})
                 _tot_S = 0.0
                 _tot_I = 0.0
-                for _name, _s, _i in _rows:
+                _cap_S, _cap_I = [], []          # cap-cost rows enter Final via max, not sum
+                for _name, _s, _i, _grp in _rows:
                     _s = _s or 0.0
                     _i = _i or 0.0
-                    _tot_S += _s
-                    _tot_I += _i
+                    if _grp == "cap":
+                        _cap_S.append(_s)
+                        _cap_I.append(_i)
+                    else:
+                        _tot_S += _s
+                        _tot_I += _i
                     _tbl_rows.append({"Component": _name,
                                       "Spread": f"{(_s - _i) * 100:.2f}%",
                                       "Stocks": f"{_s * 100:.2f}%",
                                       "Index": f"{_i * 100:.2f}%"})
+                if _cap_S:
+                    _tot_S += max(_cap_S)
+                    _tot_I += max(_cap_I)
                 _tbl_rows.append({"Component": "Final Price",
                                   "Spread": f"{(_tot_S - _tot_I) * 100:.2f}%",
                                   "Stocks": f"{_tot_S * 100:.2f}%",
                                   "Index": f"{_tot_I * 100:.2f}%"})
                 st.dataframe(pd.DataFrame(_tbl_rows), use_container_width=True, hide_index=True)
                 st.caption(
-                    "Rows are increments summing to Final Price (weighted Σ over legs). "
-                    + ("Package is capped: LV Cap Cost = cap-priced LV − uncapped LV; "
-                       "LSV Cost and LCM Benefit / cost are measured on the CAPPED prices "
-                       "(cap-priced LSV / LCM strike − cap-priced LV strike)."
+                    "Final Price = LV uncapped + max(LV Cap Cost, LSV Cap Cost) — per column, "
+                    "not their sum — + LCM Benefit / cost + charges (weighted Σ over legs). "
+                    "Cap costs = cap-priced − uncapped strike under the same model. "
+                    + ("LCM Benefit / cost is measured on the CAPPED prices "
+                       "(cap-priced LCM − cap-priced LV)."
                        if _pkg_capped else
-                       "Package is uncapped: LSV Cost and LCM Benefit / cost are measured "
-                       "against the uncapped LV strike."))
+                       "Package is uncapped: LCM Benefit / cost is measured against the uncapped LV."))
 
                 # ── Backtest the package (period is the only input) ──
                 st.markdown("**Backtest this package**")
