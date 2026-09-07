@@ -172,158 +172,22 @@ _PAYOUT_TRACE_METRIC = "PayoutTraceVariableExpectation"
 _PAYOUT_TRACE_VAR = "var_calculatePayoff_nCorridorObs"
 _ZCB_CACHE: Dict[tuple, float] = {}
 
-# ── CorrelationSens ───────────────────────────────────────────────────────────
-# Portal metric: the sensitivity of the instrument's FairValue to the pairwise
-# correlation, returned as a full n×n matrix over the instrument's assets
-# (diagonal 0, symmetric).  For a cross leg the only informative number is the
-# (variance asset, corridor asset) off-diagonal entry — `_corrsens_offdiag`.
-# Requested in the main batch alongside Correlation; a mono leg has a single
-# asset and yields nothing.  Units as returned by the portal (raw).
-#
-# Portal definition (zenithName CorrelationDelta): parameters BumpSize
-# (default 0.01), ScalingFactor (default 0.01), Differencing (default
-# "ForwardNormalized"), UseAngularBump.  ForwardNormalized returns
-# (FV(ρ+Bump) − FV(ρ)) / Bump × Scaling, so sending Bump = Scaling = b gives
-# exactly the EV change for a +b correlation move — that single number is
-# the knob below, and the "Correl Sens" column is the strike differential
-# for that move.
-#
-#   _CORRSENS_BUMP (below)                     correlation move, absolute (0.01 = +1 pt)
-#   DISP_PRICING_CORRSENS_BUMP=0.05            env override of the move
-#   DISP_PRICING_CORRSENS_PARAMS='{"k": "v"}'  extra/override metric parameters
-#                                              (JSON dict, e.g. {"UseAngularBump": "true"})
-#   DISP_PRICING_CORRSENS_DEBUG=1              dump the raw per-instrument response
-_CORRSENS_METRIC = "CorrelationSens"
-_CORRSENS_BUMP = 0.01   # ← change here (or via DISP_PRICING_CORRSENS_BUMP)
-
-
-def _corrsens_bump() -> float:
-    """The correlation move the Sens refers to (absolute, 0.01 = one point)."""
-    raw = os.environ.get("DISP_PRICING_CORRSENS_BUMP", "").strip()
-    if raw:
-        try:
-            return float(raw)
-        except ValueError:
-            _safe_print(f"[CORRSENS] ignoring DISP_PRICING_CORRSENS_BUMP={raw!r} (not a number)")
-    return float(_CORRSENS_BUMP)
-
-
-def _corrsens_debug() -> bool:
-    return os.environ.get("DISP_PRICING_CORRSENS_DEBUG", "0").strip().lower() in ("1", "true", "yes", "on")
-
-
-def _corrsens_offdiag(entries) -> Optional[float]:
-    """The (variance asset, corridor asset) entry of the CorrelationSens matrix:
-    the first pair whose two asset refs differ.  None when absent (mono leg,
-    unsupported metric, failed chunk)."""
-    for e in entries or []:
-        if isinstance(e, dict):
-            p, s = e.get("PrimaryAssetRef"), e.get("SecondaryAssetRef")
-            if p is not None and s is not None and p != s and e.get("value") is not None:
-                try:
-                    return float(e["value"])
-                except (TypeError, ValueError):
-                    return None
-    return None
-
-
-def _corrsens_metric(pricing_portal):
-    """Build the CorrelationSens metric for a +_corrsens_bump() correlation
-    move: BumpSize = ScalingFactor = bump, ForwardNormalized differencing.
-    DISP_PRICING_CORRSENS_PARAMS (JSON dict) can add/override parameters."""
-    import json
-    bump = _corrsens_bump()
-    params = {
-        "BumpSize": f"{bump:g}",
-        "ScalingFactor": f"{bump:g}",
-        "Differencing": "ForwardNormalized",
-    }
-    raw = os.environ.get("DISP_PRICING_CORRSENS_PARAMS", "").strip()
-    if raw:
-        try:
-            params.update({str(k): str(v) for k, v in json.loads(raw).items()})
-        except Exception as e:  # malformed JSON must not kill pricing — say so and keep defaults
-            _safe_print(f"[CORRSENS] ignoring DISP_PRICING_CORRSENS_PARAMS ({type(e).__name__}: {e})")
-    return pricing_portal.create_metric(
-        _CORRSENS_METRIC,
-        [pricing_portal.create_metric_parameter(k, v) for k, v in params.items()])
-
-
-def _corrsens_entries(entry) -> list:
-    """All CorrelationSens entries of one instrument result — top level, or
-    nested under a named bump / SimpleScenarioBump (same shapes as the vols)."""
-    if not isinstance(entry, dict):
-        return []
-    lst = entry.get(_CORRSENS_METRIC, [])
-    if isinstance(lst, list) and lst:
-        return lst
-    for bn in ("LV", "LSV", "LSV0", "LCM"):
-        bd = entry.get(bn)
-        if isinstance(bd, list) and bd and isinstance(bd[0], dict):
-            lst = bd[0].get(_CORRSENS_METRIC, [])
-            if isinstance(lst, list) and lst:
-                return lst
-    bumps = entry.get("SimpleScenarioBump")
-    if isinstance(bumps, list) and bumps and isinstance(bumps[0], dict):
-        for bn in ("LV", "LSV", "LSV0", "LCM"):
-            bd = bumps[0].get(bn)
-            if isinstance(bd, list) and bd and isinstance(bd[0], dict):
-                lst = bd[0].get(_CORRSENS_METRIC, [])
-                if isinstance(lst, list) and lst:
-                    return lst
-    return []
-
-
-def _dump_corrsens(results_by_chunk: dict, labels: list, header: str) -> dict:
-    """Print the raw CorrelationSens response per instrument and return
-    {global_idx: entries}.  `results_by_chunk` is the `_price_in_batches`
-    layout ({chunk_start: {"raw", "chunk_size"}}); `labels[global_idx]` is the
-    human label (block + assets).  When the metric key is absent the entry's
-    own keys are printed instead, so an unexpected response shape is visible
-    rather than silently empty."""
-    import pprint
-    out: dict = {}
-    _safe_print(f"\n{'=' * 100}\n[CORRSENS] {header}\n{'=' * 100}")
-    if not results_by_chunk:
-        _safe_print("[CORRSENS] NO results — the CorrelationSens pricing call failed or returned nothing")
-        return out
-    running = 0
-    for chunk_start in sorted(results_by_chunk.keys()):
-        chunk = results_by_chunk[chunk_start]
-        raw = chunk.get("raw") or {}
-        size = int(chunk.get("chunk_size", 0))
-        if not raw:
-            _safe_print(f"[CORRSENS] chunk@{chunk_start}: EMPTY raw (chunk failed) — {size} instruments skipped")
-        for local_idx in range(size):
-            gidx = running + local_idx
-            key = "Price" if local_idx == 0 else f"Price_{local_idx}"
-            label = labels[gidx] if gidx < len(labels) else f"instrument {gidx}"
-            entry = raw.get(key) if raw else None
-            entries = _corrsens_entries(entry)
-            out[gidx] = entries
-            _safe_print(f"\n--- [{gidx:02d}] {label} | key={key} ---")
-            if entries:
-                for e in entries:
-                    if isinstance(e, dict):
-                        pair = " / ".join(str(e.get(k)) for k in ("PrimaryAssetRef", "SecondaryAssetRef")
-                                          if e.get(k) is not None)
-                        flags = e.get("extraResults") or {}
-                        _safe_print(f"  value={e.get('value')!r}  pair=[{pair}]  "
-                                    f"maturity={e.get('Maturity')}  extraResults={sorted(flags) if flags else '{}'}")
-                _safe_print("  raw:")
-                _safe_print("  " + pprint.pformat(entries, width=110).replace("\n", "\n  "))
-            elif isinstance(entry, dict):
-                _safe_print(f"  no '{_CORRSENS_METRIC}' key — entry keys: {sorted(entry.keys())}")
-                for bn in ("LV", "LSV", "LSV0", "LCM", "SimpleScenarioBump"):
-                    bd = entry.get(bn)
-                    if isinstance(bd, list) and bd and isinstance(bd[0], dict):
-                        _safe_print(f"    {bn}[0] keys: {sorted(bd[0].keys())}")
-            else:
-                _safe_print(f"  no entry for {key} (raw keys: {sorted(raw.keys()) if raw else 'none'})")
-        running += size
-    n_ok = sum(1 for v in out.values() if v)
-    _safe_print(f"\n[CORRSENS] {n_ok}/{len(out)} instruments returned {_CORRSENS_METRIC}\n{'=' * 100}\n")
-    return out
+# ── CorrelationSens: the generic helpers (metric builder with the bump knob,
+# response unwrapping, pair extraction, debug dump) live in
+# functions.common.pricing_utils.  Only the dispersion mapping stays here:
+# strike differential = √(−(EV + Sens)/RA) − K (capped: on the priced capped
+# EV vs the cap-priced strike).  Column label carries the move.
+#   functions.common.pricing_utils.CORRELATION_SENS_BUMP   the move (0.01 = +1 pt)
+#   PRICING_CORRSENS_BUMP / _PARAMS / _DEBUG                env overrides
+from functions.common.pricing_utils import (
+    CORRELATION_SENS_METRIC as _CORRSENS_METRIC,
+    correlation_sens_bump as _corrsens_bump,
+    correlation_sens_debug as _corrsens_debug,
+    correlation_sens_metric as _corrsens_metric,
+    correlation_sens_entries as _corrsens_entries,
+    correlation_sens_pair as _corrsens_offdiag,
+    dump_correlation_sens as _dump_corrsens,
+)
 
 
 def _unfunded_zcb(currency: str, start_date, maturity_date, snap_name: str = None) -> float:
