@@ -5086,7 +5086,7 @@ class PricingEngine(VolSwapMixin):
                     if r.correlation is not None:
                         row['Correlation'] = f"{r.correlation * 100:.2f}%"
                     if r.correlation_sens is not None:
-                        row['Correl Sens'] = f"{r.correlation_sens:.6f}"   # raw portal units
+                        row['Correl Sens (%)'] = f"{r.correlation_sens * 100:.2f}%"
                     if r.mid_variance_asset is not None:
                         row['Mid Variance Asset (%)'] = f"{r.mid_variance_asset * 100:.2f}%"
                     if r.mid_corridor_asset is not None:
