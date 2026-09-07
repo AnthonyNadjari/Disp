@@ -277,7 +277,10 @@ def price_fpf(
 
 CORRELATION_SENS_METRIC = "CorrelationSens"
 CORRELATION_SENS_BUMP = 0.01          # default move, absolute (0.01 = one correlation point)
-_CORRSENS_BUMP_NAMES = ("LV", "LSV", "LSV0", "LCM")
+# Scenario keys the portal nests results under when an LSV/LCM scenario is
+# attached (entry["LV"][0][...]); first match wins, so LV is the one used.
+# Nothing to do with the correlation BumpSize.
+CORRELATION_SENS_SCENARIO_KEYS = ("LV", "LSV", "LSV0", "LCM")
 
 
 def _env(name: str) -> str:
@@ -335,16 +338,17 @@ def correlation_sens_metric(portal, bump: Optional[float] = None,
         [portal.create_metric_parameter(k, v) for k, v in params.items()])
 
 
-def correlation_sens_entries(entry, bump_names: Tuple[str, ...] = _CORRSENS_BUMP_NAMES) -> list:
+def correlation_sens_entries(entry, scenario_keys: Tuple[str, ...] = CORRELATION_SENS_SCENARIO_KEYS) -> list:
     """All CorrelationSens entries of one instrument result, wherever the
-    portal put them: top level, inside a named bump (``entry['LV'][0]``), or
-    inside a ``SimpleScenarioBump`` wrapper.  ``[]`` when absent."""
+    portal put them: top level, inside a named scenario key (``entry['LV'][0]`` — LV first, so the LV
+    sensitivity is the one used), or inside a ``SimpleScenarioBump`` wrapper.
+    ``[]`` when absent."""
     if not isinstance(entry, dict):
         return []
     lst = entry.get(CORRELATION_SENS_METRIC, [])
     if isinstance(lst, list) and lst:
         return lst
-    for bn in bump_names:
+    for bn in scenario_keys:
         bd = entry.get(bn)
         if isinstance(bd, list) and bd and isinstance(bd[0], dict):
             lst = bd[0].get(CORRELATION_SENS_METRIC, [])
@@ -352,7 +356,7 @@ def correlation_sens_entries(entry, bump_names: Tuple[str, ...] = _CORRSENS_BUMP
                 return lst
     bumps = entry.get("SimpleScenarioBump")
     if isinstance(bumps, list) and bumps and isinstance(bumps[0], dict):
-        for bn in bump_names:
+        for bn in scenario_keys:
             bd = bumps[0].get(bn)
             if isinstance(bd, list) and bd and isinstance(bd[0], dict):
                 lst = bd[0].get(CORRELATION_SENS_METRIC, [])
@@ -433,7 +437,7 @@ def dump_correlation_sens(results_by_chunk: dict, labels: list, header: str,
                 printer("  " + pprint.pformat(entries, width=110).replace("\n", "\n  "))
             elif isinstance(entry, dict):
                 printer(f"  no '{CORRELATION_SENS_METRIC}' key — entry keys: {sorted(entry.keys())}")
-                for bn in _CORRSENS_BUMP_NAMES + ("SimpleScenarioBump",):
+                for bn in CORRELATION_SENS_SCENARIO_KEYS + ("SimpleScenarioBump",):
                     bd = entry.get(bn)
                     if isinstance(bd, list) and bd and isinstance(bd[0], dict):
                         printer(f"    {bn}[0] keys: {sorted(bd[0].keys())}")
