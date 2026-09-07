@@ -1615,7 +1615,7 @@ class TickerResult:
     lcm_impact: Optional[float] = None
     correlation: Optional[float] = None
     correlation_sens: Optional[float] = None  # portal CorrelationSens, (variance asset, corridor asset) entry; cross legs only
-    correlation_sens_strike: Optional[float] = None  # strike impact dK/dρ = −Sens/(2·K·RA), vol decimal (solve path only)
+    correlation_sens_strike: Optional[float] = None  # strike differential for +1 correl point: √((−EV+Sens)/RA) − K (capped if capped), vol decimal
     # Price-mode LSV fields (FV under 3 model configs, same user-provided strike)
     mid_variance_asset_lv: Optional[float] = None  # FV_LV (variance asset)
     mid_variance_asset_lsv0: Optional[float] = None  # FV_LSV0 (variance asset)
@@ -4185,17 +4185,6 @@ class PricingEngine(VolSwapMixin):
                 else:
                     corr_value = _get_corr(idx)
                 corrsens_value = _get_corrsens(idx)
-                # Strike impact of correlation: the solve is K² = −EV/RA, so
-                # dK/dρ = −(dEV/dρ)/(2·K·RA) = −Sens/(2·K·RA)  (vol, decimal).
-                # Same RA as the solve (discounted). Sign follows the identity:
-                # Sens > 0 (EV less negative) ⇒ lower fair strike.
-                corrsens_strike = None
-                try:
-                    if (corrsens_value is not None and ra_val not in (None, 0)
-                            and strike_variance_asset_vol not in (None, 0)):
-                        corrsens_strike = -corrsens_value / (2.0 * strike_variance_asset_vol * ra_val)
-                except Exception:
-                    corrsens_strike = None
 
                 # Cap adjustment — analytical proxy for all variants (LV, LSV, LCM)
                 _corridor_vol_pct = None
@@ -4236,6 +4225,30 @@ class PricingEngine(VolSwapMixin):
                         corridor_vol_pct=_corridor_vol_pct if _corridor_vol_pct is not None else 30.0,
                         is_capped=True, region=_cap_region,
                     )
+
+                # CorrelationSens → strike differential for a +1 correlation
+                # point bump.  Sens is the EV change under that bump, so the
+                # strike is re-solved exactly: K_bumped = √((−EV + Sens)/RA),
+                # differential = K_bumped − K.  When capped, the bumped strike
+                # goes through the same cap proxy (with the bumped correlation)
+                # and is compared to the capped strike.
+                corrsens_strike = None
+                try:
+                    if corrsens_value is not None and ra_val not in (None, 0) and ev_val is not None:
+                        _bumped_var = (-ev_val + corrsens_value) / ra_val
+                        if _bumped_var > 0:
+                            _k_bumped = math.sqrt(_bumped_var)
+                            if cfg.is_capped and strike_cap_vol is not None:
+                                _k_bumped_cap, _ = compute_cap_adjusted_strike(
+                                    k_raw=_k_bumped, ra=ra_val, correlation=_cap_corr + 0.01,
+                                    corridor_vol_pct=_corridor_vol_pct if _corridor_vol_pct is not None else 30.0,
+                                    is_capped=True, region=_cap_region,
+                                )
+                                corrsens_strike = _k_bumped_cap - strike_cap_vol
+                            else:
+                                corrsens_strike = _k_bumped - strike_variance_asset_vol
+                except Exception:
+                    corrsens_strike = None
 
                 # Observation dates from the reference FPF object
 
@@ -5099,10 +5112,10 @@ class PricingEngine(VolSwapMixin):
                     if r.correlation is not None:
                         row['Correlation'] = f"{r.correlation * 100:.2f}%"
                     if r.correlation_sens_strike is not None:
-                        # dK/dρ in vol points: strike move for +1.0 correlation
-                        row['Correl Sens (strike, %)'] = f"{r.correlation_sens_strike * 100:.2f}%"
+                        # strike differential for a +1 correlation point bump (capped if capped)
+                        row['Correl Sens (%)'] = f"{r.correlation_sens_strike * 100:.2f}%"
                     elif r.correlation_sens is not None:
-                        row['Correl Sens (%)'] = f"{r.correlation_sens * 100:.2f}%"
+                        row['Correl Sens raw'] = f"{r.correlation_sens:.6f}"   # price mode: no EV/RA re-solve
                     if r.mid_variance_asset is not None:
                         row['Mid Variance Asset (%)'] = f"{r.mid_variance_asset * 100:.2f}%"
                     if r.mid_corridor_asset is not None:
