@@ -172,6 +172,119 @@ _PAYOUT_TRACE_METRIC = "PayoutTraceVariableExpectation"
 _PAYOUT_TRACE_VAR = "var_calculatePayoff_nCorridorObs"
 _ZCB_CACHE: Dict[tuple, float] = {}
 
+# ── CorrelationSens (exploration) ─────────────────────────────────────────────
+# New portal metric under evaluation — a variance-asset / corridor-asset
+# correlation sensitivity, so it is requested for CROSS instruments only (a
+# mono leg has a single asset).  It goes in a SEPARATE pricing call (never in
+# the main batch) so an unsupported/rejected metric can only cost one extra
+# HTTP round-trip, never the solve itself.  The raw response is dumped per
+# instrument so the shape (per-pair entries, extraResults, MetricNotSupported
+# flags) and the values can be studied before wiring it in.
+#
+#   DISP_PRICING_CORRSENS=0                    disable the extra call (default: on)
+#   DISP_PRICING_CORRSENS_PARAMS='{"BumpSize": "0.01"}'
+#                                              optional metric parameters (JSON
+#                                              dict, values sent as strings) —
+#                                              lets you iterate without code edits
+_CORRSENS_METRIC = "CorrelationSens"
+
+
+def _corrsens_enabled() -> bool:
+    return os.environ.get("DISP_PRICING_CORRSENS", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _corrsens_metric(pricing_portal):
+    """Build the CorrelationSens metric, with optional env-driven parameters."""
+    import json
+    raw = os.environ.get("DISP_PRICING_CORRSENS_PARAMS", "").strip()
+    params = []
+    if raw:
+        try:
+            for k, v in json.loads(raw).items():
+                params.append(pricing_portal.create_metric_parameter(str(k), str(v)))
+        except Exception as e:  # malformed JSON must not kill pricing — say so and send no params
+            _safe_print(f"[CORRSENS] ignoring DISP_PRICING_CORRSENS_PARAMS ({type(e).__name__}: {e})")
+            params = []
+    return pricing_portal.create_metric(_CORRSENS_METRIC, params) if params else \
+        pricing_portal.create_metric(_CORRSENS_METRIC)
+
+
+def _corrsens_entries(entry) -> list:
+    """All CorrelationSens entries of one instrument result — top level, or
+    nested under a named bump / SimpleScenarioBump (same shapes as the vols)."""
+    if not isinstance(entry, dict):
+        return []
+    lst = entry.get(_CORRSENS_METRIC, [])
+    if isinstance(lst, list) and lst:
+        return lst
+    for bn in ("LV", "LSV", "LSV0", "LCM"):
+        bd = entry.get(bn)
+        if isinstance(bd, list) and bd and isinstance(bd[0], dict):
+            lst = bd[0].get(_CORRSENS_METRIC, [])
+            if isinstance(lst, list) and lst:
+                return lst
+    bumps = entry.get("SimpleScenarioBump")
+    if isinstance(bumps, list) and bumps and isinstance(bumps[0], dict):
+        for bn in ("LV", "LSV", "LSV0", "LCM"):
+            bd = bumps[0].get(bn)
+            if isinstance(bd, list) and bd and isinstance(bd[0], dict):
+                lst = bd[0].get(_CORRSENS_METRIC, [])
+                if isinstance(lst, list) and lst:
+                    return lst
+    return []
+
+
+def _dump_corrsens(results_by_chunk: dict, labels: list, header: str) -> dict:
+    """Print the raw CorrelationSens response per instrument and return
+    {global_idx: entries}.  `results_by_chunk` is the `_price_in_batches`
+    layout ({chunk_start: {"raw", "chunk_size"}}); `labels[global_idx]` is the
+    human label (block + assets).  When the metric key is absent the entry's
+    own keys are printed instead, so an unexpected response shape is visible
+    rather than silently empty."""
+    import pprint
+    out: dict = {}
+    _safe_print(f"\n{'=' * 100}\n[CORRSENS] {header}\n{'=' * 100}")
+    if not results_by_chunk:
+        _safe_print("[CORRSENS] NO results — the CorrelationSens pricing call failed or returned nothing")
+        return out
+    running = 0
+    for chunk_start in sorted(results_by_chunk.keys()):
+        chunk = results_by_chunk[chunk_start]
+        raw = chunk.get("raw") or {}
+        size = int(chunk.get("chunk_size", 0))
+        if not raw:
+            _safe_print(f"[CORRSENS] chunk@{chunk_start}: EMPTY raw (chunk failed) — {size} instruments skipped")
+        for local_idx in range(size):
+            gidx = running + local_idx
+            key = "Price" if local_idx == 0 else f"Price_{local_idx}"
+            label = labels[gidx] if gidx < len(labels) else f"instrument {gidx}"
+            entry = raw.get(key) if raw else None
+            entries = _corrsens_entries(entry)
+            out[gidx] = entries
+            _safe_print(f"\n--- [{gidx:02d}] {label} | key={key} ---")
+            if entries:
+                for e in entries:
+                    if isinstance(e, dict):
+                        pair = " / ".join(str(e.get(k)) for k in ("PrimaryAssetRef", "SecondaryAssetRef")
+                                          if e.get(k) is not None)
+                        flags = e.get("extraResults") or {}
+                        _safe_print(f"  value={e.get('value')!r}  pair=[{pair}]  "
+                                    f"maturity={e.get('Maturity')}  extraResults={sorted(flags) if flags else '{}'}")
+                _safe_print("  raw:")
+                _safe_print("  " + pprint.pformat(entries, width=110).replace("\n", "\n  "))
+            elif isinstance(entry, dict):
+                _safe_print(f"  no '{_CORRSENS_METRIC}' key — entry keys: {sorted(entry.keys())}")
+                for bn in ("LV", "LSV", "LSV0", "LCM", "SimpleScenarioBump"):
+                    bd = entry.get(bn)
+                    if isinstance(bd, list) and bd and isinstance(bd[0], dict):
+                        _safe_print(f"    {bn}[0] keys: {sorted(bd[0].keys())}")
+            else:
+                _safe_print(f"  no entry for {key} (raw keys: {sorted(raw.keys()) if raw else 'none'})")
+        running += size
+    n_ok = sum(1 for v in out.values() if v)
+    _safe_print(f"\n[CORRSENS] {n_ok}/{len(out)} instruments returned {_CORRSENS_METRIC}\n{'=' * 100}\n")
+    return out
+
 
 def _unfunded_zcb(currency: str, start_date, maturity_date, snap_name: str = None) -> float:
     """Unfunded zero-coupon bond (discount factor) at 100% reoffer.
@@ -3365,6 +3478,32 @@ class PricingEngine(VolSwapMixin):
                 if not batch_res_atms:
                     dbg.warn("batch", "ATMS batch returned NO results — ATMS columns will be "
                                       "empty (the second pricing call failed)")
+
+            # ── CorrelationSens exploration: CROSS instruments only (the metric
+            # is a variance-asset / corridor-asset correlation sensitivity — a
+            # mono leg has a single asset).  Separate call, never in the main
+            # batch, no scenario, raw response dumped per instrument.  Wrapped
+            # so nothing here can ever affect the solve.  Index i of the dump
+            # == cross leg i (same order as `tickers`). ──
+            self._corrsens_raw = {}
+            if _corrsens_enabled() and n_ev > 0:
+                try:
+                    _cs_labels = [f"EV_CROSS variance={tickers[_i]} corridor={corr_assets[_i]}"
+                                  for _i in range(n_ev)]
+                    _t_cs = time.time()
+                    batch_res_corrsens = _price_in_batches(
+                        instruments[:n_ev],
+                        metrics=[_corrsens_metric(pricing_portal)],
+                        price_id="Price",
+                        batch_label="corrsens",
+                    )
+                    self._corrsens_raw = _dump_corrsens(
+                        batch_res_corrsens, _cs_labels,
+                        f"{_CORRSENS_METRIC} — solve batch, {n_ev} cross instruments, "
+                        f"params={os.environ.get('DISP_PRICING_CORRSENS_PARAMS', '') or 'none'} "
+                        f"({time.time() - _t_cs:.1f}s)")
+                except Exception as _cs_e:
+                    _safe_print(f"[CORRSENS] debug call failed: {type(_cs_e).__name__}: {_cs_e}")
             dbg.ok("batch", f"priced in {time.time() - t_price_call:.1f}s (main: {t_price_done:.1f}s)")
 
             # ── Step 4: Extract results ──
@@ -4741,6 +4880,32 @@ class PricingEngine(VolSwapMixin):
 
         # Extract results
         results_map = batch_res.get("results", {})
+
+        # ── CorrelationSens exploration (price mode): the CROSS instrument
+        # only (index 0; the mono leg has no correlation).  Separate call so an
+        # unsupported metric can never break the price itself. ──
+        if _corrsens_enabled() and ticker != corridor_asset:
+            try:
+                _cs_res = pricing_portal.price(
+                    price_id="Price",
+                    instruments=instruments[:1],
+                    valuation_date=valuation_date,
+                    calculation_parameters={},
+                    model_context=model_context,
+                    overridden_snap_name=live_snap["name"],
+                    metrics=[_corrsens_metric(pricing_portal)],
+                )
+                _cs_labels = [f"EV_CROSS variance={ticker} corridor={corridor_asset}"]
+                _cs_entries = _dump_corrsens(
+                    {0: {"raw": _cs_res.get("results", {}), "chunk_size": 1}},
+                    _cs_labels,
+                    f"{_CORRSENS_METRIC} — price mode, {ticker} / {corridor_asset}, "
+                    f"params={os.environ.get('DISP_PRICING_CORRSENS_PARAMS', '') or 'none'}")
+                if not hasattr(self, "_corrsens_raw_by_ticker"):
+                    self._corrsens_raw_by_ticker = {}
+                self._corrsens_raw_by_ticker[ticker] = _cs_entries
+            except Exception as _cs_e:
+                _safe_print(f"[CORRSENS] debug call failed for {ticker}: {type(_cs_e).__name__}: {_cs_e}")
 
         def _get_fv(idx):
             key = "Price" if idx == 0 else f"Price_{idx}"
