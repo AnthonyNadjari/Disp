@@ -4620,28 +4620,32 @@ class PricingEngine(VolSwapMixin):
                             # strike under the +1 correl point bump of the capped EV:
                             #   √((−EV_cap + Sens_cap)/RA) − √(−EV_cap/RA)
                             sens_cap = _get_cap_corrsens(inst_idx)
+                            _sens_unc = result_obj.correlation_sens          # main-batch (uncapped) Sens
                             if sens_cap is not None:
-                                _sens_unc = result_obj.correlation_sens      # main-batch (uncapped) Sens
                                 result_obj.correlation_sens = sens_cap
                                 _bumped_cap_var = (-ev_cap + sens_cap) / ra_val
                                 result_obj.correlation_sens_strike = (
                                     math.sqrt(_bumped_cap_var) - real_cap_strike
                                     if _bumped_cap_var > 0 else None)
-                                # Diagnostic: uncapped vs capped, raw Sens and strike differential
-                                try:
-                                    _ev_unc = ev_cross_values[idx]
-                                    _k_unc = math.sqrt(abs(-_ev_unc / ra_val))
-                                    _dk_unc = (math.sqrt((-_ev_unc + _sens_unc) / ra_val) - _k_unc
-                                               if _sens_unc is not None and (-_ev_unc + _sens_unc) / ra_val > 0 else None)
-                                    _dk_cap = result_obj.correlation_sens_strike
-                                    dbg.info("CORRSENS",
-                                             f"{ticker}/{corr}: RA={ra_val:.4f} | uncapped EV={_ev_unc:.6f} "
-                                             f"Sens={_sens_unc if _sens_unc is None else f'{_sens_unc:.3e}'} "
-                                             f"K={_k_unc*100:.2f}% dK={'n/a' if _dk_unc is None else f'{_dk_unc*100:+.3f}%'} "
-                                             f"| capped EV={ev_cap:.6f} Sens={sens_cap:.3e} K={real_cap_strike*100:.2f}% "
-                                             f"dK={'n/a' if _dk_cap is None else f'{_dk_cap*100:+.3f}%'}")
-                                except Exception:
-                                    pass
+                            # Diagnostic (plain print — the dbg.info channel is filtered
+                            # in the app console): uncapped vs capped, raw Sens and dK.
+                            try:
+                                _ev_unc = ev_cross_values[idx]
+                                _k_unc = math.sqrt(abs(-_ev_unc / ra_val))
+                                _dk_unc = (math.sqrt((-_ev_unc + _sens_unc) / ra_val) - _k_unc
+                                           if _sens_unc is not None and (-_ev_unc + _sens_unc) / ra_val > 0 else None)
+                                _dk_cap = result_obj.correlation_sens_strike if sens_cap is not None else None
+                                _fmt = lambda v, f: 'n/a' if v is None else format(v, f)
+                                _safe_print(
+                                    f"[CORRSENS] {ticker}/{corr}: RA={ra_val:.4f}"
+                                    f" | uncapped EV={_ev_unc:.6f} Sens={_fmt(_sens_unc, '.3e')}"
+                                    f" K={_k_unc*100:.2f}% dK={_fmt(None if _dk_unc is None else _dk_unc*100, '+.3f')}%"
+                                    f" | capped EV={ev_cap:.6f} Sens={_fmt(sens_cap, '.3e')}"
+                                    f" K={real_cap_strike*100:.2f}% dK={_fmt(None if _dk_cap is None else _dk_cap*100, '+.3f')}%"
+                                    + ("" if sens_cap is not None else
+                                       "   <- capped instrument returned NO CorrelationSens"))
+                            except Exception as _cs_e:
+                                _safe_print(f"[CORRSENS] diagnostic failed for {ticker}: {type(_cs_e).__name__}: {_cs_e}")
                             _cap_str_serial_jobs.append((result_obj, 'fpf_string_cap_lv',
                                                           _build_capped_fpf_obj(ref_obj, ticker, corr, real_cap_strike)))
                             try:
