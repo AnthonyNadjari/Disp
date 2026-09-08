@@ -1735,7 +1735,7 @@ with tab3:
             st.session_state['backtest_completed'] = True
             for key in ['fig_split', 'fig_60d_split', 'fig_entry_point', 'email_60d_graph',
                         'fig_sectorial', 'fig_sectorial_long', 'fig_sectorial_short',
-                        'carry_result_series']:
+                        'fig_weights_pie', 'carry_result_series']:
                 if key in st.session_state:
                     del st.session_state[key]
             # Run backtest
@@ -1783,6 +1783,10 @@ with tab3:
                     else:
                         st.session_state['is_dual_sectorial'] = False
                         st.session_state['fig_sectorial'] = sectorial_result['fig']
+                else:
+                    _sec_err = sectorial_result.get('error')
+                    st.warning(f"Sector chart unavailable — it will be missing from the email: {_sec_err}")
+                    print(f"[charts] graph_sectorial failed: {_sec_err}")
             else:
                 df_res_basket, backtest_metadata, graph_data, cross_corridor_data = _run_bt(
                     st.session_state.edited_df_bis, is_vol_swap, n_exp, local_cap,
@@ -1825,6 +1829,10 @@ with tab3:
                     else:
                         st.session_state['is_dual_sectorial'] = False
                         st.session_state['fig_sectorial'] = sectorial_result['fig']
+                else:
+                    _sec_err = sectorial_result.get('error')
+                    st.warning(f"Sector chart unavailable — it will be missing from the email: {_sec_err}")
+                    print(f"[charts] graph_sectorial failed: {_sec_err}")
                 # Generate entry point
                 entry_fig = func_graph.entry_point(
                     st.session_state.get('long_tickers', []),
@@ -1837,6 +1845,10 @@ with tab3:
                 )
                 if entry_fig is not None:
                     st.session_state['fig_entry_point'] = entry_fig
+                else:
+                    st.warning("Entry point chart unavailable (entry_point() returned None) — "
+                               "the email will omit the Entry Point section")
+                    print("[charts] entry_point() returned None (backtest run)")
             st.success("✅ Backtest completed successfully!")
         except Exception as e:
             st.error(f"❌ Backtest failed: {str(e)}")
@@ -2153,6 +2165,10 @@ with tab3:
                         )
                         if entry_fig is not None:
                             st.session_state['fig_entry_point'] = entry_fig
+                        else:
+                            st.warning("Entry point chart unavailable (entry_point() returned None) — "
+                                       "the email will omit the Entry Point section")
+                            print("[charts] entry_point() returned None (email path)")
                     # Prepare charts data for saving
                     charts_data = {
                         'main_graph': st.session_state.get('graph_backtest'),
@@ -2173,6 +2189,11 @@ with tab3:
                     # Add entry point (only if not cross corridor)
                     if not is_cross_corridor:
                         charts_data['entry_point'] = st.session_state.get('fig_entry_point')
+                    _missing = [k for k in ('sectorial', 'sectorial_long', 'sectorial_short', 'entry_point')
+                                if k in charts_data and charts_data[k] is None]
+                    if _missing:
+                        st.warning(f"Charts not available for the email: {', '.join(_missing)} "
+                                   f"(see the warnings above / the console '[charts]' lines for the cause)")
                     # Save charts to disk
                     saved_files = func_graph.save_charts_to_disk(charts_data)
                     # Prepare email parameters
