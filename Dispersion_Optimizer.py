@@ -194,8 +194,7 @@ def _decorate_entry_point(fig):
         # label card: value in bold navy, percentile underneath in grey, thin grey leader line
         # to the dot (the email renderer draws the same card)
         fig.add_annotation(x=x_last, y=last,
-                           text=(f"<b>{last:.1f}</b><br><span style='font-size:11px;color:#666666'>"
-                                 f"{_ordinal(round(pct))} percentile</span>"),
+                           text=f"<b>{_ordinal(round(pct))} percentile</b>",
                            showarrow=True, arrowhead=0, arrowcolor='#999999', arrowwidth=1,
                            ax=-90, ay=-55, align='center',
                            font=dict(color=navy, size=15), bgcolor='rgba(255,255,255,0.94)',
