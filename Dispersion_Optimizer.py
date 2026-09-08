@@ -150,7 +150,14 @@ def _get_short_leg_display(tickers):
 _PIE_GREYS = ['rgb(37,37,37)', 'rgb(82,82,82)', 'rgb(115,115,115)', 'rgb(150,150,150)', 'rgb(189,189,189)',
               'rgb(217,217,217)', 'rgb(240,240,240)']
 
-_UI_BUILD = "2026-09-08 email-diag-2"
+_UI_BUILD = "2026-09-08 email-diag-3"
+
+def _weights_as_fractions(ws):
+    """Editor weights are in percent (10 = 10%); entry_point() applies them as they come, which
+    put the implied-vol spread on a x100 scale (thousands). Hand it fractions summing to 1."""
+    ws = [abs(float(w)) for w in (list(ws) if ws is not None else [])]
+    s = sum(ws)
+    return [w / s for w in ws] if s > 0 else ws
 
 def _sector_pies_from_bloomberg(long_tickers, short_tickers=None):
     """Sector split straight from Bloomberg (GICS_SECTOR_NAME via xbbg), house-style pies.
@@ -1871,7 +1878,7 @@ with tab3:
             st.session_state['backtest_completed'] = True
             for key in ['fig_split', 'fig_60d_split', 'fig_entry_point', 'email_60d_graph',
                         'fig_sectorial', 'fig_sectorial_long', 'fig_sectorial_short',
-                        'fig_weights_pie', 'carry_result_series']:
+                        'carry_result_series']:
                 if key in st.session_state:
                     del st.session_state[key]
             # Run backtest
@@ -2019,8 +2026,8 @@ with tab3:
                 entry_fig = func_graph.entry_point(
                     st.session_state.get('long_tickers', []),
                     st.session_state.get('short_tickers', []),
-                    st.session_state.get('long_weights', []),
-                    st.session_state.get('short_weights', []),
+                    _weights_as_fractions(st.session_state.get('long_weights', [])),
+                    _weights_as_fractions(st.session_state.get('short_weights', [])),
                     start_date=bt_start_date,
                     end_date=date.today(),
                     is_cross_corridor=False
@@ -2199,26 +2206,6 @@ with tab3:
                 st.plotly_chart(st.session_state['graph_backtest'], use_container_width=True, key="plotly_bt_main")
         # Display sectorial analysis
         st.subheader("📊 Sectorial Analysis")
-        # Weights pie per stock (corridor asset) — cross-corridor shows the
-        # per-stock split directly; mono shows the long legs.
-        _lt = st.session_state.get('long_tickers')
-        _lw = st.session_state.get('long_weights')
-        if _lt and _lw:
-            _pie_pairs = sorted(zip([str(t).replace(' Equity', '').replace(' Index', '') for t in _lt],
-                                    [abs(float(w)) for w in _lw]), key=lambda p: p[1], reverse=True)
-            if len(_pie_pairs) > 20:  # large baskets: 19 biggest + Other, as in the email
-                _tail = _pie_pairs[19:]
-                _pie_pairs = _pie_pairs[:19] + [(f"Other ({len(_tail)})", sum(v for _, v in _tail))]
-            _pie_fig = go.Figure(go.Pie(labels=[p[0] for p in _pie_pairs],
-                                        values=[p[1] for p in _pie_pairs],
-                                        sort=False, textinfo="percent",
-                                        marker=dict(colors=[_PIE_BLUES[i % len(_PIE_BLUES)]
-                                                            for i in range(len(_pie_pairs))],
-                                                    line=dict(color='white', width=2))))
-            _pie_fig.update_layout(title="Weights by stock", height=350,
-                                   margin=dict(t=40, b=20, l=20, r=20))
-            st.session_state['fig_weights_pie'] = _pie_fig
-            st.plotly_chart(_pie_fig, use_container_width=True, key="plotly_weights_pie")
         is_dual = st.session_state.get('is_dual_sectorial', False)
         if is_dual:
             if 'fig_sectorial_long' in st.session_state and 'fig_sectorial_short' in st.session_state:
@@ -2256,7 +2243,7 @@ with tab3:
             key="recipient_email_input",
             placeholder="example@company.com"
         )
-        st.checkbox("Show email diagnostics", value=True, key="email_diag",
+        st.checkbox("Show email diagnostics", value=False, key="email_diag",
                     help="Prints, on screen, which _charts module is loaded, what each chart object is, "
                          "what the renderers produce and which sections the email HTML gets.")
         col_email, col_60d, col_clear = st.columns(3)
@@ -2353,8 +2340,8 @@ with tab3:
                         entry_fig = func_graph.entry_point(
                             st.session_state.get('long_tickers', []),
                             st.session_state.get('short_tickers', []),
-                            st.session_state.get('long_weights', []),
-                            st.session_state.get('short_weights', []),
+                            _weights_as_fractions(st.session_state.get('long_weights', [])),
+                            _weights_as_fractions(st.session_state.get('short_weights', [])),
                             start_date=bt_start_date,
                             end_date=date.today(),
                             is_cross_corridor=False
@@ -2377,7 +2364,6 @@ with tab3:
                         'is_cross_corridor': is_cross_corridor,
                         'has_short_leg': st.session_state.ds_res.iloc[:, 1].abs().sum() > 0,
                         'is_dual_sectorial': st.session_state.get('is_dual_sectorial', False),
-                        'weights_pie': st.session_state.get('fig_weights_pie'),
                     }
                     # Add sectorial graphs
                     if charts_data['is_dual_sectorial']:
