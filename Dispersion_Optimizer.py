@@ -186,15 +186,20 @@ def _decorate_entry_point(fig):
             x_last = pd.Timestamp(x_last).to_pydatetime()
         except (TypeError, ValueError):
             pass
-        fig.add_hline(y=last, line_dash='dot', line_color=red, line_width=1)
+        navy = '#00395D'
+        fig.add_hline(y=last, line_dash='dot', line_color='rgba(220,0,0,0.55)', line_width=1)
         fig.add_trace(go.Scatter(x=[x_last], y=[last], mode='markers', name='Today', showlegend=False,
-                                 marker=dict(color=red, size=10, line=dict(color='white', width=1)),
+                                 marker=dict(color=red, size=11, line=dict(color='white', width=1.5)),
                                  hovertemplate=f'{label}<extra></extra>'))
-        # label in a white box, arrow to the dot (kept clear of the series; the email renderer draws it too)
-        fig.add_annotation(x=x_last, y=last, text=f"<b>{label}</b>", showarrow=True, arrowhead=0,
-                           arrowcolor=red, arrowwidth=1, ax=-80, ay=-50,
-                           font=dict(color=red, size=13), bgcolor='white',
-                           bordercolor=red, borderwidth=1, borderpad=4)
+        # label card: value in bold navy, percentile underneath in grey, thin grey leader line
+        # to the dot (the email renderer draws the same card)
+        fig.add_annotation(x=x_last, y=last,
+                           text=(f"<b>{last:.1f}</b><br><span style='font-size:11px;color:#666666'>"
+                                 f"{_ordinal(round(pct))} percentile</span>"),
+                           showarrow=True, arrowhead=0, arrowcolor='#999999', arrowwidth=1,
+                           ax=-90, ay=-55, align='center',
+                           font=dict(color=navy, size=15), bgcolor='rgba(255,255,255,0.94)',
+                           bordercolor='#cccccc', borderwidth=1, borderpad=6)
         return fig
     except Exception as e:
         print(f"[charts] entry point decoration skipped: {e}")

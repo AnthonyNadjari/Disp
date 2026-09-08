@@ -237,31 +237,35 @@ def _render_line_to_png(fig: go.Figure, title: str,
                                color=col, linewidth=1.2, linestyle=ls, zorder=1)
             except (TypeError, ValueError):
                 pass
-        # Annotations added with add_annotation (label box + arrow, e.g. the last-point marker)
+        # Annotations added with add_annotation (label box + leader line, e.g. the last-point
+        # marker): first line big and bold, following lines (after <br>) smaller and grey
+        from matplotlib.offsetbox import AnnotationBbox, TextArea, VPacker
         for an in (getattr(fig.layout, 'annotations', None) or []):
             try:
                 if an.text is None or an.x is None or an.y is None:
                     continue
                 xv = pd.to_datetime(an.x) if any_dates else an.x
-                txt = re.sub(r'<br\s*/?>', '\n', str(an.text))
-                txt = re.sub(r'<[^>]+>', '', txt)
+                raw = re.sub(r'<br\s*/?>', '\n', str(an.text))
+                parts = [re.sub(r'<[^>]+>', '', s).strip() for s in raw.split('\n')]
+                parts = [s for s in parts if s] or ['']
                 afont = getattr(an, 'font', None)
-                col = _color_to_rgba(getattr(afont, 'color', None) if afont is not None else None) or '#333'
+                col = _color_to_rgba(getattr(afont, 'color', None) if afont is not None else None) or BARCLAYS_NAVY
                 bg = _color_to_rgba(getattr(an, 'bgcolor', None))
                 bc = _color_to_rgba(getattr(an, 'bordercolor', None))
-                kw = dict(fontsize=18, fontweight='bold', color=col, ha='center', va='center', zorder=6)
-                if bg is not None or bc is not None:
-                    kw['bbox'] = dict(boxstyle='round,pad=0.4', fc=bg if bg is not None else 'white',
-                                      ec=bc if bc is not None else 'none', lw=1.2)
-                if getattr(an, 'showarrow', True):
-                    axp = float(an.ax) if an.ax is not None else -60.0
-                    ayp = float(an.ay) if an.ay is not None else -40.0
-                    ax.annotate(txt, (xv, float(an.y)), xytext=(axp * 1.5, -ayp * 1.5),
-                                textcoords='offset points',
-                                arrowprops=dict(arrowstyle='-', color=bc if bc is not None else col, lw=1.2),
-                                **kw)
-                else:
-                    ax.annotate(txt, (xv, float(an.y)), xytext=(0, 0), textcoords='offset points', **kw)
+                lc = _color_to_rgba(getattr(an, 'arrowcolor', None)) or '#999999'
+                texts = [TextArea(parts[0], textprops=dict(size=21, weight='bold', color=col))]
+                texts += [TextArea(s, textprops=dict(size=14, color='#666666')) for s in parts[1:]]
+                show_arrow = getattr(an, 'showarrow', True)
+                axp = float(an.ax) if an.ax is not None else -60.0
+                ayp = float(an.ay) if an.ay is not None else -40.0
+                ab = AnnotationBbox(
+                    VPacker(children=texts, align='center', pad=0, sep=5), (xv, float(an.y)),
+                    xybox=(axp * 1.5, -ayp * 1.5) if show_arrow else (0, 0), boxcoords='offset points',
+                    frameon=True, zorder=6,
+                    bboxprops=dict(boxstyle='round,pad=0.7', fc=bg if bg is not None else 'white',
+                                   ec=bc if bc is not None else 'none', lw=1.0),
+                    arrowprops=dict(arrowstyle='-', color=lc, lw=1.0) if show_arrow else None)
+                ax.add_artist(ab)
             except Exception:
                 pass
 
