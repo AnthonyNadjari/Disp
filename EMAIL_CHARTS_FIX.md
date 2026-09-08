@@ -47,7 +47,7 @@ are the ones already there (`io`, `base64`, `numpy as np`, `pandas as pd`,
 
 ---
 
-## 1. `_render_line_to_png` — REPLACE
+## 1. `_render_line_to_png` — REPLACE (updated: draws the entry-point last-point marker, its label box and level line)
 
 ```python
 def _render_line_to_png(fig: go.Figure, title: str,
@@ -122,7 +122,7 @@ def _render_line_to_png(fig: go.Figure, title: str,
         y = _as_list(trace.y)
         if len(x) == 0 or len(y) == 0:
             continue
-        label = trace.name or ''
+        label = (trace.name or '') if getattr(trace, 'showlegend', True) is not False else ''
 
         # Determine which axis: check trace.yaxis property
         # Plotly stores 'y2' for secondary_y traces
@@ -195,10 +195,20 @@ def _render_line_to_png(fig: go.Figure, title: str,
             target_ax.scatter(x_arr, y_arr, color=line_color, s=ms ** 2, label=label, zorder=4)
         if 'text' in mode and getattr(trace, 'text', None) is not None:
             texts = [trace.text] * len(y_arr) if isinstance(trace.text, str) else list(trace.text)
+            # honour plotly textposition ('middle left', 'top center', ...) and textfont colour
+            _tp = getattr(trace, 'textposition', None) or 'top center'
+            _tp = str(_tp[0] if isinstance(_tp, (list, tuple)) else _tp)
+            ha = 'left' if 'right' in _tp else ('right' if 'left' in _tp else 'center')
+            va = 'bottom' if 'top' in _tp else ('top' if 'bottom' in _tp else 'center')
+            dx = 10 if ha == 'left' else (-10 if ha == 'right' else 0)
+            dy = 8 if va == 'bottom' else (-8 if va == 'top' else 0)
+            _tf = getattr(trace, 'textfont', None)
+            tcol = _color_to_rgba(getattr(_tf, 'color', None) if _tf is not None else None) or '#333'
             for xi, yi, txt in zip(x_arr, y_arr, texts):
                 if yi == yi:
-                    target_ax.annotate(str(txt), (xi, yi), fontsize=16, xytext=(0, 8),
-                                       textcoords='offset points', ha='center', color='#333')
+                    target_ax.annotate(str(txt), (xi, yi), fontsize=18, fontweight='bold',
+                                       xytext=(dx, dy), textcoords='offset points',
+                                       ha=ha, va=va, color=tcol)
 
         # Fill area
         if getattr(trace, 'fill', None) == 'tozeroy':
@@ -226,6 +236,33 @@ def _render_line_to_png(fig: go.Figure, title: str,
                     ax.axvline(pd.to_datetime(sh.x0) if any_dates else sh.x0,
                                color=col, linewidth=1.2, linestyle=ls, zorder=1)
             except (TypeError, ValueError):
+                pass
+        # Annotations added with add_annotation (label box + arrow, e.g. the last-point marker)
+        for an in (getattr(fig.layout, 'annotations', None) or []):
+            try:
+                if an.text is None or an.x is None or an.y is None:
+                    continue
+                xv = pd.to_datetime(an.x) if any_dates else an.x
+                txt = re.sub(r'<br\s*/?>', '\n', str(an.text))
+                txt = re.sub(r'<[^>]+>', '', txt)
+                afont = getattr(an, 'font', None)
+                col = _color_to_rgba(getattr(afont, 'color', None) if afont is not None else None) or '#333'
+                bg = _color_to_rgba(getattr(an, 'bgcolor', None))
+                bc = _color_to_rgba(getattr(an, 'bordercolor', None))
+                kw = dict(fontsize=18, fontweight='bold', color=col, ha='center', va='center', zorder=6)
+                if bg is not None or bc is not None:
+                    kw['bbox'] = dict(boxstyle='round,pad=0.4', fc=bg if bg is not None else 'white',
+                                      ec=bc if bc is not None else 'none', lw=1.2)
+                if getattr(an, 'showarrow', True):
+                    axp = float(an.ax) if an.ax is not None else -60.0
+                    ayp = float(an.ay) if an.ay is not None else -40.0
+                    ax.annotate(txt, (xv, float(an.y)), xytext=(axp * 1.5, -ayp * 1.5),
+                                textcoords='offset points',
+                                arrowprops=dict(arrowstyle='-', color=bc if bc is not None else col, lw=1.2),
+                                **kw)
+                else:
+                    ax.annotate(txt, (xv, float(an.y)), xytext=(0, 0), textcoords='offset points', **kw)
+            except Exception:
                 pass
 
     # Styling - primary axis

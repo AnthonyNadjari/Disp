@@ -150,7 +150,55 @@ def _get_short_leg_display(tickers):
 _PIE_GREYS = ['rgb(37,37,37)', 'rgb(82,82,82)', 'rgb(115,115,115)', 'rgb(150,150,150)', 'rgb(189,189,189)',
               'rgb(217,217,217)', 'rgb(240,240,240)']
 
-_UI_BUILD = "2026-09-08 email-diag-3"
+_UI_BUILD = "2026-09-08 entry-point-marker"
+
+def _ordinal(n):
+    n = int(n)
+    return f"{n}{'th' if 10 <= n % 100 <= 20 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
+
+def _decorate_entry_point(fig):
+    """Entry-point chart: red dot on the last point, its value and historical percentile
+    written next to it, and a dotted line at that level across the chart. Works on the
+    plotly figure (interface) and survives the email renderer (marker-only trace with text
+    + hline shape)."""
+    try:
+        if fig is None or not getattr(fig, 'data', None):
+            return fig
+        base = None
+        for t in fig.data:
+            if getattr(t, 'type', 'scatter') in ('scatter', 'scattergl') and t.y is not None and len(t.y) > 1:
+                base = t
+                break
+        if base is None:
+            return fig
+        ys = np.array([np.nan if v is None else float(v) for v in base.y], dtype=float)
+        ok = ~np.isnan(ys)
+        if ok.sum() < 2:
+            return fig
+        xs = list(base.x) if base.x is not None else list(range(len(ys)))
+        idx = int(np.where(ok)[0][-1])
+        last = float(ys[idx])
+        pct = float((ys[ok] < last).mean() * 100)  # share of the history below today's level
+        label = f"{last:.1f}  ({_ordinal(round(pct))} percentile)"
+        red = 'rgb(220,0,0)'
+        x_last = xs[idx]
+        try:
+            x_last = pd.Timestamp(x_last).to_pydatetime()
+        except (TypeError, ValueError):
+            pass
+        fig.add_hline(y=last, line_dash='dot', line_color=red, line_width=1)
+        fig.add_trace(go.Scatter(x=[x_last], y=[last], mode='markers', name='Today', showlegend=False,
+                                 marker=dict(color=red, size=10, line=dict(color='white', width=1)),
+                                 hovertemplate=f'{label}<extra></extra>'))
+        # label in a white box, arrow to the dot (kept clear of the series; the email renderer draws it too)
+        fig.add_annotation(x=x_last, y=last, text=f"<b>{label}</b>", showarrow=True, arrowhead=0,
+                           arrowcolor=red, arrowwidth=1, ax=-80, ay=-50,
+                           font=dict(color=red, size=13), bgcolor='white',
+                           bordercolor=red, borderwidth=1, borderpad=4)
+        return fig
+    except Exception as e:
+        print(f"[charts] entry point decoration skipped: {e}")
+        return fig
 
 def _weights_as_fractions(ws):
     """Editor weights are in percent (10 = 10%); entry_point() applies them as they come, which
@@ -2033,6 +2081,7 @@ with tab3:
                     is_cross_corridor=False
                 )
                 if entry_fig is not None:
+                    entry_fig = _decorate_entry_point(entry_fig)
                     st.session_state['fig_entry_point'] = entry_fig
                     st.session_state.setdefault('chart_debug', {})['entry_point returned'] = (
                         f"{type(entry_fig).__name__} with {len(getattr(entry_fig, 'data', []))} traces")
@@ -2347,6 +2396,7 @@ with tab3:
                             is_cross_corridor=False
                         )
                         if entry_fig is not None:
+                            entry_fig = _decorate_entry_point(entry_fig)
                             st.session_state['fig_entry_point'] = entry_fig
                             st.session_state.setdefault('chart_debug', {})['entry_point returned (email path)'] = (
                                 f"{type(entry_fig).__name__} with {len(getattr(entry_fig, 'data', []))} traces")
