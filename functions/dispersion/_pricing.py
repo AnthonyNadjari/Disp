@@ -190,6 +190,178 @@ from functions.common.pricing_utils import (
 )
 
 
+# ── FPF string templating ─────────────────────────────────────────────────────
+class _FpfTemplateEngine:
+    """Per-ticker FPF strings without one ``to_fpf_string()`` (2-4 s) per clone.
+
+    Every per-ticker FPF of the batch path is ``ref.clone(...)`` of a reference
+    object where only the leg asset / strike / cap, the corridor asset and the
+    KO asset change — dates, observation schedule, payment dates, barriers and
+    every other field come from the reference untouched.  So each (reference
+    object, clone shape) is serialized ONCE with sentinel values and the
+    per-ticker strings are rendered by substituting the sentinels.
+
+    Safety, in order:
+      1. a template is only accepted if every sentinel is present in the
+         serialized string and the serializer's float format is recognised;
+      2. the FIRST render of every site kind is compared byte-for-byte with the
+         legacy ``clone(...).to_fpf_string()`` of the very same spec (and of
+         the very same reference object — mono references are clones of the
+         cross reference, and rendering goes through that root: the check
+         proves the substitution is exact);
+      3. any failure disables templating for the whole run — loudly — and
+         the legacy path is used for everything.
+    Thread-safe (the serialization pools call ``render`` concurrently).
+    """
+
+    _VA, _CA, _KO = "__TPLVA__", "__TPLCA__", "__TPLKO__"
+    _S, _C = 0.123456789, 0.987654321          # numeric sentinels (never rounded away by %g-style formats)
+    _FMTS = (
+        ("repr", repr),
+        ("%.17g", lambda v: "%.17g" % v), ("%.15g", lambda v: "%.15g" % v),
+        ("%.12g", lambda v: "%.12g" % v), ("%.10g", lambda v: "%.10g" % v),
+        ("%.9f", lambda v: "%.9f" % v), ("%.8f", lambda v: "%.8f" % v),
+    )
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._templates = {}          # key -> (template, fmt_fn)  |  None = shape unsupported
+        self._roots = {}              # id(derived reference) -> root reference object
+        self._checked_kinds = set()
+        self.enabled = True
+        self.disabled_reason = None
+        self.n_rendered = 0
+        self.n_legacy = 0
+        self.n_templates = 0
+
+    # ---- the ONE clone shape every site uses (kept identical to the old inline code) ----
+    @staticmethod
+    def legacy_obj(ref, leg_kwargs, vd_kwargs, corr, ko):
+        return ref.clone(
+            varianceDetails=ref.varianceDetails.clone(
+                varianceAssetsAndIndexLegDetails=[
+                    ref.varianceDetails.varianceAssetsAndIndexLegDetails[0].clone(**leg_kwargs)
+                ],
+                **vd_kwargs,
+            ),
+            corridorDefinition=Just(ref.corridorDefinition.value.clone(
+                corridorAssets=[corridorCovarianceSwap_v4.CorridorAssets(
+                    corridorAsset=corr, corridorMultiplier=1.0, corridorAssetLag=0
+                )]
+            )),
+            koDetails=ref.koDetails.clone(
+                koAssets=[corridorCovarianceSwap_v4.KoAssets(
+                    koAsset=ko, koAssetMultiplier=1.0, koAssetLag=0
+                )]
+            ),
+        )
+
+    def register_derived(self, derived, root):
+        """`derived` was produced by `root.clone(...)` with a shape whose fields
+        are ALL overridden again at render time — so it can be rendered from
+        the root's template (one template per schedule group, not per name)."""
+        self._roots[id(derived)] = self._roots.get(id(root), root)
+
+    def disable(self, reason):
+        with self._lock:
+            if self.enabled:
+                self.enabled = False
+                self.disabled_reason = reason
+        _safe_print(f"[FPF-TEMPLATE] DISABLED — falling back to clone()+to_fpf_string() "
+                    f"for every FPF (slow but exact): {reason}")
+
+    # ---- internals ----
+    @staticmethod
+    def _cap_kind(leg_kwargs):
+        if "legCap" not in leg_kwargs:
+            return "absent"
+        cap = leg_kwargs["legCap"]
+        return "just" if hasattr(cap, "value") else "nothing"
+
+    def _key(self, root, leg_kwargs, vd_kwargs):
+        consts = tuple(sorted((k, repr(v)) for k, v in leg_kwargs.items()
+                              if k not in ("asset", "strike", "legCap")))
+        return (id(root), consts, "strike" in leg_kwargs, self._cap_kind(leg_kwargs),
+                tuple(sorted((k, repr(v)) for k, v in vd_kwargs.items())))
+
+    def _build(self, root, leg_kwargs, vd_kwargs):
+        """Serialize the reference ONCE with sentinels; returns (template, fmt) or None."""
+        lk = dict(leg_kwargs)
+        lk["asset"] = self._VA
+        if "strike" in lk:
+            lk["strike"] = self._S
+        cap_kind = self._cap_kind(leg_kwargs)
+        if cap_kind == "just":
+            lk["legCap"] = Just(self._C)
+        tpl = self.legacy_obj(root, lk, vd_kwargs, self._CA, self._KO).to_fpf_string()
+        for sent in (self._VA, self._CA, self._KO):
+            if sent not in tpl:
+                raise RuntimeError(f"sentinel {sent} not found in serialized FPF")
+        if "strike" not in lk and cap_kind != "just":
+            return tpl, None
+        for _name, fn in self._FMTS:
+            ok = ("strike" not in lk or fn(self._S) in tpl) and (cap_kind != "just" or fn(self._C) in tpl)
+            if ok:
+                return tpl, fn
+        raise RuntimeError("serializer float format not recognised (strike/cap sentinels not found verbatim)")
+
+    def _render_from(self, tpl, fmt, leg_kwargs, corr, ko):
+        s = tpl.replace(self._VA, str(leg_kwargs["asset"])).replace(self._CA, str(corr)).replace(self._KO, str(ko))
+        if "strike" in leg_kwargs:
+            s = s.replace(fmt(self._S), fmt(float(leg_kwargs["strike"])))
+        if self._cap_kind(leg_kwargs) == "just":
+            s = s.replace(fmt(self._C), fmt(float(leg_kwargs["legCap"].value)))
+        return s
+
+    # ---- public ----
+    def render(self, ref, leg_kwargs, vd_kwargs, corr, ko, kind="fpf"):
+        """The FPF string for `ref.clone(<shape>)` — templated when proven exact,
+        legacy clone()+to_fpf_string() otherwise."""
+        if self.enabled:
+            try:
+                root = self._roots.get(id(ref), ref)
+                key = self._key(root, leg_kwargs, vd_kwargs)
+                with self._lock:
+                    entry = self._templates.get(key, "missing")
+                if entry == "missing":
+                    try:
+                        entry = self._build(root, leg_kwargs, vd_kwargs)
+                    except Exception as e:
+                        entry = None
+                        _safe_print(f"[FPF-TEMPLATE] shape unsupported ({kind}): {type(e).__name__}: {e} "
+                                    f"— legacy path for this shape")
+                    with self._lock:
+                        self._templates[key] = entry
+                        if entry is not None:
+                            self.n_templates += 1
+                if entry is not None:
+                    tpl, fmt = entry
+                    out = self._render_from(tpl, fmt, leg_kwargs, corr, ko)
+                    with self._lock:
+                        first = kind not in self._checked_kinds
+                        if first:
+                            self._checked_kinds.add(kind)
+                    if first:
+                        legacy = self.legacy_obj(ref, leg_kwargs, vd_kwargs, corr, ko).to_fpf_string()
+                        if legacy != out:
+                            i = next((j for j, (a, b) in enumerate(zip(legacy, out)) if a != b), min(len(legacy), len(out)))
+                            self.disable(f"kind={kind}: templated string differs from legacy at char {i}: "
+                                         f"legacy[..]={legacy[max(0, i-40):i+40]!r} templated[..]={out[max(0, i-40):i+40]!r}")
+                            return legacy
+                    with self._lock:
+                        self.n_rendered += 1
+                    return out
+            except Exception as e:
+                self.disable(f"kind={kind}: {type(e).__name__}: {e}")
+        with self._lock:
+            self.n_legacy += 1
+        return self.legacy_obj(ref, leg_kwargs, vd_kwargs, corr, ko).to_fpf_string()
+
+    def stats(self):
+        return (f"{self.n_rendered} templated / {self.n_legacy} legacy / {self.n_templates} templates"
+                + ("" if self.enabled else " / TEMPLATING DISABLED"))
+
+
 def _unfunded_zcb(currency: str, start_date, maturity_date, snap_name: str = None) -> float:
     """Unfunded zero-coupon bond (discount factor) at 100% reoffer.
 
@@ -2710,6 +2882,9 @@ class PricingEngine(VolSwapMixin):
             # For LSV: build LSV and LSV0 versions of mono EV (uncapped, same as cross)
 
             mono_ref_objs = {}
+            # One template per (schedule-group reference, clone shape) serves every
+            # per-ticker string of this run: build phase + the three post-process pools.
+            _tpl = _FpfTemplateEngine()
 
             for corr in unique_corr_assets:
                 ref_idx = corr_assets.index(corr)
@@ -2830,6 +3005,8 @@ class PricingEngine(VolSwapMixin):
                         mono_ev_lsv_obj,
                         mono_ev_lsv_zero_obj,
                     )
+                    _tpl.register_derived(mono_ev_lsv_obj, mono_ref_obj)
+                    _tpl.register_derived(mono_ev_lsv_zero_obj, mono_ref_obj)
                 else:
                     mono_ref_objs[corr] = (
                         mono_ev_obj,
@@ -2837,26 +3014,17 @@ class PricingEngine(VolSwapMixin):
                         None,
                         None,
                     )
-            # ── Step 2: Clone FPF objects per ticker (no HTTP — instant) ──
+                # Mono references are clones of the cross reference whose fields
+                # are all overridden again at every render site → one template
+                # per schedule group covers the mono legs too.
+                _tpl.register_derived(mono_ev_obj, mono_ref_obj)
+            # ── Step 2: Per-ticker FPF strings (templated — see _FpfTemplateEngine) ──
+            _MONO_LEG = dict(basketMultiplier=1, strike=0.000001, legCap="Nothing",
+                             legFloor="Nothing", legMultiplier=1.0)   # == the mono clone shape above
+
             def _clone_for_ticker(ref_obj, ticker, corr_asset):
-                """Clone FPF with new ticker/corridor. No string replace, no HTTP."""
-                return ref_obj.clone(
-                    varianceDetails=ref_obj.varianceDetails.clone(
-                        varianceAssetsAndIndexLegDetails=[
-                            ref_obj.varianceDetails.varianceAssetsAndIndexLegDetails[0].clone(asset=ticker)
-                        ]
-                    ),
-                    corridorDefinition=Just(ref_obj.corridorDefinition.value.clone(
-                        corridorAssets=[corridorCovarianceSwap_v4.CorridorAssets(
-                            corridorAsset=corr_asset, corridorMultiplier=1.0, corridorAssetLag=0
-                        )]
-                    )),
-                    koDetails=ref_obj.koDetails.clone(
-                        koAssets=[corridorCovarianceSwap_v4.KoAssets(
-                            koAsset=ticker, koAssetMultiplier=1.0, koAssetLag=0
-                        )]
-                    ),
-                ).to_fpf_string()
+                """Cross FPF string for `ticker`: reference with new asset / corridor / KO."""
+                return _tpl.render(ref_obj, {"asset": ticker}, {}, corr_asset, ticker, kind="build_cross")
 
             # ── Parallelize FPF serialization (CPU-bound, independent) ──
             t_clone = time.time()
@@ -2879,7 +3047,9 @@ class PricingEngine(VolSwapMixin):
             def _do_clone(task):
                 kind, key, obj, ticker, corr = task
                 if ticker is None:
-                    return (kind, key, obj.to_fpf_string())
+                    # mono reference (key = corridor asset): same string as obj.to_fpf_string()
+                    return (kind, key, _tpl.render(obj, dict(_MONO_LEG, asset=key), {"isOptionOnVariance": True},
+                                                   key, key, kind="build_mono"))
                 return (kind, key, _clone_for_ticker(obj, ticker, corr))
 
             with ThreadPoolExecutor(max_workers=8) as pool:
@@ -2894,7 +3064,8 @@ class PricingEngine(VolSwapMixin):
                         ev_mono_lsv_zero_fpfs[key] = fpf_str
 
             dbg.info("batch",
-                     f"[TIMING] Clone+serialize: {time.time() - t_clone:.2f}s ({len(_clone_tasks)} FPFs, 8 threads)")
+                     f"[TIMING] Clone+serialize: {time.time() - t_clone:.2f}s ({len(_clone_tasks)} FPFs, "
+                     f"{_tpl.stats()})")
 
             dbg.ok("batch", f"FPFs built in {time.time() - t_fpf:.2f}s "
                             f"({len(tickers)} cross + {len(unique_corr_assets)} mono)")
@@ -3998,30 +4169,14 @@ class PricingEngine(VolSwapMixin):
 
                 # Build solved FPFs using object clone (no HTTP)
                 def _solved_fpf_obj(ref_obj, ticker_name, corr_name, strike_variance):
-                    """Clone the ref FPF with the solved strike (cheap — the
-                    expensive part is to_fpf_string(), pooled after the loop)."""
+                    """Spec of the solved FPF (reference + clone shape); rendered
+                    through the template engine in the pooled step after the loop."""
                     cap = Just((cfg.cap_multiplier ** 2 - 1) * strike_variance) if cfg.is_capped else "Nothing"
-                    return ref_obj.clone(
-                        varianceDetails=ref_obj.varianceDetails.clone(
-                            varianceAssetsAndIndexLegDetails=[
-                                ref_obj.varianceDetails.varianceAssetsAndIndexLegDetails[0].clone(
-                                    asset=ticker_name, basketMultiplier=1, strike=strike_variance,
-                                    legCap=cap, legFloor="Nothing", legMultiplier=1.0,
-                                )
-                            ],
-                            isOptionOnVariance=True,
-                        ),
-                        corridorDefinition=Just(ref_obj.corridorDefinition.value.clone(
-                            corridorAssets=[corridorCovarianceSwap_v4.CorridorAssets(
-                                corridorAsset=corr_name, corridorMultiplier=1.0, corridorAssetLag=0
-                            )]
-                        )),
-                        koDetails=ref_obj.koDetails.clone(
-                            koAssets=[corridorCovarianceSwap_v4.KoAssets(
-                                koAsset=ticker_name, koAssetMultiplier=1.0, koAssetLag=0
-                            )]
-                        ),
-                    )
+                    return (ref_obj,
+                            dict(asset=ticker_name, basketMultiplier=1, strike=strike_variance,
+                                 legCap=cap, legFloor="Nothing", legMultiplier=1.0),
+                            {"isOptionOnVariance": True},
+                            corr_name, ticker_name)
 
                 ticker_ref_obj = ev_cross_ref_objs[schedule_assets[idx]]
 
@@ -4268,7 +4423,7 @@ class PricingEngine(VolSwapMixin):
 
             def _safe_serialize(o):
                 try:
-                    return o.to_fpf_string(), None
+                    return _tpl.render(*o, kind="solved"), None
                 except Exception as _se:
                     return None, _se
 
@@ -4285,7 +4440,7 @@ class PricingEngine(VolSwapMixin):
             if _failed_tickers:
                 dbg.warn("batch", f"FPF serialization failed for: {sorted(_failed_tickers)}")
             dbg.info("batch", f"[TIMING] FPF serialization (solved, pooled): "
-                              f"{time.time() - _t_fpf_serial:.2f}s ({len(_fpf_serial_jobs)} FPFs, 8 threads)")
+                              f"{time.time() - _t_fpf_serial:.2f}s ({len(_fpf_serial_jobs)} FPFs, {_tpl.stats()})")
 
         # ── Phase 2b: Capped re-pricing (only if is_capped) ──
         if cfg.is_capped:
@@ -4346,30 +4501,14 @@ class PricingEngine(VolSwapMixin):
                     else:
                         ref_obj = ev_cross_ref_objs[sched_asset]
                         rics = [ticker, corr]
-                    # Clone with cap set (strike=0.000001 — we only need EV, not solved FPF)
-                    _cap_clone = ref_obj.clone(
-                        varianceDetails=ref_obj.varianceDetails.clone(
-                            varianceAssetsAndIndexLegDetails=[
-                                ref_obj.varianceDetails.varianceAssetsAndIndexLegDetails[0].clone(
-                                    asset=corr if variant in ('mono', 'lsv_mono') else ticker,
-                                    basketMultiplier=1, strike=0.000001,
-                                    legCap=Just(cap_value), legFloor="Nothing", legMultiplier=1.0,
-                                )
-                            ],
-                            isOptionOnVariance=True,
-                        ),
-                        corridorDefinition=Just(ref_obj.corridorDefinition.value.clone(
-                            corridorAssets=[corridorCovarianceSwap_v4.CorridorAssets(
-                                corridorAsset=corr, corridorMultiplier=1.0, corridorAssetLag=0
-                            )]
-                        )),
-                        koDetails=ref_obj.koDetails.clone(
-                            koAssets=[corridorCovarianceSwap_v4.KoAssets(
-                                koAsset=corr if variant in ('mono', 'lsv_mono') else ticker,
-                                koAssetMultiplier=1.0, koAssetLag=0
-                            )]
-                        ),
-                    )
+                    # Capped EV spec (strike=0.000001 — we only need EV, not solved FPF);
+                    # rendered through the template engine in the pooled step below.
+                    _leg_asset = corr if variant in ('mono', 'lsv_mono') else ticker
+                    _cap_clone = (ref_obj,
+                                  dict(asset=_leg_asset, basketMultiplier=1, strike=0.000001,
+                                       legCap=Just(cap_value), legFloor="Nothing", legMultiplier=1.0),
+                                  {"isOptionOnVariance": True},
+                                  corr, _leg_asset)
                     _cap_clone_jobs.append((_cap_clone, rics))
                     cap_task_map.append((idx, variant))
 
@@ -4380,7 +4519,7 @@ class PricingEngine(VolSwapMixin):
 
                     def _safe_serialize_inst(o):
                         try:
-                            return o.to_fpf_string(), None
+                            return _tpl.render(*o, kind="cap_instrument"), None
                         except Exception as _se:
                             return None, _se
 
@@ -4388,7 +4527,7 @@ class PricingEngine(VolSwapMixin):
                         _cap_fpf_strs = list(pool.map(_safe_serialize_inst,
                                                       [j[0] for j in _cap_clone_jobs]))
                     dbg.info("batch", f"[TIMING] FPF serialization (cap instruments, pooled): "
-                                      f"{time.time() - _t_cap_serial:.2f}s ({len(_cap_fpf_strs)} FPFs, 8 threads)")
+                                      f"{time.time() - _t_cap_serial:.2f}s ({len(_cap_fpf_strs)} FPFs, {_tpl.stats()})")
                     for (idx_v, variant_v), (_, rics), (capped_fpf_str, err) in zip(
                             cap_task_map, _cap_clone_jobs, _cap_fpf_strs):
                         if err is not None:
@@ -4465,30 +4604,15 @@ class PricingEngine(VolSwapMixin):
 
                 # Compute real priced capped strikes and build final FPF strings
                 def _build_capped_fpf_obj(ref_obj, ticker, corr, strike_vol):
-                    """Clone the capped FPF with the final priced strike (serialization pooled)."""
+                    """Spec of the capped FPF with the final priced strike; rendered
+                    through the template engine in the pooled step below."""
                     strike_var = strike_vol ** 2
                     cap_val = (cfg.cap_multiplier ** 2 - 1) * strike_var
-                    return ref_obj.clone(
-                        varianceDetails=ref_obj.varianceDetails.clone(
-                            varianceAssetsAndIndexLegDetails=[
-                                ref_obj.varianceDetails.varianceAssetsAndIndexLegDetails[0].clone(
-                                    asset=ticker, basketMultiplier=1, strike=strike_var,
-                                    legCap=Just(cap_val), legFloor="Nothing", legMultiplier=1.0,
-                                )
-                            ],
-                            isOptionOnVariance=True,
-                        ),
-                        corridorDefinition=Just(ref_obj.corridorDefinition.value.clone(
-                            corridorAssets=[corridorCovarianceSwap_v4.CorridorAssets(
-                                corridorAsset=corr, corridorMultiplier=1.0, corridorAssetLag=0
-                            )]
-                        )),
-                        koDetails=ref_obj.koDetails.clone(
-                            koAssets=[corridorCovarianceSwap_v4.KoAssets(
-                                koAsset=ticker, koAssetMultiplier=1.0, koAssetLag=0
-                            )]
-                        ),
-                    )
+                    return (ref_obj,
+                            dict(asset=ticker, basketMultiplier=1, strike=strike_var,
+                                 legCap=Just(cap_val), legFloor="Nothing", legMultiplier=1.0),
+                            {"isOptionOnVariance": True},
+                            corr, ticker)
 
                 _cap_str_serial_jobs = []  # [(result_obj, attr_name, clone_obj)]
                 for inst_idx, (idx, variant) in enumerate(cap_task_map):
@@ -4610,7 +4734,7 @@ class PricingEngine(VolSwapMixin):
 
                     def _safe_serialize_cap(o):
                         try:
-                            return o.to_fpf_string(), None
+                            return _tpl.render(*o, kind="solved_cap"), None
                         except Exception as _se:
                             return None, _se
 
@@ -4624,7 +4748,7 @@ class PricingEngine(VolSwapMixin):
                         else:
                             setattr(result_obj, attr, fpf_str)
                     dbg.info("batch", f"[TIMING] FPF serialization (solved capped, pooled): "
-                                      f"{time.time() - _t_cap_str:.2f}s ({len(_cap_str_strs)} FPFs, 8 threads)")
+                                      f"{time.time() - _t_cap_str:.2f}s ({len(_cap_str_strs)} FPFs, {_tpl.stats()})")
 
                 dbg.ok("batch",
                        f"Phase 2b capped pricing: {len(cap_instruments)} instruments in {time.time() - t_cap:.1f}s")
