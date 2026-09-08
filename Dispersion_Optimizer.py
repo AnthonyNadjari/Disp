@@ -147,7 +147,54 @@ def _get_short_leg_display(tickers):
         out.append(t)
     return ', '.join(out)
 
-_UI_BUILD = "2026-09-08 email-diag-1"
+_PIE_GREYS = ['rgb(37,37,37)', 'rgb(82,82,82)', 'rgb(115,115,115)', 'rgb(150,150,150)', 'rgb(189,189,189)',
+              'rgb(217,217,217)', 'rgb(240,240,240)']
+
+_UI_BUILD = "2026-09-08 email-diag-2"
+
+def _sector_pies_from_bloomberg(long_tickers, short_tickers=None):
+    """Sector split straight from Bloomberg (GICS_SECTOR_NAME via xbbg), house-style pies.
+    Same return shape as func_graph.graph_sectorial: {'fig': ...} or
+    {'is_dual': True, 'fig_long': ..., 'fig_short': ...} or {'error': ...}.
+    Count of names per sector (not weight adjusted), like the original Gaia_PP chart."""
+    def _sectors(tickers):
+        names = [str(t).strip() for t in (tickers or []) if str(t).strip().endswith(' Equity')]
+        if not names:
+            return {}, "no stock tickers (Bloomberg '... Equity' form expected)"
+        try:
+            df = blp.bdp(tickers=names, flds=['GICS_SECTOR_NAME'])
+        except Exception as e:
+            return {}, f"Bloomberg BDP failed: {e}"
+        if df is None or len(df) == 0:
+            return {}, "Bloomberg BDP returned nothing"
+        col = [c for c in df.columns if str(c).lower() == 'gics_sector_name']
+        if not col:
+            return {}, f"no GICS_SECTOR_NAME column in the BDP result ({list(df.columns)})"
+        sec = df[col[0]].dropna().astype(str)
+        if sec.empty:
+            return {}, "BDP returned no sector for any name"
+        return dict(sec.value_counts()), None
+
+    def _pie(counts, title, palette):
+        items = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+        fig = go.Figure(go.Pie(labels=[k for k, _ in items], values=[int(v) for _, v in items], sort=False,
+                               textinfo='percent',
+                               marker=dict(colors=[palette[i % len(palette)] for i in range(len(items))],
+                                           line=dict(color='white', width=2))))
+        fig.update_layout(title=title, height=400, margin=dict(t=50, b=20, l=20, r=20))
+        return fig
+
+    long_counts, err = _sectors(long_tickers)
+    if not long_counts:
+        return {'error': f"long leg: {err}"}
+    short_names = [str(t).strip() for t in (short_tickers or []) if str(t).strip().endswith(' Equity')]
+    if len(short_names) >= 2:
+        short_counts, _ = _sectors(short_names)
+        if short_counts:
+            return {'is_dual': True,
+                    'fig_long': _pie(long_counts, "Long Basket Sectors", _PIE_BLUES),
+                    'fig_short': _pie(short_counts, "Short Basket Sectors", _PIE_GREYS)}
+    return {'fig': _pie(long_counts, "Sector Repartition", _PIE_BLUES)}
 
 def _email_diagnostics(charts_data, email_params):
     """On-screen trace of the email chart pipeline: which _charts module is loaded (and
@@ -1883,8 +1930,23 @@ with tab3:
                         st.session_state['fig_sectorial'] = sectorial_result['fig']
                 else:
                     _sec_err = sectorial_result.get('error')
-                    st.warning(f"Sector chart unavailable — it will be missing from the email: {_sec_err}")
-                    print(f"[charts] graph_sectorial failed: {_sec_err}")
+                    print(f"[charts] graph_sectorial failed: {_sec_err} — building the sector pies from Bloomberg GICS")
+                    _fb = _sector_pies_from_bloomberg(st.session_state.get('long_tickers', []),
+                                                      st.session_state.get('short_tickers', []))
+                    if 'error' not in _fb:
+                        st.session_state['chart_debug']['sector pies'] = (
+                            f"built from Bloomberg GICS_SECTOR_NAME (graph_sectorial said: {_sec_err})")
+                        if _fb.get('is_dual'):
+                            st.session_state['is_dual_sectorial'] = True
+                            st.session_state['fig_sectorial_long'] = _fb['fig_long']
+                            st.session_state['fig_sectorial_short'] = _fb['fig_short']
+                        else:
+                            st.session_state['is_dual_sectorial'] = False
+                            st.session_state['fig_sectorial'] = _fb['fig']
+                    else:
+                        st.warning(f"Sector chart unavailable — it will be missing from the email. "
+                                   f"graph_sectorial: {_sec_err}; Bloomberg GICS: {_fb['error']}")
+                        print(f"[charts] sector pies from Bloomberg failed too: {_fb['error']}")
             else:
                 df_res_basket, backtest_metadata, graph_data, cross_corridor_data = _run_bt(
                     st.session_state.edited_df_bis, is_vol_swap, n_exp, local_cap,
@@ -1936,8 +1998,23 @@ with tab3:
                         st.session_state['fig_sectorial'] = sectorial_result['fig']
                 else:
                     _sec_err = sectorial_result.get('error')
-                    st.warning(f"Sector chart unavailable — it will be missing from the email: {_sec_err}")
-                    print(f"[charts] graph_sectorial failed: {_sec_err}")
+                    print(f"[charts] graph_sectorial failed: {_sec_err} — building the sector pies from Bloomberg GICS")
+                    _fb = _sector_pies_from_bloomberg(st.session_state.get('long_tickers', []),
+                                                      st.session_state.get('short_tickers', []))
+                    if 'error' not in _fb:
+                        st.session_state['chart_debug']['sector pies'] = (
+                            f"built from Bloomberg GICS_SECTOR_NAME (graph_sectorial said: {_sec_err})")
+                        if _fb.get('is_dual'):
+                            st.session_state['is_dual_sectorial'] = True
+                            st.session_state['fig_sectorial_long'] = _fb['fig_long']
+                            st.session_state['fig_sectorial_short'] = _fb['fig_short']
+                        else:
+                            st.session_state['is_dual_sectorial'] = False
+                            st.session_state['fig_sectorial'] = _fb['fig']
+                    else:
+                        st.warning(f"Sector chart unavailable — it will be missing from the email. "
+                                   f"graph_sectorial: {_sec_err}; Bloomberg GICS: {_fb['error']}")
+                        print(f"[charts] sector pies from Bloomberg failed too: {_fb['error']}")
                 # Generate entry point
                 entry_fig = func_graph.entry_point(
                     st.session_state.get('long_tickers', []),
@@ -2341,8 +2418,8 @@ with tab3:
                         'progress_callback': progress_callback
                     }
                     if st.session_state.get('email_diag', True):
-                        with st.expander("🔎 Email diagnostics — what goes into the email", expanded=True):
-                            st.code(_email_diagnostics(charts_data, email_params), language=None)
+                        st.markdown("**🔎 Email diagnostics — what goes into the email**")
+                        st.code(_email_diagnostics(charts_data, email_params), language=None)
                     # Send email
                     email_result = func_graph.send_email_with_attachments(
                         charts_data,
