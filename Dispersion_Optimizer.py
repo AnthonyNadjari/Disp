@@ -2,6 +2,7 @@ import streamlit as st
 from functions.dispersion import optimize, backtest, DispersionConfig, OptimizationConstraints, price, solve
 from functions.dispersion.models import ProductType, MissingDataPolicy, OptimizationResult, PriceResult
 from functions.dispersion._portal import payment_dates as calculate_payment_dates, observation_schedule
+from functions.dispersion._api import _to_bbg as _ticker_to_bbg
 import functions.dispersion._charts as func_graph
 # ── Inlined from _optimizer.py (4 lines) ──
 _log_callback = None
@@ -114,12 +115,11 @@ def _run_bt(src_df, is_vol_swap, n_exp, local_cap,
                                         active_count=bt_result.active_legs_count,
                                         is_cross_corridor=is_cross_corridor)
     # Build metadata dict for downstream display code
-    if is_cross_corridor:
-        all_tickers = src_df['Variance Asset'].astype(str).str.strip().tolist()
-        all_weights = src_df['Weight (%)'].astype(float).tolist()
-    else:
-        all_tickers = src_df['Variance Asset'].astype(str).str.strip().tolist()
-        all_weights = src_df['Weight (%)'].astype(float).tolist()
+    # graph_sectorial / entry_point (Bloomberg lookups) need Bloomberg tickers:
+    # normalize whatever the editor holds (RIC 'ISP.MI' / '.SPX' or BBG) to the BBG form,
+    # exactly as the engine does before loading data.
+    all_tickers = [_ticker_to_bbg(t) for t in src_df['Variance Asset'].astype(str).str.strip().tolist()]
+    all_weights = src_df['Weight (%)'].astype(float).tolist()
     metadata = {
         'long_tickers': [t for t, w in zip(all_tickers, all_weights) if w > 0],
         'short_tickers': [t for t, w in zip(all_tickers, all_weights) if w < 0],
@@ -133,8 +133,19 @@ def _run_bt(src_df, is_vol_swap, n_exp, local_cap,
 
 _SHORT_DISPLAY = {'.SPX': 'SPX', '.STOXX50E': 'SX5E', '.SX7E': 'SX7E', '.SX8E': 'SX8E'}
 
+# House palette for pies (plotly Blues, dark -> light) — same as the email pie renderer
+_PIE_BLUES = ['rgb(8,48,107)', 'rgb(8,81,156)', 'rgb(33,113,181)', 'rgb(66,146,198)', 'rgb(107,174,214)',
+              'rgb(158,202,225)', 'rgb(198,219,239)', 'rgb(222,235,247)', 'rgb(247,251,255)']
+
 def _get_short_leg_display(tickers):
-    return ', '.join(_SHORT_DISPLAY.get(t, t) for t in tickers)
+    out = []
+    for t in tickers:
+        t = _SHORT_DISPLAY.get(str(t).strip(), str(t).strip())
+        for _suf in (' Index', ' Equity'):
+            if t.endswith(_suf):
+                t = t[:-len(_suf)]
+        out.append(t)
+    return ', '.join(out)
 
 from functions.common.utils import *
 # Vol-swap pricing functions (solve_volswap_strikes_multithreaded,
@@ -1765,8 +1776,10 @@ with tab3:
                 # Generate sectorial graphs (use converted dataframe with Weights (%))
                 df_cross = st.session_state.edited_df_cross.copy()
                 df_cross['Weight (%)'] = df_cross['Weight (%)'].astype(float)
-                long_stocks = df_cross[df_cross['Weight (%)'] > 0]['Variance Asset'].tolist()
-                short_stocks = df_cross[df_cross['Weight (%)'] < 0]['Variance Asset'].tolist()
+                long_stocks = [_ticker_to_bbg(str(t).strip())
+                               for t in df_cross[df_cross['Weight (%)'] > 0]['Variance Asset'].tolist()]
+                short_stocks = [_ticker_to_bbg(str(t).strip())
+                                for t in df_cross[df_cross['Weight (%)'] < 0]['Variance Asset'].tolist()]
                 long_weights_cross = df_cross[df_cross['Weight (%)'] > 0]['Weight (%)'].astype(float).tolist()
                 short_weights_cross = df_cross[df_cross['Weight (%)'] < 0]['Weight (%)'].astype(float).abs().tolist()
                 sectorial_result = func_graph.graph_sectorial(
@@ -2019,9 +2032,17 @@ with tab3:
         _lt = st.session_state.get('long_tickers')
         _lw = st.session_state.get('long_weights')
         if _lt and _lw:
-            _pie_fig = go.Figure(go.Pie(labels=list(_lt),
-                                        values=[abs(float(w)) for w in _lw],
-                                        hole=0.35, textinfo="label+percent"))
+            _pie_pairs = sorted(zip([str(t).replace(' Equity', '').replace(' Index', '') for t in _lt],
+                                    [abs(float(w)) for w in _lw]), key=lambda p: p[1], reverse=True)
+            if len(_pie_pairs) > 20:  # large baskets: 19 biggest + Other, as in the email
+                _tail = _pie_pairs[19:]
+                _pie_pairs = _pie_pairs[:19] + [(f"Other ({len(_tail)})", sum(v for _, v in _tail))]
+            _pie_fig = go.Figure(go.Pie(labels=[p[0] for p in _pie_pairs],
+                                        values=[p[1] for p in _pie_pairs],
+                                        sort=False, textinfo="percent",
+                                        marker=dict(colors=[_PIE_BLUES[i % len(_PIE_BLUES)]
+                                                            for i in range(len(_pie_pairs))],
+                                                    line=dict(color='white', width=2))))
             _pie_fig.update_layout(title="Weights by stock", height=350,
                                    margin=dict(t=40, b=20, l=20, r=20))
             st.session_state['fig_weights_pie'] = _pie_fig

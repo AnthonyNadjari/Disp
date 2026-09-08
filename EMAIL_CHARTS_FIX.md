@@ -7,7 +7,12 @@ existing function of the same name). Nothing else changes: `_color_to_rgba`,
 are the ones already there (`io`, `base64`, `numpy as np`, `pandas as pd`,
 `plotly.graph_objects as go`, `typing`).
 
-## Root causes (from your pasted functions)
+## Root causes
+
+0. **RICs instead of Bloomberg tickers (UI, fixed on main)** — in mono mode the UI passed the
+   editor's names as typed (`ISP.MI`, `.STOXX50E`) to `graph_sectorial` / `entry_point`, whose
+   Bloomberg lookups need `ISP IM Equity` / `SX5E Index`. `Dispersion_Optimizer.py` now normalizes
+   them to Bloomberg form (the engine's own `_to_bbg`) before calling the chart functions.
 
 1. **Entry point title without graph** — `_render_line_to_png` raises on the entry-point
    figure, the failure is swallowed (console warning only), the HTML prints the title anyway:
