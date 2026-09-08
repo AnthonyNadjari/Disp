@@ -1957,15 +1957,20 @@ with tab3:
                 # Store main graph
                 if graph_data:
                     st.session_state['graph_backtest'] = graph_data
-                # Generate sectorial graphs (use converted dataframe with Weights (%))
+                # Generate sectorial graphs on the CORRIDOR assets (the traded single stocks;
+                # the Variance Asset is the index and has no sector) — long basket and,
+                # when there is one, short basket
                 df_cross = st.session_state.edited_df_cross.copy()
                 df_cross['Weight (%)'] = df_cross['Weight (%)'].astype(float)
+                _stock_col = 'Corridor Condition Asset' if 'Corridor Condition Asset' in df_cross.columns else 'Variance Asset'
                 long_stocks = [_ticker_to_bbg(str(t).strip())
-                               for t in df_cross[df_cross['Weight (%)'] > 0]['Variance Asset'].tolist()]
+                               for t in df_cross[df_cross['Weight (%)'] > 0][_stock_col].tolist()]
                 short_stocks = [_ticker_to_bbg(str(t).strip())
-                                for t in df_cross[df_cross['Weight (%)'] < 0]['Variance Asset'].tolist()]
+                                for t in df_cross[df_cross['Weight (%)'] < 0][_stock_col].tolist()]
                 long_weights_cross = df_cross[df_cross['Weight (%)'] > 0]['Weight (%)'].astype(float).tolist()
                 short_weights_cross = df_cross[df_cross['Weight (%)'] < 0]['Weight (%)'].astype(float).abs().tolist()
+                st.session_state['sector_long_names'] = long_stocks
+                st.session_state['sector_short_names'] = short_stocks
                 sectorial_result = func_graph.graph_sectorial(
                     long_stocks,
                     short_tickers=short_stocks,
@@ -1973,8 +1978,8 @@ with tab3:
                     short_weights=short_weights_cross
                 )
                 st.session_state['chart_debug'] = {
-                    'long tickers passed to graph_sectorial / entry_point': st.session_state.get('long_tickers', []),
-                    'short tickers passed': st.session_state.get('short_tickers', []),
+                    'long names passed to graph_sectorial': st.session_state.get('sector_long_names', []),
+                    'short names passed to graph_sectorial': st.session_state.get('sector_short_names', []),
                     'graph_sectorial returned': (f"keys={list(sectorial_result.keys())}, is_dual={sectorial_result.get('is_dual')}, "
                                                  f"error={sectorial_result.get('error')}"
                                                  if isinstance(sectorial_result, dict) else type(sectorial_result).__name__),
@@ -1990,8 +1995,8 @@ with tab3:
                 else:
                     _sec_err = sectorial_result.get('error')
                     print(f"[charts] graph_sectorial failed: {_sec_err} — building the sector pies from Bloomberg GICS")
-                    _fb = _sector_pies_from_bloomberg(st.session_state.get('long_tickers', []),
-                                                      st.session_state.get('short_tickers', []))
+                    _fb = _sector_pies_from_bloomberg(st.session_state.get('sector_long_names', []),
+                                                      st.session_state.get('sector_short_names', []))
                     if 'error' not in _fb:
                         st.session_state['chart_debug']['sector pies'] = (
                             f"built from Bloomberg GICS_SECTOR_NAME (graph_sectorial said: {_sec_err})")
@@ -2030,6 +2035,8 @@ with tab3:
                 if graph_data:
                     st.session_state['graph_backtest'] = graph_data
                 # Generate sectorial graphs
+                st.session_state['sector_long_names'] = list(st.session_state.get('long_tickers', []))
+                st.session_state['sector_short_names'] = list(st.session_state.get('short_tickers', []))
                 sectorial_result = func_graph.graph_sectorial(
                     st.session_state.get('long_tickers', []),
                     short_tickers=st.session_state.get('short_tickers', []),
@@ -2041,8 +2048,8 @@ with tab3:
                                                                                                        [])
                 )
                 st.session_state['chart_debug'] = {
-                    'long tickers passed to graph_sectorial / entry_point': st.session_state.get('long_tickers', []),
-                    'short tickers passed': st.session_state.get('short_tickers', []),
+                    'long names passed to graph_sectorial': st.session_state.get('sector_long_names', []),
+                    'short names passed to graph_sectorial': st.session_state.get('sector_short_names', []),
                     'graph_sectorial returned': (f"keys={list(sectorial_result.keys())}, is_dual={sectorial_result.get('is_dual')}, "
                                                  f"error={sectorial_result.get('error')}"
                                                  if isinstance(sectorial_result, dict) else type(sectorial_result).__name__),
@@ -2058,8 +2065,8 @@ with tab3:
                 else:
                     _sec_err = sectorial_result.get('error')
                     print(f"[charts] graph_sectorial failed: {_sec_err} — building the sector pies from Bloomberg GICS")
-                    _fb = _sector_pies_from_bloomberg(st.session_state.get('long_tickers', []),
-                                                      st.session_state.get('short_tickers', []))
+                    _fb = _sector_pies_from_bloomberg(st.session_state.get('sector_long_names', []),
+                                                      st.session_state.get('sector_short_names', []))
                     if 'error' not in _fb:
                         st.session_state['chart_debug']['sector pies'] = (
                             f"built from Bloomberg GICS_SECTOR_NAME (graph_sectorial said: {_sec_err})")
