@@ -147,6 +147,84 @@ def _get_short_leg_display(tickers):
         out.append(t)
     return ', '.join(out)
 
+_UI_BUILD = "2026-09-08 email-diag-1"
+
+def _email_diagnostics(charts_data, email_params):
+    """On-screen trace of the email chart pipeline: which _charts module is loaded (and
+    whether it carries the rewritten functions), what each chart object is, what the
+    renderers produce (their console output included), which sections the HTML gets."""
+    import contextlib, inspect, os, traceback
+    import base64 as _b64
+    import time as _time
+    lines = [f"UI build: {_UI_BUILD}"]
+    try:
+        _f = getattr(func_graph, '__file__', '?')
+        _m = _time.strftime('%Y-%m-%d %H:%M', _time.localtime(os.path.getmtime(_f)))
+        lines.append(f"_charts module: {_f} (file modified {_m})")
+    except Exception as e:
+        lines.append(f"_charts module: ? ({e})")
+
+    def _src(name):
+        try:
+            return inspect.getsource(getattr(func_graph, name))
+        except Exception:
+            return ''
+    _checks = (('render_charts_to_bytes', "weights_pie"),
+               ('_render_line_to_png', "_lw if _lw is not None"),
+               ('_render_pie_to_png', "legend_title"),
+               ('_generate_email_html', "'entry_point.png' in base64_images"))
+    for _fn, _marker in _checks:
+        lines.append(f"rewritten {_fn} loaded: " + ("YES" if _marker in _src(_fn) else
+                     "NO  <-- old version in memory: apply EMAIL_CHARTS_FIX.md to the file above and restart Streamlit"))
+    for k, v in st.session_state.get('chart_debug', {}).items():
+        lines.append(f"{k}: {v}")
+    for key in ('main_graph', 'split_graph', 'graph_60d', 'split_60d', 'sectorial',
+                'sectorial_long', 'sectorial_short', 'weights_pie', 'entry_point'):
+        if key not in charts_data:
+            continue
+        val = charts_data[key]
+        if val is None:
+            lines.append(f"chart '{key}': None")
+            continue
+        desc = type(val).__name__
+        try:
+            fig = val if isinstance(val, go.Figure) else go.Figure(val)
+            desc += f", {len(fig.data)} traces: " + str([f"{t.type}({getattr(t, 'mode', None) or ''})" for t in fig.data][:6])
+            if fig.data and fig.data[0].type == 'pie':
+                _p = fig.data[0]
+                desc += (f", labels={None if _p.labels is None else len(_p.labels)}"
+                         f", values={None if _p.values is None else len(_p.values)}")
+        except Exception as e:
+            desc += f" -- NOT convertible to a plotly Figure: {e}"
+        lines.append(f"chart '{key}': {desc}")
+    _buf = io.StringIO()
+    rendered = []
+    try:
+        with contextlib.redirect_stdout(_buf):
+            rendered = func_graph.render_charts_to_bytes(charts_data)
+        lines.append("rendered images: " + (", ".join(f"{n} ({len(b) // 1024} KB)" for n, b in rendered) or "NONE"))
+    except Exception:
+        lines.append("render_charts_to_bytes RAISED:\n" + traceback.format_exc())
+    if _buf.getvalue().strip():
+        lines.append("renderer console output:\n" + _buf.getvalue().strip())
+    try:
+        _adj = email_params.get('adj_divs')
+        if isinstance(_adj, bool):
+            _adj = "Yes" if _adj else "No"
+        html = func_graph._generate_email_html(
+            charts_data, email_params.get('result_series'), email_params.get('data_editor'),
+            email_params.get('n_exp'), email_params.get('is_cross_corridor'), email_params.get('product_type'),
+            email_params.get('local_cap'), email_params.get('barrier_up'), email_params.get('barrier_down'),
+            email_params.get('short_leg_display'), _adj,
+            base64_images={n: _b64.b64encode(b).decode('ascii') for n, b in rendered},
+            carry_series=email_params.get('carry_series'))
+        lines.append(f"HTML: {html.count('<img')} images embedded; Sector Split section: "
+                     f"{'YES' if 'Sector Split' in html else 'NO'}; Entry Point section: "
+                     f"{'YES' if 'Entry Point' in html else 'NO'}")
+    except Exception as e:
+        lines.append(f"_generate_email_html check failed: {e}")
+    return "\n".join(lines)
+
 from functions.common.utils import *
 # Vol-swap pricing functions (solve_volswap_strikes_multithreaded,
 # generate_fpf_vol_with_dates, create_and_price_fpf) — explicit import, the
@@ -1788,6 +1866,13 @@ with tab3:
                     weights=long_weights_cross,
                     short_weights=short_weights_cross
                 )
+                st.session_state['chart_debug'] = {
+                    'long tickers passed to graph_sectorial / entry_point': st.session_state.get('long_tickers', []),
+                    'short tickers passed': st.session_state.get('short_tickers', []),
+                    'graph_sectorial returned': (f"keys={list(sectorial_result.keys())}, is_dual={sectorial_result.get('is_dual')}, "
+                                                 f"error={sectorial_result.get('error')}"
+                                                 if isinstance(sectorial_result, dict) else type(sectorial_result).__name__),
+                }
                 if 'error' not in sectorial_result:
                     if sectorial_result.get('is_dual'):
                         st.session_state['is_dual_sectorial'] = True
@@ -1834,6 +1919,13 @@ with tab3:
                         st.session_state.get('short_weights', []), 'tolist') else st.session_state.get('short_weights',
                                                                                                        [])
                 )
+                st.session_state['chart_debug'] = {
+                    'long tickers passed to graph_sectorial / entry_point': st.session_state.get('long_tickers', []),
+                    'short tickers passed': st.session_state.get('short_tickers', []),
+                    'graph_sectorial returned': (f"keys={list(sectorial_result.keys())}, is_dual={sectorial_result.get('is_dual')}, "
+                                                 f"error={sectorial_result.get('error')}"
+                                                 if isinstance(sectorial_result, dict) else type(sectorial_result).__name__),
+                }
                 if 'error' not in sectorial_result:
                     if sectorial_result.get('is_dual'):
                         st.session_state['is_dual_sectorial'] = True
@@ -1858,7 +1950,10 @@ with tab3:
                 )
                 if entry_fig is not None:
                     st.session_state['fig_entry_point'] = entry_fig
+                    st.session_state.setdefault('chart_debug', {})['entry_point returned'] = (
+                        f"{type(entry_fig).__name__} with {len(getattr(entry_fig, 'data', []))} traces")
                 else:
+                    st.session_state.setdefault('chart_debug', {})['entry_point returned'] = 'None'
                     st.warning("Entry point chart unavailable (entry_point() returned None) — "
                                "the email will omit the Entry Point section")
                     print("[charts] entry_point() returned None (backtest run)")
@@ -2084,6 +2179,9 @@ with tab3:
             key="recipient_email_input",
             placeholder="example@company.com"
         )
+        st.checkbox("Show email diagnostics", value=True, key="email_diag",
+                    help="Prints, on screen, which _charts module is loaded, what each chart object is, "
+                         "what the renderers produce and which sections the email HTML gets.")
         col_email, col_60d, col_clear = st.columns(3)
         with col_email:
             if st.button("📧 Generate Email Report", key="gen_email", use_container_width=True, type="primary"):
@@ -2186,7 +2284,10 @@ with tab3:
                         )
                         if entry_fig is not None:
                             st.session_state['fig_entry_point'] = entry_fig
+                            st.session_state.setdefault('chart_debug', {})['entry_point returned (email path)'] = (
+                                f"{type(entry_fig).__name__} with {len(getattr(entry_fig, 'data', []))} traces")
                         else:
+                            st.session_state.setdefault('chart_debug', {})['entry_point returned (email path)'] = 'None'
                             st.warning("Entry point chart unavailable (entry_point() returned None) — "
                                        "the email will omit the Entry Point section")
                             print("[charts] entry_point() returned None (email path)")
@@ -2230,6 +2331,8 @@ with tab3:
                             st.session_state.get('short_tickers', [])
                         ),
                         'local_cap': local_cap,
+                        'barrier_up': ubar,
+                        'barrier_down': dbar,
                         'ubar': ubar,
                         'dbar': dbar,
                         'adj_divs': adj_divs,
@@ -2237,6 +2340,9 @@ with tab3:
                         'is_dual_sectorial': charts_data['is_dual_sectorial'],
                         'progress_callback': progress_callback
                     }
+                    if st.session_state.get('email_diag', True):
+                        with st.expander("🔎 Email diagnostics — what goes into the email", expanded=True):
+                            st.code(_email_diagnostics(charts_data, email_params), language=None)
                     # Send email
                     email_result = func_graph.send_email_with_attachments(
                         charts_data,
