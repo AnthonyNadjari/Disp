@@ -34,9 +34,10 @@ are the ones already there (`io`, `base64`, `numpy as np`, `pandas as pd`,
   categorical x, `add_hline` / `add_vline` reference lines (entry-point figures only);
   returns `b''` when nothing is plottable so the email omits the chart instead of showing
   an empty frame.
-- `_render_pie_to_png`: same output, byte for byte, for the sector pies (Blues / Greys
-  palette, legend on the right); the weights pie uses the same style with a legend titled
-  "Stocks", and above 20 slices the smallest are grouped into "Other (n)".
+- `_render_pie_to_png`: interface-matching style — exact house Blues/Greys hues, white
+  wedge borders, percent inside the slices (suppressed under 2.5%; navy text on light
+  slices, white on dark), full labels in a right-hand legend; above 20 slices the
+  smallest are grouped into "Other (n)".
 - `render_charts_to_bytes`: renders `weights_pie` (house style); a figure that is `None`
   or fails to render is reported on the console (`[charts] …`, with the traceback) and left
   out.
@@ -349,23 +350,33 @@ def _render_line_to_png(fig: go.Figure, title: str,
 
 ## 2. `_render_pie_to_png` — REPLACE
 
+Interface-matching style: house Blues (long) / Greys (short) palette with the exact
+on-screen hues, white wedge borders, percent inside the slices (suppressed below 2.5%
+to avoid overlap; navy text on light slices, white on dark), full untruncated labels in
+a right-hand legend, navy bold title. Above 20 slices the smallest are grouped in "Other".
+
 ```python
 def _render_pie_to_png(fig: go.Figure, title: str,
                        width: int = 1600, height: int = 1600) -> bytes:
-    """Render a plotly pie chart to PNG bytes via matplotlib.
-    Uses a legend on the right instead of inline labels to prevent cropping.
-    Sector pies: Blues (long) / Greys (short). The weights-by-stock pie uses the same
-    style (legend titled 'Stocks'); above 20 slices the smallest are grouped in 'Other'."""
+    """Render a plotly pie chart to PNG bytes via matplotlib — interface-matching style.
+
+    Same look as the on-screen pies: house Blues (long) / Greys (short) palette,
+    white wedge borders, percent inside the slices (suppressed below 2.5% to avoid
+    overlap; navy text on light slices, white on dark), full labels in a right-hand
+    legend, navy bold title. Above 20 slices the smallest are grouped in 'Other'."""
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     from matplotlib.gridspec import GridSpec
 
-    dpi = 150
-    mpl_fig = plt.figure(figsize=(12, 8), dpi=dpi)
-    mpl_fig.patch.set_facecolor('white')
+    # House palettes — exact same hues as the interface pies (_PIE_BLUES / _PIE_GREYS)
+    _PIE_BLUES_HEX = ['#08306b', '#08519c', '#2171b5', '#4292c6', '#6baed6',
+                      '#9ecae1', '#c6dbef', '#deebf7', '#f7fbff']
+    _PIE_GREYS_HEX = ['#252525', '#525252', '#737373', '#969696', '#bdbdbd', '#d9d9d9', '#f0f0f0']
 
-    # Use gridspec: left half for pie (square), right portion for legend
+    dpi = 200
+    mpl_fig = plt.figure(figsize=(11.5, 7.5), dpi=dpi)
+    mpl_fig.patch.set_facecolor('white')
     gs = GridSpec(1, 2, width_ratios=[3, 2], figure=mpl_fig)
     ax = mpl_fig.add_subplot(gs[0])
     ax.set_aspect('equal')
@@ -386,7 +397,6 @@ def _render_pie_to_png(fig: go.Figure, title: str,
     # Robust extraction: handle tuple, list, ndarray, or dict-based trace
     _raw_labels = getattr(trace, 'labels', None)
     _raw_values = getattr(trace, 'values', None)
-    # Fallback: try dict access for reconstructed figures
     if _raw_labels is None:
         try:
             _raw_labels = trace['labels']
@@ -404,61 +414,53 @@ def _render_pie_to_png(fig: go.Figure, title: str,
             values.append(float(v))
         except (TypeError, ValueError):
             values.append(None)
-    # Filter out NaN/None/zero entries
     clean = [(l, v) for l, v in zip(labels, values) if v is not None and v == v and v > 0]
     if not clean:
         plt.close(mpl_fig)
         return b''
-    # Large baskets (weights pie): keep the 19 biggest slices, group the rest as 'Other'
+
+    # Largest slices first (matches the interface pie ordering)
+    clean = sorted(clean, key=lambda lv: lv[1], reverse=True)
     max_slices = 20
     if len(clean) > max_slices:
-        clean = sorted(clean, key=lambda lv: lv[1], reverse=True)
         head, tail = clean[:max_slices - 1], clean[max_slices - 1:]
         clean = head + [(f'Other ({len(tail)})', sum(v for _, v in tail))]
-    labels, values = zip(*clean)
-    labels, values = list(labels), list(values)
+    labels, values = [l for l, _ in clean], [v for _, v in clean]
 
-    # Detect colour palette from the original Plotly figure's marker colors
-    # Short basket uses Greys, long basket uses Blues (matching original Gaia_PP)
-    import plotly.express as _px
     is_short_basket = 'short' in title.lower()
-    palette = _px.colors.sequential.Greys[::-1] if is_short_basket else _px.colors.sequential.Blues[::-1]
-    # Convert plotly color strings to matplotlib-compatible RGBA tuples
-    wedge_colors = [_color_to_rgba(palette[i % len(palette)]) for i in range(len(labels))]
+    palette = _PIE_GREYS_HEX if is_short_basket else _PIE_BLUES_HEX
+    wedge_colors = [palette[i % len(palette)] for i in range(len(labels))]
 
-    # Shorten long sector names for legend readability
-    max_label_len = 25
-    display_labels = [l if len(l) <= max_label_len else l[:max_label_len-1] + '…' for l in labels]
+    def _autopct(pct):
+        return f'{pct:.1f}%' if pct >= 2.5 else ''
 
-    # Draw pie WITHOUT inline labels — use legend instead to prevent cropping
     wedges, texts, autotexts = ax.pie(
-        values, autopct='%1.1f%%', colors=wedge_colors,
-        textprops={'fontsize': 11, 'color': 'white'}, pctdistance=0.75,
+        values, autopct=_autopct, colors=wedge_colors,
+        pctdistance=0.72, startangle=90, counterclock=False,
         wedgeprops={'linewidth': 2, 'edgecolor': 'white'},
-        startangle=90,
     )
-    # Hide the empty label texts (no labels= kwarg, but mpl still creates them)
     for t in texts:
         t.set_visible(False)
-    for at in autotexts:
+
+    # % label color follows the slice luminance (white on dark, navy on light)
+    def _lum(hex_color):
+        h = hex_color.lstrip('#')
+        r, g, b = (int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+    for at, wc in zip(autotexts, wedge_colors):
         at.set_fontsize(10)
         at.set_fontweight('bold')
-        at.set_color('white')
+        at.set_color('#00395D' if _lum(wc) > 0.55 else 'white')
 
-    # Legend on the right — never overlaps or gets cropped
     legend_title = "Stocks" if 'weight' in title.lower() else "Sectors"
-    ax.legend(
-        wedges, display_labels,
-        title=legend_title, loc="center left", bbox_to_anchor=(1.05, 0.5),
-        fontsize=11, title_fontsize=12, frameon=False,
-    )
+    ax.legend(wedges, labels, title=legend_title, loc="center left",
+              bbox_to_anchor=(1.02, 0.5), fontsize=11, title_fontsize=12, frameon=False)
 
-    mpl_fig.suptitle(title, fontsize=20, fontweight='bold', color=BARCLAYS_NAVY, y=0.95)
-    ax.set_aspect('equal')
+    mpl_fig.suptitle(title, fontsize=20, fontweight='bold', color=BARCLAYS_NAVY, y=0.97)
 
     buf = io.BytesIO()
     mpl_fig.savefig(buf, format='png', facecolor='white', dpi=dpi,
-                    bbox_inches='tight', pad_inches=0.4)
+                    bbox_inches='tight', pad_inches=0.35)
     plt.close(mpl_fig)
     buf.seek(0)
     return buf.read()
