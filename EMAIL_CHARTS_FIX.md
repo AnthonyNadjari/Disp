@@ -352,8 +352,10 @@ def _render_line_to_png(fig: go.Figure, title: str,
 
 Two paths: **kaleido first** — rasterizes the actual Plotly figure, so the email pie is
 pixel-identical to the interface (requires `pip install kaleido==0.2.1` once in the desk
-env; it's a regular wheel, pip handles it, no manual archive). If kaleido is missing,
-falls back to the matplotlib re-render below (same house style).
+env; it's a regular wheel, pip handles it, no manual archive). Kaleido spawns a headless
+Chromium that can hang in restricted environments, so the call is capped at 25 s and then
+falls back to the matplotlib re-render below (same house style). If it still hangs on your
+machine: `pip uninstall kaleido` — the fallback alone is deterministic.
 
 ```python
 def _render_pie_to_png(fig: go.Figure, title: str,
@@ -365,11 +367,26 @@ def _render_pie_to_png(fig: go.Figure, title: str,
     short palette, white wedge borders, percent inside the slices, legend on the right)."""
 
     # ── Path 1: exact Plotly rasterization (needs kaleido) ──────────────────────
+    # kaleido spawns a headless Chromium which can HANG in restricted environments
+    # (no sandbox rights, antivirus) — hard 25s timeout, then matplotlib fallback.
     try:
         import kaleido  # noqa: F401
-        png = fig.to_image(format="png", width=width, height=height, scale=2)
-        if png:
-            return png
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutTimeout
+
+        def _kaleido_render():
+            return fig.to_image(format="png", width=width, height=height, scale=2)
+
+        _pool = ThreadPoolExecutor(max_workers=1)
+        try:
+            png = _pool.submit(_kaleido_render).result(timeout=25)
+            if png:
+                return png
+        except _FutTimeout:
+            print("[charts] kaleido pie render timed out (25s) — matplotlib fallback")
+        finally:
+            _pool.shutdown(wait=False)
+    except ImportError:
+        pass
     except Exception as e:
         print(f"[charts] kaleido pie render unavailable ({e}) — falling back to matplotlib")
 
