@@ -958,6 +958,22 @@ def render_charts_to_bytes(charts_data: Dict) -> List[Tuple[str, bytes]]:
     return rendered
 
 
+def save_charts_to_disk(charts_data: Dict, output_dir: Optional[str] = None) -> List[str]:
+    """Render all charts and save the PNGs to disk (records/diagnostics only —
+    the email embeds base64 and never reads these files).
+    Returns the list of saved file paths."""
+    import os
+    import tempfile
+    out_dir = output_dir or os.path.join(tempfile.gettempdir(), "dispersion_charts")
+    os.makedirs(out_dir, exist_ok=True)
+    saved = []
+    for fname, png in render_charts_to_bytes(charts_data):
+        path = os.path.join(out_dir, fname)
+        with open(path, "wb") as f:
+            f.write(png)
+        saved.append(path)
+    return saved
+
 
 def _generate_email_html(charts_data: Dict, result_series: Optional[pd.Series],
                          data_editor: Optional[pd.DataFrame],
