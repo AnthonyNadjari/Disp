@@ -2083,8 +2083,11 @@ with tab3:
                             f"per-pair relative perf, {len(_ep.data)} traces")
                     else:
                         st.session_state.setdefault('chart_debug', {})['entry_point (cross)'] = 'None (no price data)'
+                        st.warning("Entry point chart unavailable (no price data for the pairs) — "
+                                   "the email will omit the Entry Point section")
                 except Exception as _epe:
                     st.session_state.setdefault('chart_debug', {})['entry_point (cross)'] = f'failed: {_epe}'
+                    st.warning(f"Entry point chart unavailable: {_epe}")
                     print(f"[charts] cross entry point failed: {_epe}")
             else:
                 df_res_basket, backtest_metadata, graph_data, cross_corridor_data = _run_bt(

@@ -350,20 +350,30 @@ def _render_line_to_png(fig: go.Figure, title: str,
 
 ## 2. `_render_pie_to_png` — REPLACE
 
-Interface-matching style: house Blues (long) / Greys (short) palette with the exact
-on-screen hues, white wedge borders, percent inside the slices (suppressed below 2.5%
-to avoid overlap; navy text on light slices, white on dark), full untruncated labels in
-a right-hand legend, navy bold title. Above 20 slices the smallest are grouped in "Other".
+Two paths: **kaleido first** — rasterizes the actual Plotly figure, so the email pie is
+pixel-identical to the interface (requires `pip install kaleido==0.2.1` once in the desk
+env; it's a regular wheel, pip handles it, no manual archive). If kaleido is missing,
+falls back to the matplotlib re-render below (same house style).
 
 ```python
 def _render_pie_to_png(fig: go.Figure, title: str,
                        width: int = 1600, height: int = 1600) -> bytes:
-    """Render a plotly pie chart to PNG bytes via matplotlib — interface-matching style.
+    """Render a plotly pie chart to PNG bytes.
 
-    Same look as the on-screen pies: house Blues (long) / Greys (short) palette,
-    white wedge borders, percent inside the slices (suppressed below 2.5% to avoid
-    overlap; navy text on light slices, white on dark), full labels in a right-hand
-    legend, navy bold title. Above 20 slices the smallest are grouped in 'Other'."""
+    Preferred path: plotly's own to_image (kaleido) — byte-for-byte the same chart as
+    on screen. Fallback: matplotlib re-render with the house style (Blues long / Greys
+    short palette, white wedge borders, percent inside the slices, legend on the right)."""
+
+    # ── Path 1: exact Plotly rasterization (needs kaleido) ──────────────────────
+    try:
+        import kaleido  # noqa: F401
+        png = fig.to_image(format="png", width=width, height=height, scale=2)
+        if png:
+            return png
+    except Exception as e:
+        print(f"[charts] kaleido pie render unavailable ({e}) — falling back to matplotlib")
+
+    # ── Path 2: matplotlib fallback (interface style) ───────────────────────────
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -379,7 +389,7 @@ def _render_pie_to_png(fig: go.Figure, title: str,
     mpl_fig.patch.set_facecolor('white')
     gs = GridSpec(1, 2, width_ratios=[3, 2], figure=mpl_fig)
     ax = mpl_fig.add_subplot(gs[0])
-    ax.set_aspect('equal')
+    ax.set_aspect('equal', adjustable='box')  # keep the pie perfectly round
 
     trace = fig.data[0] if fig.data else None
     if trace is None:
