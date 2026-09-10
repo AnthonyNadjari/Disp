@@ -1270,27 +1270,37 @@ def _convert_matu(n_exp: int) -> str:
 
 
 def _return_offer(data_editor) -> str:
-    """'Offer @ X%' of the email trade description: weight-averaged basket strike
-    in vol points (cross corridor uses the cross strike when both are present)."""
+    """'Offer @ X%' of the email trade description: weight-averaged dispersion spread
+    (mono var-swap strike minus cross-corridor strike) in vol points.
+    Falls back to the average mono strike when there is no cross column."""
     if data_editor is None or len(data_editor) == 0:
         return "N/A"
     try:
         df = data_editor
-        strike_col = ('Strike Cross Corridor (%)' if 'Strike Cross Corridor (%)' in df.columns
-                      else 'Strike Mono Var Swap (%)' if 'Strike Mono Var Swap (%)' in df.columns
-                      else 'Strikes (%)' if 'Strikes (%)' in df.columns else None)
         weight_col = ('Weight (%)' if 'Weight (%)' in df.columns
                       else 'Weights (%)' if 'Weights (%)' in df.columns else None)
-        if strike_col is None:
+        mono_col = 'Strike Mono Var Swap (%)' if 'Strike Mono Var Swap (%)' in df.columns else None
+        cross_col = 'Strike Cross Corridor (%)' if 'Strike Cross Corridor (%)' in df.columns else None
+        if mono_col is None and cross_col is None:
             return "N/A"
-        strikes = pd.to_numeric(df[strike_col], errors='coerce')
-        if weight_col is not None:
+
+        def _wavg(values):
+            values = pd.to_numeric(values, errors='coerce')
+            if weight_col is None:
+                return values.dropna().mean()
             w = pd.to_numeric(df[weight_col], errors='coerce').abs()
-            mask = strikes.notna() & w.notna() & (w > 0)
+            mask = values.notna() & w.notna() & (w > 0)
             if mask.sum() == 0:
-                return "N/A"
-            return f"{(strikes[mask] * w[mask]).sum() / w[mask].sum():.2f}"
-        return f"{strikes.dropna().mean():.2f}"
+                return float('nan')
+            return float((values[mask] * w[mask]).sum() / w[mask].sum())
+
+        if mono_col and cross_col:
+            spread = pd.to_numeric(df[mono_col], errors='coerce') - pd.to_numeric(df[cross_col], errors='coerce')
+            v = _wavg(spread)
+            if v == v:
+                return f"{v:.2f}"
+        v = _wavg(df[mono_col or cross_col])
+        return f"{v:.2f}" if v == v else "N/A"
     except Exception:
         return "N/A"
 
