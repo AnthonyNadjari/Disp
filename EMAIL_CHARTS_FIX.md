@@ -366,29 +366,44 @@ def _render_pie_to_png(fig: go.Figure, title: str,
     on screen. Fallback: matplotlib re-render with the house style (Blues long / Greys
     short palette, white wedge borders, percent inside the slices, legend on the right)."""
 
-    # ── Path 1: exact Plotly rasterization (needs kaleido) ──────────────────────
-    # kaleido spawns a headless Chromium which can HANG in restricted environments
-    # (no sandbox rights, antivirus) — hard 25s timeout, then matplotlib fallback.
+    # ── Path 1: exact Plotly rasterization (kaleido), attempted ONCE per session ──
+    # kaleido spawns a headless Chromium which can hang in restricted environments
+    # (corp AV scanning the binary, sandbox blocked). One 20s attempt max: on success
+    # the Chromium stays warm and later pies render directly (fast); on timeout it is
+    # never tried again — all remaining pies go straight to matplotlib, zero waiting.
+    global _KALEIDO_STATE
     try:
-        import kaleido  # noqa: F401
-        from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutTimeout
-
-        def _kaleido_render():
-            return fig.to_image(format="png", width=width, height=height, scale=2)
-
-        _pool = ThreadPoolExecutor(max_workers=1)
+        _KALEIDO_STATE
+    except NameError:
+        _KALEIDO_STATE = {"tried": False, "ok": False}
+    if not _KALEIDO_STATE["tried"]:
+        _KALEIDO_STATE["tried"] = True
         try:
-            png = _pool.submit(_kaleido_render).result(timeout=25)
-            if png:
-                return png
-        except _FutTimeout:
-            print("[charts] kaleido pie render timed out (25s) — matplotlib fallback")
-        finally:
-            _pool.shutdown(wait=False)
-    except ImportError:
-        pass
-    except Exception as e:
-        print(f"[charts] kaleido pie render unavailable ({e}) — falling back to matplotlib")
+            import kaleido  # noqa: F401
+            from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutTimeout
+
+            def _kaleido_render():
+                return fig.to_image(format="png", width=width, height=height, scale=2)
+
+            _pool = ThreadPoolExecutor(max_workers=1)
+            try:
+                png = _pool.submit(_kaleido_render).result(timeout=20)
+                if png:
+                    _KALEIDO_STATE["ok"] = True
+                    return png
+            except _FutTimeout:
+                print("[charts] kaleido timed out on first render — matplotlib for the rest of the session")
+            finally:
+                _pool.shutdown(wait=False)
+        except ImportError:
+            pass
+        except Exception as e:
+            print(f"[charts] kaleido pie render unavailable ({e}) — falling back to matplotlib")
+    elif _KALEIDO_STATE["ok"]:
+        try:
+            return fig.to_image(format="png", width=width, height=height, scale=2)
+        except Exception:
+            pass
 
     # ── Path 2: matplotlib fallback (interface style) ───────────────────────────
     import matplotlib
