@@ -1373,7 +1373,7 @@ with tab1:
                     # name, label, unit hint, prefill (sensible order of magnitude), step, format
                     ('last_carry', 'Last carry', 'vol points (mean of the last trade payoffs)', 0.5, 0.1, "%.2f"),
                     ('mean_payoff', 'Mean payoff', 'vol points (mean payoff per trade, e.g. 0.5)', 0.5, 0.1, "%.2f"),
-                    ('hit_ratio', 'Hit ratio', 'fraction 0–1 (0.65 = 65% winning trades)', 0.65, 0.01, "%.2f"),
+                    ('hit_ratio', 'Hit ratio', 'PERCENT (65 = 65% winning trades)', 65.0, 1.0, "%.0f"),
                     ('min_payoff', 'Min payoff', 'vol points (worst single trade, negative)', -2.0, 0.5, "%.2f"),
                     ('max_drawdown', 'Max drawdown', 'vol points, positive magnitude of the worst drop — plateau BELOW the target', 3.0, 0.5, "%.2f"),
                     ('cvar_5', 'CVaR 5%', 'vol points (mean of the 5% worst trades, negative)', -1.5, 0.5, "%.2f"),
@@ -1389,7 +1389,8 @@ with tab1:
                                            disabled=not _on,
                                            help=f"Raw {_mlabel} units: {_munit}")
                     if _on:
-                        metric_targets[_mname] = _v
+                        # hit_ratio is entered in percent; the metric works in fraction
+                        metric_targets[_mname] = _v / 100.0 if _mname == 'hit_ratio' else _v
         # Validation
         score_weights = {
             'last_carry': last_carry_weight,
