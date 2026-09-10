@@ -1246,6 +1246,10 @@ def optimize(
         global_floor=config.global_floor,
         metric_weights=metric_weights,
         metric_targets=metric_targets,
+        # Re-optimization speedup: on a prep-cache HIT (identical universe),
+        # seed the GA with the previous run's winner.
+        warm_start=(_PREP_CACHE.get("last_baskets")
+                    if cache_prep and _PREP_CACHE.get("last_was_hit") else None),
         progress_callback=progress_callback,
         bisect_in_ga=bisect_in_ga,
         seed=seed,
@@ -1298,6 +1302,15 @@ def optimize(
                 "filter_zero_hr": bool(filter_zero_hr),
             },
             result=opt_result,
+        )
+
+    # ── Warm-start memory for re-optimization (cache_prep runs only) ──
+    # Next call with identical inputs starts the GA from THIS winner — a
+    # weight/threshold tweak then converges almost immediately.
+    if cache_prep and opt_result is not None and opt_result.long_basket:
+        _PREP_CACHE["last_baskets"] = (
+            [k for k, _ in opt_result.long_basket],
+            [k for k, _ in opt_result.short_basket],
         )
 
     # ── Persist smoothing state for interactive post-smoothing in UI ──

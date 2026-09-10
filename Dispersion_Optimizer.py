@@ -1101,17 +1101,18 @@ with tab1:
             st.subheader("🎯 Constraints")
             st.markdown("**📐 Basket size**")
             _sz1, _sz2 = st.columns(2)
-            min_stocks_long = _sz1.number_input("Min stocks (long)", step=1, value=3)
-            max_stocks_long = _sz2.number_input("Max stocks (long)", step=1, value=8)
-            min_stocks_short = _sz1.number_input("Min stocks (short)", step=1, value=2)
-            max_stocks_short = _sz2.number_input("Max stocks (short)", step=1, value=5)
+            min_stocks_long = _sz1.number_input("Min stocks (long)", step=1, value=3, key="opt_min_stocks_long")
+            max_stocks_long = _sz2.number_input("Max stocks (long)", step=1, value=8, key="opt_max_stocks_long")
+            min_stocks_short = _sz1.number_input("Min stocks (short)", step=1, value=2, key="opt_min_stocks_short")
+            max_stocks_short = _sz2.number_input("Max stocks (short)", step=1, value=5, key="opt_max_stocks_short")
             _sz3, _sz4, _sz5 = st.columns(3)
-            max_strike = _sz3.number_input("Max net strike (%)", value=15.00)
+            max_strike = _sz3.number_input("Max net strike (%)", value=15.00, key="opt_max_strike")
             time_limit = _sz4.number_input(
-                "Time limit (s)", max_value=600, value=20,
+                "Time limit (s)", max_value=600, value=20, key="opt_time_limit",
                 help="Bounds the GA search only — Bloomberg load, reference fitting and "
-                     "the post-GA polish are extra wall time.")
-            seed = _sz5.number_input("Random seed", value=0, step=1, min_value=0)
+                     "the post-GA polish are extra wall time. Re-running with the same "
+                     "universe warm-starts from the previous winner (much faster).")
+            seed = _sz5.number_input("Random seed", value=0, step=1, min_value=0, key="opt_seed")
             st.divider()
             st.markdown("**🎛️ Universe shaping** · optional")
             forced_tickers_raw = st.text_area(
@@ -1238,20 +1239,26 @@ with tab1:
 
         with col45:
             st.subheader("⚖️ Optimization Weights")
-            col18, col19 = st.columns(2)
-            with col18:
+            _wc1, _wc2, _wc3, _wc4 = st.columns(4)
+            with _wc1:
                 last_carry_weight = st.number_input("Last carry weight", step=0.01, min_value=0.00,
                                                     max_value=1.00, value=0.30,
+                                                    key="opt_w_last_carry",
                                                     help="Recent payoff (last maturities)")
+            with _wc2:
                 mean_payoff_weight = st.number_input("Mean payoff weight", step=0.01, min_value=0.00,
                                                      max_value=1.00, value=0.30,
+                                                     key="opt_w_mean_payoff",
                                                      help="Average payoff over the backtest window")
-            with col19:
+            with _wc3:
                 hit_ratio_weight = st.number_input("Hit ratio weight", step=0.01, min_value=0.00,
                                                    max_value=1.00, value=0.30,
+                                                   key="opt_w_hit_ratio",
                                                    help="Fraction of positive payoffs")
+            with _wc4:
                 min_payoff_weight = st.number_input("Min payoff weight", step=0.01, min_value=0.00,
                                                     max_value=1.00, value=0.10,
+                                                    key="opt_w_min_payoff",
                                                     help="Worst single payoff (floor protection)")
             st.divider()
             st.markdown("**⚡ Vega**")
@@ -1269,8 +1276,10 @@ with tab1:
                 st.markdown("**⚡ Vega settings**")
                 st.caption("Total package Vega V is free within these bounds:")
                 _vg_c1, _vg_c2 = st.columns(2)
-                vega_v_min = _vg_c1.number_input("Total V — min", value=50.0, min_value=0.01)
-                vega_v_max = _vg_c2.number_input("Total V — max", value=200.0, min_value=0.01)
+                vega_v_min = _vg_c1.number_input("Total V — min", value=50.0, min_value=0.01,
+                                                 key="opt_vega_v_min")
+                vega_v_max = _vg_c2.number_input("Total V — max", value=200.0, min_value=0.01,
+                                                 key="opt_vega_v_max")
                 st.markdown("**Axe targets (recycling) — optional**")
                 st.caption(
                     "Paste one line per name: `Name  Axe target` (tab or comma), then "
@@ -1333,16 +1342,20 @@ with tab1:
                 with col19b:
                     max_dd_weight = st.number_input("Max drawdown weight", step=0.01, min_value=0.00,
                                                     max_value=1.00, value=0.00,
+                                                    key="opt_w_max_dd",
                                                     help="Worst peak-to-trough drop of the payoff curve (penalized)")
                     cvar_weight = st.number_input("CVaR 5% weight", step=0.01, min_value=0.00,
                                                   max_value=1.00, value=0.00,
+                                                  key="opt_w_cvar",
                                                   help="Mean of the 5% worst payoffs (tail protection)")
                 with col19c:
                     sharpe_weight = st.number_input("Sharpe weight", step=0.01, min_value=0.00,
                                                     max_value=1.00, value=0.00,
+                                                    key="opt_w_sharpe",
                                                     help="Risk-adjusted payoff (mean/std, annualized)")
                     strike_obj_weight = st.number_input("Weighted strike weight", step=0.01, min_value=0.00,
                                                         max_value=1.00, value=0.00,
+                                                        key="opt_w_weighted_strike",
                                                         help="Minimize the basket's weighted net strike. "
                                                              "The Max net strike hard limit stays active independently.")
                 # Recycling priority is now the dedicated 'Recycling priority weight'

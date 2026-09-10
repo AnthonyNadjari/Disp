@@ -328,6 +328,7 @@ class DispersionOptimizer:
         vega_config: Optional[VegaConfig] = None,
         reference_cache: Optional[dict] = None,
         metric_targets: Optional[Dict[str, float]] = None,
+        warm_start: Optional[Tuple[List[str], List[str]]] = None,
     ):
         self.long_candidates = long_candidates
         self.short_candidates = short_candidates
@@ -368,6 +369,10 @@ class DispersionOptimizer:
         self._metric_weights = metric_weights
         # Indifference thresholds {metric_name: raw-value cap} — see ScoreFunction
         self._metric_targets = dict(metric_targets) if metric_targets else None
+        # Warm start: (long_names, short_names) of a previous run's winner on the
+        # SAME prepared universe — seeded into the initial population so
+        # re-optimizations after a weight/threshold tweak converge much faster.
+        self._warm_start = warm_start
         self._use_new_scoring = metric_weights is not None
         self._score_fn: Optional[ScoreFunction] = None
         self._weight_solver: Optional[WeightSolver] = None
@@ -850,6 +855,11 @@ class DispersionOptimizer:
                                        and _active_names == {"axe_book_cleaned"}))
         # Create initial population
         population = []
+        # Warm start: the previous run's winner (same prepared universe) seeds
+        # the population. One individual among population_size — exploration is
+        # unaffected (immigrants + mutation still run), but a barely-changed
+        # objective converges almost immediately instead of re-searching.
+        population.extend(self._warm_start_individuals())
         attempts = 0
         while len(population) < self.c.population_size and attempts < self.c.population_size * TUNING.population_attempts_factor:
             ind = self._create_random_individual()
@@ -2148,6 +2158,30 @@ class DispersionOptimizer:
             capped_total += sum(1 for bb in self._bucket_of if bb is None)
             hi = min(hi, capped_total)
         return lo, max(lo, hi)
+
+    def _warm_start_individuals(self) -> List["_Individual"]:
+        """Build initial-population individuals from a previous run's winning
+        basket (re-optimization speedup). Names not in the current universe are
+        dropped; if nothing usable remains (or the individual scores <= 0 under
+        the new objective), the GA starts purely random, exactly as before."""
+        if not self._warm_start:
+            return []
+        long_names, short_names = self._warm_start
+        is_xc = self.is_cross_corridor
+        key_of = {_candidate_key(leg, is_xc): i for i, leg in enumerate(self.long_candidates)}
+        long_idx = sorted({key_of[n] for n in (long_names or []) if n in key_of})
+        if not long_idx:
+            return []
+        short_idx: List[int] = []
+        if not self._long_only and short_names:
+            skey_of = {_candidate_key(leg, is_xc): i for i, leg in enumerate(self.short_candidates)}
+            short_idx = sorted({skey_of[n] for n in short_names if n in skey_of})
+        ind = _Individual(long_idx, short_idx)
+        try:
+            ind.fitness = self._fitness(ind)
+        except Exception:
+            return []
+        return [ind] if ind.fitness > 0.0 else []
 
     def _create_random_individual(self) -> Optional[_Individual]:
         """Create an individual — the genome is ONLY the stock subsets;
