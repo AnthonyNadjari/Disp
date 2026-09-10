@@ -1370,21 +1370,22 @@ with tab1:
                            "For lower-is-better criteria (Max drawdown, Weighted strike) "
                            "the plateau is BELOW the target.")
                 _tgt_specs = [
-                    ('last_carry', 'Last carry', 'vol points (mean of the last trade payoffs)'),
-                    ('mean_payoff', 'Mean payoff', 'vol points (mean payoff per trade, e.g. 0.5)'),
-                    ('hit_ratio', 'Hit ratio', 'fraction 0–1 (0.65 = 65% winning trades)'),
-                    ('min_payoff', 'Min payoff', 'vol points (worst single trade, negative)'),
-                    ('max_drawdown', 'Max drawdown', 'vol points, positive magnitude of the worst drop — plateau BELOW the target'),
-                    ('cvar_5', 'CVaR 5%', 'vol points (mean of the 5% worst trades, negative)'),
-                    ('sharpe_payoff', 'Sharpe', 'annualized ratio (mean/std × √252)'),
-                    ('weighted_strike', 'Weighted strike', 'decimal vol (0.25 = 25%) — plateau BELOW the target'),
+                    # name, label, unit hint, prefill (sensible order of magnitude), step, format
+                    ('last_carry', 'Last carry', 'vol points (mean of the last trade payoffs)', 0.5, 0.1, "%.2f"),
+                    ('mean_payoff', 'Mean payoff', 'vol points (mean payoff per trade, e.g. 0.5)', 0.5, 0.1, "%.2f"),
+                    ('hit_ratio', 'Hit ratio', 'fraction 0–1 (0.65 = 65% winning trades)', 0.65, 0.01, "%.2f"),
+                    ('min_payoff', 'Min payoff', 'vol points (worst single trade, negative)', -2.0, 0.5, "%.2f"),
+                    ('max_drawdown', 'Max drawdown', 'vol points, positive magnitude of the worst drop — plateau BELOW the target', 3.0, 0.5, "%.2f"),
+                    ('cvar_5', 'CVaR 5%', 'vol points (mean of the 5% worst trades, negative)', -1.5, 0.5, "%.2f"),
+                    ('sharpe_payoff', 'Sharpe', 'annualized ratio (mean/std × √252)', 1.5, 0.1, "%.2f"),
+                    ('weighted_strike', 'Weighted strike', 'decimal vol (0.20 = 20%) — plateau BELOW the target', 0.20, 0.01, "%.3f"),
                 ]
                 metric_targets = {}
-                for _mname, _mlabel, _munit in _tgt_specs:
+                for _mname, _mlabel, _munit, _mdef, _mstep, _mfmt in _tgt_specs:
                     _c_on, _c_v = st.columns([1.2, 2])
                     _on = _c_on.checkbox(_mlabel, key=f"_tgt_on_{_mname}")
-                    _v = _c_v.number_input(f"{_mlabel} target", value=0.0, step=0.05,
-                                           format="%.4f", key=f"_tgt_val_{_mname}",
+                    _v = _c_v.number_input(f"{_mlabel} target", value=_mdef, step=_mstep,
+                                           format=_mfmt, key=f"_tgt_val_{_mname}",
                                            disabled=not _on,
                                            help=f"Raw {_mlabel} units: {_munit}")
                     if _on:
