@@ -1383,9 +1383,9 @@ with tab1:
                 metric_targets = {}
                 for _mname, _mlabel, _munit, _mdef, _mstep, _mfmt in _tgt_specs:
                     _c_on, _c_v = st.columns([1.2, 2])
-                    _on = _c_on.checkbox(_mlabel, key=f"_tgt_on_{_mname}")
+                    _on = _c_on.checkbox(_mlabel, key=f"_tgt2_on_{_mname}")
                     _v = _c_v.number_input(f"{_mlabel} target", value=_mdef, step=_mstep,
-                                           format=_mfmt, key=f"_tgt_val_{_mname}",
+                                           format=_mfmt, key=f"_tgt2_val_{_mname}",
                                            disabled=not _on,
                                            help=f"Raw {_mlabel} units: {_munit}")
                     if _on:
