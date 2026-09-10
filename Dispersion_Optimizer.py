@@ -259,11 +259,12 @@ def _sector_pies_from_bloomberg(long_tickers, short_tickers=None):
     return {'fig': _pie(long_counts, "Sector Repartition", _PIE_BLUES)}
 
 def _cross_entry_point_fig(df_cross, start_date):
-    """Cross-corridor entry point: ONE line = weight-averaged relative performance
-    (corridor assets minus index), rebased to 0 at start_date. Same look as the mono
-    entry point: single line + today marker + historical percentile (via
-    _decorate_entry_point)."""
-    pairs = []
+    """Cross-corridor entry point — same construction as the mono entry point
+    (desk _charts.entry_point): 18M implied vols via Bloomberg
+    18MTH_IMPVOL_90.0%MNY_DF. One line = weight-averaged corridor-asset IV
+    minus weight-averaged index IV. Mono-style marker + percentile added by
+    _decorate_entry_point."""
+    pairs, wts = [], []
     for _, r in df_cross.iterrows():
         try:
             w = abs(float(r['Weight (%)']))
@@ -272,38 +273,44 @@ def _cross_entry_point_fig(df_cross, start_date):
         stk = _ticker_to_bbg(str(r['Corridor Condition Asset']).strip())
         idx = _ticker_to_bbg(str(r['Variance Asset']).strip())
         if stk and idx and stk != idx and w > 0:
-            pairs.append((stk, idx, w))
+            pairs.append((stk, idx))
+            wts.append(w)
     if not pairs:
         return None
-    tickers = sorted({t for s, i, _ in pairs for t in (s, i)})
+    tickers = sorted({t for p in pairs for t in p})
     start_str = pd.Timestamp(start_date).strftime("%m/%d/%Y")
-    px = _fetch_bloomberg_prices("|".join(tickers) + start_str, tickers, "PX_LAST", start_str)
-    if px is None or px.empty:
+    data = _fetch_bloomberg_prices("|".join(tickers) + start_str + "|iv18m", tickers,
+                                   "18MTH_IMPVOL_90.0%MNY_DF", start_str)
+    if data is None or data.empty:
         return None
-    px = px.sort_index().ffill()
-    series, wmap = [], {}
-    for stk, idx, w in pairs:
-        if stk not in px.columns or idx not in px.columns:
-            continue
-        pair_px = px[[stk, idx]].dropna()
-        if len(pair_px) < 5:
-            continue
-        rel = ((pair_px[stk] / pair_px[stk].iloc[0]) - (pair_px[idx] / pair_px[idx].iloc[0])) * 100
-        series.append(rel.rename((stk, idx)))
-        wmap[(stk, idx)] = w
-    if not series:
+    data = data.sort_index()
+    # Same threshold logic as the mono version — keep rows where at least half have data
+    min_valid = max(1, len(tickers) // 2)
+    data = data.dropna(axis=0, thresh=min_valid)
+    data = data.loc[~data.index.duplicated(keep='first')]
+    if len(data) == 0:
         return None
-    panel = pd.concat(series, axis=1).ffill().dropna()
-    if panel.empty:
+    avail = data.columns
+    corr_sum = pd.Series(0.0, index=data.index)
+    idx_sum = pd.Series(0.0, index=data.index)
+    w_used = 0.0
+    for (stk, idx), w in zip(pairs, wts):
+        if stk in avail and idx in avail:
+            corr_sum += data[stk].fillna(0) * w
+            idx_sum += data[idx].fillna(0) * w
+            w_used += w
+    if w_used == 0:
         return None
-    wvec = np.array([wmap[c] for c in panel.columns], dtype=float)
-    wvec = wvec / wvec.sum()
-    avg = pd.Series(panel.values @ wvec, index=panel.index)
-    fig = go.Figure(go.Scatter(x=avg.index, y=avg.values, mode='lines', name='Weighted avg',
-                               line=dict(color='#00395D', width=2.5)))
-    fig.update_layout(title="Entry point — relative performance (corridor assets − index), weighted avg",
-                      xaxis_title='Date', yaxis_title='Relative perf (%)', hovermode='x unified',
-                      height=500, plot_bgcolor='white', paper_bgcolor='white', showlegend=False)
+    result = (corr_sum - idx_sum) / w_used  # renormalize over pairs with data
+    if result.abs().sum() == 0:
+        return None
+    fig = go.Figure(go.Scatter(x=result.index, y=result.values, mode='lines',
+                               name='Implied Vol Spread',
+                               line=dict(color='#00395D', width=3)))
+    fig.update_layout(title="Entry Point — 18M Implied Vol Spread (corridor assets − index, weighted avg)",
+                      xaxis_title='Date', yaxis_title='18M implied vol spread (vol pts)',
+                      hovermode='x unified', height=500,
+                      plot_bgcolor='white', paper_bgcolor='white', showlegend=False)
     return _decorate_entry_point(fig)
 
 
