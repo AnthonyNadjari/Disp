@@ -217,9 +217,12 @@ def _sector_pies_from_bloomberg(long_tickers, short_tickers=None):
     {'is_dual': True, 'fig_long': ..., 'fig_short': ...} or {'error': ...}.
     Count of names per sector (not weight adjusted), like the original Gaia_PP chart."""
     def _sectors(tickers):
-        names = [str(t).strip() for t in (tickers or []) if str(t).strip().endswith(' Equity')]
+        raw = [str(t).strip() for t in (tickers or []) if str(t).strip()]
+        # Accept RICs too: convert anything not already in BBG '... Equity' form
+        names = [t if t.endswith(' Equity') else _ticker_to_bbg(t) for t in raw]
+        names = [t for t in names if t.endswith(' Equity')]
         if not names:
-            return {}, "no stock tickers (Bloomberg '... Equity' form expected)"
+            return {}, f"no stock tickers (Bloomberg '... Equity' form expected; got {raw[:6]})"
         try:
             df = blp.bdp(tickers=names, flds=['GICS_SECTOR_NAME'])
         except Exception as e:
@@ -1971,12 +1974,15 @@ with tab3:
                 short_weights_cross = df_cross[df_cross['Weight (%)'] < 0]['Weight (%)'].astype(float).abs().tolist()
                 st.session_state['sector_long_names'] = long_stocks
                 st.session_state['sector_short_names'] = short_stocks
-                sectorial_result = func_graph.graph_sectorial(
-                    long_stocks,
-                    short_tickers=short_stocks,
-                    weights=long_weights_cross,
-                    short_weights=short_weights_cross
-                )
+                try:
+                    sectorial_result = func_graph.graph_sectorial(
+                        long_stocks,
+                        short_tickers=short_stocks,
+                        weights=long_weights_cross,
+                        short_weights=short_weights_cross
+                    )
+                except Exception as _se:
+                    sectorial_result = {'error': f"{type(_se).__name__}: {_se}"}
                 st.session_state['chart_debug'] = {
                     'long names passed to graph_sectorial': st.session_state.get('sector_long_names', []),
                     'short names passed to graph_sectorial': st.session_state.get('sector_short_names', []),
@@ -2037,16 +2043,19 @@ with tab3:
                 # Generate sectorial graphs
                 st.session_state['sector_long_names'] = list(st.session_state.get('long_tickers', []))
                 st.session_state['sector_short_names'] = list(st.session_state.get('short_tickers', []))
-                sectorial_result = func_graph.graph_sectorial(
-                    st.session_state.get('long_tickers', []),
-                    short_tickers=st.session_state.get('short_tickers', []),
-                    weights=st.session_state.get('long_weights', []).tolist() if hasattr(
-                        st.session_state.get('long_weights', []), 'tolist') else st.session_state.get('long_weights',
-                                                                                                      []),
-                    short_weights=st.session_state.get('short_weights', []).tolist() if hasattr(
-                        st.session_state.get('short_weights', []), 'tolist') else st.session_state.get('short_weights',
-                                                                                                       [])
-                )
+                try:
+                    sectorial_result = func_graph.graph_sectorial(
+                        st.session_state.get('long_tickers', []),
+                        short_tickers=st.session_state.get('short_tickers', []),
+                        weights=st.session_state.get('long_weights', []).tolist() if hasattr(
+                            st.session_state.get('long_weights', []), 'tolist') else st.session_state.get('long_weights',
+                                                                                                          []),
+                        short_weights=st.session_state.get('short_weights', []).tolist() if hasattr(
+                            st.session_state.get('short_weights', []), 'tolist') else st.session_state.get('short_weights',
+                                                                                                           [])
+                    )
+                except Exception as _se:
+                    sectorial_result = {'error': f"{type(_se).__name__}: {_se}"}
                 st.session_state['chart_debug'] = {
                     'long names passed to graph_sectorial': st.session_state.get('sector_long_names', []),
                     'short names passed to graph_sectorial': st.session_state.get('sector_short_names', []),
