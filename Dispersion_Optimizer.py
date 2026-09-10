@@ -1350,6 +1350,32 @@ with tab1:
                 # Criterion A (axe_book_cleaned) is retired per design decision.
                 axe_cleaned_weight = 0.0
                 axe_recycled_weight = recycle_weight if st.session_state.get('_vega_toggle', False) else 0.0
+            with st.expander("🎯 Indifference thresholds (optional — off by default)"):
+                st.caption("Past its target, a criterion stops differentiating baskets "
+                           "(plateau): e.g. mean payoff 0.5 and 1.5 score the same. "
+                           "Tick to enable, then set the level in the metric's raw units. "
+                           "For lower-is-better criteria (Max drawdown, Weighted strike) "
+                           "the plateau is BELOW the target.")
+                _tgt_specs = [
+                    ('last_carry', 'Last carry', 'v (vol points)'),
+                    ('mean_payoff', 'Mean payoff', 'v (vol points)'),
+                    ('hit_ratio', 'Hit ratio', 'fraction 0–1'),
+                    ('min_payoff', 'Min payoff', 'v (vol points)'),
+                    ('max_drawdown', 'Max drawdown', 'v (vol points)'),
+                    ('cvar_5', 'CVaR 5%', 'v (vol points)'),
+                    ('sharpe_payoff', 'Sharpe', 'ratio'),
+                    ('weighted_strike', 'Weighted strike', 'decimal (0.25 = 25%)'),
+                ]
+                metric_targets = {}
+                for _mname, _mlabel, _munit in _tgt_specs:
+                    _c_on, _c_v = st.columns([1.2, 2])
+                    _on = _c_on.checkbox(_mlabel, key=f"_tgt_on_{_mname}")
+                    _v = _c_v.number_input(f"{_mlabel} target", value=0.0, step=0.05,
+                                           format="%.4f", key=f"_tgt_val_{_mname}",
+                                           disabled=not _on,
+                                           help=f"Raw {_mlabel} units: {_munit}")
+                    if _on:
+                        metric_targets[_mname] = _v
         # Validation
         score_weights = {
             'last_carry': last_carry_weight,
@@ -1366,6 +1392,10 @@ with tab1:
         total_weight = sum(score_weights.values())
         if abs(total_weight - 1.0) > 0.01:
             st.warning(f"⚠️ Weights sum to {total_weight:.2f}, not 1.0. They will be normalized automatically.")
+        _inactive_targets = [m for m in metric_targets if score_weights.get(m, 0) <= 0]
+        if _inactive_targets:
+            st.caption(f"⚠️ Threshold set but criterion weight is 0 — no effect: "
+                       f"{', '.join(_inactive_targets)}")
         st.divider()
         filter_zero_hr = st.toggle(
             "🧹 Filter useless candidates (0% HR long / 100% HR short)",
@@ -1528,6 +1558,7 @@ with tab1:
                                     constraints=_constraints,
                                     short_df=_short_df_arg,
                                     score_weights=score_weights,
+                                    metric_targets=metric_targets or None,
                                     start_date=st.session_state.get('_opt_start_date_value'),
                                     filter_zero_hr=filter_zero_hr,
                                     progress_callback=_opti_progress,
