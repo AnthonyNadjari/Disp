@@ -204,6 +204,15 @@ class ScoreFunction:
         An :class:`Aggregator` instance.
     weights:
         :class:`MetricWeights` specifying preference over metrics.
+    targets:
+        Optional ``{metric_name: threshold}`` — indifference thresholds.
+        Beyond the target, a metric stops differentiating: for a
+        higher-is-better metric all values >= target are treated as equal
+        (raw value capped at the target), for a lower-is-better metric all
+        values <= target are treated as equal.  Applied on the RAW metric
+        value, before normalisation, in both the reference build and every
+        scoring path — so two baskets past the threshold get exactly the same
+        score contribution for that metric.
     """
 
     def __init__(
@@ -212,6 +221,7 @@ class ScoreFunction:
         normalizer: Optional[Normalizer] = None,
         aggregator: Optional[Aggregator] = None,
         weights: Optional[MetricWeights] = None,
+        targets: Optional[Dict[str, float]] = None,
     ) -> None:
         self._metrics = list(metrics)
         if not self._metrics:
@@ -234,7 +244,39 @@ class ScoreFunction:
                     f"Available: {sorted(metric_names)}"
                 )
 
+        # Indifference thresholds: names must exist; a target on a weight-0
+        # metric is harmless (it just never matters).
+        self._targets: Dict[str, float] = {}
+        for name, t in (targets or {}).items():
+            if name not in metric_names:
+                raise ValueError(
+                    f"Target for unknown metric '{name}'. "
+                    f"Available: {sorted(metric_names)}"
+                )
+            self._targets[name] = float(t)
+        self._metric_by_name = {m.name: m for m in self._metrics}
+
         self._fitted = False
+
+    def _apply_target(self, name: str, val):
+        """Cap a raw metric value at its indifference threshold (if any).
+
+        higher_is_better: values >= target become the target (plateau above).
+        lower_is_better:  values <= target become the target (plateau below).
+        """
+        t = self._targets.get(name)
+        if t is None or val is None:
+            return val
+        try:
+            fval = float(val)
+        except (TypeError, ValueError):
+            return val
+        if not np.isfinite(fval):
+            return val
+        m = self._metric_by_name.get(name)
+        if m is None:
+            return val
+        return min(fval, t) if m.higher_is_better else max(fval, t)
 
     @property
     def metrics(self) -> List[Metric]:
@@ -243,6 +285,11 @@ class ScoreFunction:
     @property
     def weights(self) -> MetricWeights:
         return self._weights
+
+    @property
+    def targets(self) -> Dict[str, float]:
+        """Indifference thresholds (copy), ``{metric_name: threshold}``."""
+        return dict(self._targets)
 
     @property
     def normalizer(self) -> Normalizer:
@@ -295,9 +342,11 @@ class ScoreFunction:
             extra = extras_list[i] if (extras_list is not None and i < len(extras_list)) else None
             for m in self._metrics:
                 if extra is not None and m.name in extra:
-                    raw_by_metric[m.name].append(float(extra[m.name]))
+                    raw_by_metric[m.name].append(
+                        self._apply_target(m.name, float(extra[m.name])))
                 else:
-                    raw_by_metric[m.name].append(m.compute(pnl, ctx))
+                    raw_by_metric[m.name].append(
+                        self._apply_target(m.name, m.compute(pnl, ctx)))
 
         # Convert to arrays, drop NaN; metrics with an empty finite reference
         # are excluded from the fit (they stay usable only at weight 0).
@@ -410,7 +459,8 @@ class ScoreFunction:
         """
         if not self._fitted:
             raise RuntimeError("ScoreFunction not fitted. Call build_reference() first.")
-        filled = {m.name: raw.get(m.name, float("nan")) for m in self._metrics}
+        filled = {m.name: self._apply_target(m.name, raw.get(m.name, float("nan")))
+                  for m in self._metrics}
         normalized = self._normalize(filled, smooth=True)
         return self._aggregator.aggregate(normalized, self._weights.to_dict())
 
@@ -434,11 +484,12 @@ class ScoreFunction:
         if active_only:
             active = set(self._weights.active_names)
             return {
-                m.name: m.compute(net_pnl, ctx)
+                m.name: self._apply_target(m.name, m.compute(net_pnl, ctx))
                 for m in self._metrics
                 if m.name in active
             }
-        return {m.name: m.compute(net_pnl, ctx) for m in self._metrics}
+        return {m.name: self._apply_target(m.name, m.compute(net_pnl, ctx))
+                for m in self._metrics}
 
     def _normalize(self, raw: Dict[str, float], smooth: bool) -> Dict[str, float]:
         """Normalize raw values to [0, 1] using the fitted normalizer."""
@@ -474,6 +525,7 @@ def make_default_score_function(
     weights: Optional[MetricWeights] = None,
     last_carry_k: int = 1,
     mean_payoff_window: Optional[int] = None,
+    targets: Optional[Dict[str, float]] = None,
 ) -> ScoreFunction:
     """Build a ScoreFunction with the default metric set.
 
@@ -488,6 +540,9 @@ def make_default_score_function(
         Window for LastCarry metric.
     mean_payoff_window:
         Window for MeanPayoff metric. None = full series.
+    targets:
+        Optional indifference thresholds ``{metric_name: threshold}``
+        (see :class:`ScoreFunction`).
 
     Returns
     -------
@@ -540,4 +595,5 @@ def make_default_score_function(
         normalizer=QuantileNormalizer(),
         aggregator=WeightedSum(),
         weights=weights,
+        targets=targets,
     )

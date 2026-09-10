@@ -150,12 +150,12 @@ class _TuningConstants:
 TUNING = _TuningConstants()
 
 def _scoring_signature(metric_weights, seed: int, n_samples: int,
-                       reference_size: int) -> str:
+                       reference_size: int, targets=None) -> str:
     """Reproducibility fingerprint: sha256[:16] over the scoring inputs.
 
     Two runs with the same signature scored baskets on the same objective
-    (active metrics + weights), the same seed and the same reference-sample
-    geometry — their scores are directly comparable.
+    (active metrics + weights + indifference thresholds), the same seed and
+    the same reference-sample geometry — their scores are directly comparable.
     """
     import hashlib
     import json
@@ -166,6 +166,11 @@ def _scoring_signature(metric_weights, seed: int, n_samples: int,
         "n_samples": int(n_samples),
         "reference_size": int(reference_size),
     }
+    # Only fingerprints when actually used — target-free runs keep their
+    # historical signature (golden replay comparability).
+    if targets:
+        payload["targets"] = {k: round(float(v), 12)
+                              for k, v in sorted(targets.items())}
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True).encode("utf-8")
     ).hexdigest()[:16]
@@ -322,6 +327,7 @@ class DispersionOptimizer:
         bucket_constraints: Optional[List[BucketConstraint]] = None,
         vega_config: Optional[VegaConfig] = None,
         reference_cache: Optional[dict] = None,
+        metric_targets: Optional[Dict[str, float]] = None,
     ):
         self.long_candidates = long_candidates
         self.short_candidates = short_candidates
@@ -360,6 +366,8 @@ class DispersionOptimizer:
                 "exists. Pass a MetricWeights instance (optimize(metric_weights=...))."
             )
         self._metric_weights = metric_weights
+        # Indifference thresholds {metric_name: raw-value cap} — see ScoreFunction
+        self._metric_targets = dict(metric_targets) if metric_targets else None
         self._use_new_scoring = metric_weights is not None
         self._score_fn: Optional[ScoreFunction] = None
         self._weight_solver: Optional[WeightSolver] = None
@@ -776,7 +784,8 @@ class DispersionOptimizer:
                     f"Metric(s) {sorted(_axe_names)} are weighted but no candidate "
                     f"carries an Axe Target — add the 'Axe Target' column to the "
                     f"long input (absolute Vega units).")
-            self._score_fn = make_default_score_function(weights=self._metric_weights)
+            self._score_fn = make_default_score_function(weights=self._metric_weights,
+                                                         targets=self._metric_targets)
             ctx = ScoreContext(n_days=self._n_rows)
             # Weight bounds from stock objects (already decimal: 0.015 = 1.5%)
             all_min_w = [s.min_weight for s in self.long_candidates]
@@ -812,6 +821,7 @@ class DispersionOptimizer:
                 self._metric_weights, self.seed,
                 getattr(self, "_ref_n_samples", n_samples),
                 getattr(self, "_reference_size", 0),
+                targets=self._metric_targets,
             )
             # Construct weight solver AFTER fitting so it sees the fitted score_fn
             # Determine weight solver policy: _use_exact_in_ga=True uses exact adaptive bisection,

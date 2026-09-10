@@ -8,7 +8,7 @@ Public API:
 """
 
 # Public functions
-from functions.dispersion._api import solve, price, optimize, backtest
+from functions.dispersion._api import solve, price, optimize, backtest, list_metrics
 
 # Config classes (users construct these)
 from functions.dispersion.models import (

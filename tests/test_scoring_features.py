@@ -184,3 +184,61 @@ def test_api_too_many_forced_raises_before_load():
     with pytest.raises(ValueError, match="max_stocks_long"):
         optimize(long_df, cfg, cons,
                  forced_tickers=["AAA", "BBB", "CCC"])  # 3 forced > max 2
+
+
+# ---------------------------------------------------------------------------
+# Indifference thresholds (metric_targets)
+# ---------------------------------------------------------------------------
+
+
+def test_metric_targets_create_indifference_plateau():
+    """mean_payoff target: baskets above the threshold score identically."""
+    w = MetricWeights({"mean_payoff": 1.0})
+    ctx = ScoreContext(n_days=N_DAYS)
+    # Reference means straddle the 0.5 target (mu in [0.2, 0.8]); daily noise
+    # wide enough that hit_ratio etc. stay fittable across the reference sample
+    samples = [RNG.normal(mu, 0.5, N_DAYS)
+               for mu in RNG.uniform(0.2, 0.8, 120)]
+    sf = make_default_score_function(weights=w, targets={"mean_payoff": 0.5})
+    sf.build_reference(samples, ctx)
+    above_1 = np.full(N_DAYS, 0.6)
+    above_2 = np.full(N_DAYS, 1.5)
+    s1 = sf.score(above_1, ctx)
+    s2 = sf.score(above_2, ctx)
+    assert s1 == pytest.approx(s2)  # plateau: indifferent above 0.5
+    # below the target the metric still differentiates
+    assert sf.score(np.full(N_DAYS, 0.4), ctx) < s1
+    # control: without targets the higher mean scores strictly better
+    sf_plain = make_default_score_function(weights=w)
+    sf_plain.build_reference(samples, ctx)
+    assert sf_plain.score(above_2, ctx) > sf_plain.score(above_1, ctx)
+
+
+def test_metric_targets_lower_is_better_floor():
+    """weighted_strike (lower is better): values below the target are floored."""
+    w = MetricWeights({"weighted_strike": 1.0})
+    samples = _ref_samples()
+    extras = _extras_for(samples)  # strikes in ~[0.08, 0.18]
+    ctx = ScoreContext(n_days=N_DAYS)
+    sf = make_default_score_function(weights=w, targets={"weighted_strike": 0.10})
+    sf.build_reference(samples, ctx, sample_extras=extras)
+    pnl = RNG.normal(0.8, 1.2, N_DAYS)
+    lo1 = sf.score(pnl, ScoreContext(n_days=N_DAYS, weighted_strike=0.08))
+    lo2 = sf.score(pnl, ScoreContext(n_days=N_DAYS, weighted_strike=0.09))
+    hi = sf.score(pnl, ScoreContext(n_days=N_DAYS, weighted_strike=0.15))
+    assert lo1 == pytest.approx(lo2)  # both below 0.10 → floored to 0.10
+    assert lo1 > hi                   # above the target still differentiates
+
+
+def test_metric_targets_unknown_metric_raises():
+    with pytest.raises(ValueError, match="unknown metric"):
+        make_default_score_function(targets={"definitely_not_a_metric": 0.5})
+
+
+def test_list_metrics_api():
+    """list_metrics() exposes every registered metric with direction."""
+    import functions.dispersion as fd
+    df = fd.list_metrics()
+    assert {"mean_payoff", "hit_ratio", "weighted_strike"} <= set(df.index)
+    assert df.loc["max_drawdown", "direction"] == "lower is better"
+    assert bool(df.loc["mean_payoff", "core"])

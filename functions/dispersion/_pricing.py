@@ -3901,7 +3901,7 @@ class PricingEngine(VolSwapMixin):
                     running_idx = 0
 
                     for chunk_start in sorted(results_map_atms.keys()):
-                        chunk_data = results_map[chunk_start]
+                        chunk_data = results_map_atms[chunk_start]
                         chunk_size = chunk_data["chunk_size"]
 
                         if global_idx < running_idx + chunk_size:

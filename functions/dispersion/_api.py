@@ -363,6 +363,36 @@ def _build_pnl_matrix(
 # 1. SOLVE
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def list_metrics() -> pd.DataFrame:
+    """List every registered scoring metric for optimize()/optimize_multi().
+
+    Returns a DataFrame with one row per metric:
+      - metric: the name to use in ``score_weights`` / ``metric_targets``
+      - direction: "higher is better" / "lower is better"
+      - core: True for the 4 default metrics (equal-weighted when
+        ``score_weights=None``)
+      - description: one-line summary
+
+    Adding a criterion of your own never requires touching the engine:
+    register a class with ``@register_metric()`` in
+    ``functions/dispersion/scoring/metrics.py`` and it appears here and in
+    ``score_weights`` automatically.
+    """
+    from functions.dispersion.scoring.metrics import MetricRegistry
+    core = {"last_carry", "hit_ratio", "min_payoff", "mean_payoff"}
+    rows = []
+    for name in sorted(MetricRegistry.keys()):
+        cls = MetricRegistry[name]
+        doc = (getattr(cls, "__doc__", "") or "").strip().split("\n")[0].strip()
+        rows.append({
+            "metric": name,
+            "direction": "higher is better" if getattr(cls, "higher_is_better", True) else "lower is better",
+            "core": name in core,
+            "description": doc,
+        })
+    return pd.DataFrame(rows).set_index("metric")
+
+
 def solve(
     df: pd.DataFrame,
     config: DispersionConfig,
@@ -986,6 +1016,7 @@ def optimize(
     *,
     short_df: pd.DataFrame = None,
     score_weights: Dict[str, float] = None,
+    metric_targets: Dict[str, float] = None,
     start_date: date = None,
     end_date: date = None,
     filter_zero_hr: bool = False,
@@ -1023,6 +1054,15 @@ def optimize(
         'sharpe_payoff' and 'weighted_strike' (strike-minimisation objective;
         the max_net_strike hard constraint stays active independently).
         None = equal weights on the 4 core metrics.
+        Run ``list_metrics()`` to see every registered metric name (any of
+        them can be weighted — adding a criterion never requires touching
+        the engine).
+    metric_targets : dict, optional
+        Indifference thresholds, ``{metric_name: raw_value}`` — beyond the
+        target a metric stops differentiating (higher-is-better metrics cap
+        at the target, lower-is-better floor at it).  E.g.
+        ``{'mean_payoff': 0.5}`` = indifferent between a basket averaging
+        0.5 and one averaging 1.5.  None = no thresholds (default).
     start_date, end_date : date, optional
         Optimization window. Default: lookback_years from today.
     filter_zero_hr : bool
@@ -1205,6 +1245,7 @@ def optimize(
         global_cap=config.global_cap,
         global_floor=config.global_floor,
         metric_weights=metric_weights,
+        metric_targets=metric_targets,
         progress_callback=progress_callback,
         bisect_in_ga=bisect_in_ga,
         seed=seed,
@@ -1470,6 +1511,7 @@ def optimize_multi(
     *,
     configs: List[Dict[str, float]],
     short_df: pd.DataFrame = None,
+    metric_targets: Dict[str, float] = None,
     start_date: date = None,
     end_date: date = None,
     filter_zero_hr: bool = False,
@@ -1495,6 +1537,9 @@ def optimize_multi(
     configs:
         List of score_weights dicts, e.g.
         ``[{'mean_payoff': 1.0}, {'mean_payoff': 0.5, 'hit_ratio': 0.5}]``.
+    metric_targets:
+        Optional indifference thresholds ``{metric_name: raw_value}``,
+        shared by all configs (see :func:`optimize`).
     run_backtests:
         Backtest each winner (True, default) — set False to skip the
         backtest step (e.g. quick comparisons).
@@ -1587,6 +1632,7 @@ def optimize_multi(
             global_cap=config.global_cap,
             global_floor=config.global_floor,
             metric_weights=metric_weights,
+            metric_targets=metric_targets,
             progress_callback=progress_callback,
             bisect_in_ga=bisect_in_ga,
             seed=seed,

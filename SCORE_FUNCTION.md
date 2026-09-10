@@ -66,6 +66,17 @@ The sample is fixed for the whole run, so every candidate is measured against th
 same yardstick. If a criterion has no spread in the reference, the run stops with an
 error rather than silently scoring every candidate at zero.
 
+## Indifference thresholds
+
+Sometimes a criterion stops mattering past a point: a basket averaging 0.5v and one
+averaging 1.5v can be equally acceptable. `metric_targets={'mean_payoff': 0.5}`
+declares exactly that. The raw metric is capped at the target before normalisation
+(for lower-is-better criteria it is floored), in the calibration sample and in every
+evaluation alike, so all baskets past the threshold land on the same percentile and
+get the same contribution. The search then spends its effort on the criteria that
+are not saturated yet. No smooth saturating curve is needed — the plateau is the
+intended behaviour, and the genetic algorithm does not need a gradient.
+
 ## What the score does not do
 
 Constraints are not part of the score. Basket size, per-name weight bounds, the net
