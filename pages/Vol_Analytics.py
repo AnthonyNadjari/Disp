@@ -1,26 +1,24 @@
 """
-Vol Analytics — implied vs subsequent realised volatility, with variance-swap economics.
+Vol Analytics — implied vs subsequent realised volatility.
 
-Everything lives in the main page: a collapsible input panel at the top, live display
-controls, then the analysis tabs. No sidebar.
+Everything is in vol points, everything is on the main page: a collapsible input panel
+at the top, live display controls, then the analysis tabs. No sidebar.
 
 What it does
 ------------
 * Constant-maturity ATM implied vol vs the volatility that actually realised over the
   matching forward window, per name and for a weighted basket.
-* Spread expressed in vol points, variance points or vega-equivalent, with percentile
-  and rolling-percentile context.
-* Realised vol on the **variance-swap convention** (zero-mean, Σr²/N) by default, with
-  the demeaned sample-σ variant available.
+* The spread between the two, with percentile and rolling-percentile context.
+* Realised vol on the swap convention (zero-mean, Σr²/N) by default, with the demeaned
+  sample-σ variant available.
 * Regression of realised on implied with **Newey-West** standard errors, because the
   observations overlap by one horizon and plain OLS t-stats are meaningless there.
-* Short-variance carry, optionally **capped** (the desk's 2.5× local cap), reported
-  across *all* non-overlapping schedules so the result does not hinge on the arbitrary
-  start date of one of them.
+* Short-vol carry, optionally capped, reported across *all* non-overlapping schedules
+  so the result does not hinge on the arbitrary start date of one of them.
 * Term structure on matched observation dates, not today's implied against a stale
   realised.
 * Dispersion: implied vs subsequent realised correlation, the dispersion carry
-  (weighted single-name variance spread minus the index one), and a single-name ranking.
+  (weighted single-name spread minus the index one), and a single-name ranking.
 
 Design notes
 ------------
@@ -59,11 +57,7 @@ TENOR_CONFIG = {
 
 BASKET = "BASKET (avg)"
 
-SPREAD_BASES = {
-    "Variance": "variance points",
-    "Vol": "vol points",
-    "Vega-equivalent": "vol points (vega-equiv.)",
-}
+UNIT = "vol points"
 
 PCT_WINDOWS = {"1Y": TRADING_DAYS, "3Y": 3 * TRADING_DAYS, "5Y": 5 * TRADING_DAYS, "All": None}
 
@@ -196,15 +190,15 @@ def _load_implied(tickers: Sequence[str], start: dt.date, end: dt.date,
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# VOL / VARIANCE MATH
+# VOL MATH
 # ────────────────────────────────────────────────────────────────────────────
 
 def forward_realised_vol(prices: pd.DataFrame, horizon: int, demean: bool = False) -> pd.DataFrame:
     """Annualised realised vol, in vol points, over the window *after* each date.
 
-    ``demean=False`` (default) is the variance-swap convention, ``√(mean(r²))`` with no
-    mean subtraction, which is what a variance swap actually settles on. ``demean=True``
-    uses the sample standard deviation instead.
+    ``demean=False`` (default) is the swap convention, ``√(mean(r²))`` with no mean
+    subtraction, which is what a volatility or variance swap actually settles on.
+    ``demean=True`` uses the sample standard deviation instead.
 
     The value carried at date *t* covers returns over ``(t, t + horizon]``, so it lines
     up with an implied vol observed at *t*. The last ``horizon`` rows are therefore NaN.
@@ -241,26 +235,6 @@ def implied_correlation(sigma_names: pd.DataFrame, w: pd.Series, sigma_idx: pd.S
     wsq = (sub ** 2).mul(ww ** 2, axis=1).sum(axis=1, min_count=1)
     denom = (wsum ** 2) - wsq
     return ((idx ** 2) - wsq) / denom.where(denom.abs() > 1e-12)
-
-
-def basket_vol_from_rho(sigma_names: pd.DataFrame, w: pd.Series, rho: float) -> pd.Series:
-    """Correlation-consistent basket vol: √(ρ(Σwσ)² + (1−ρ)Σw²σ²)."""
-    cols = [c for c in sigma_names.columns if c in w.index]
-    sub, ww = sigma_names[cols], w[cols]
-    wsum = sub.mul(ww, axis=1).sum(axis=1, min_count=1)
-    wsq = (sub ** 2).mul(ww ** 2, axis=1).sum(axis=1, min_count=1)
-    return np.sqrt(rho * wsum ** 2 + (1.0 - rho) * wsq)
-
-
-def spread_frame(implied: pd.DataFrame, realised: pd.DataFrame, basis: str) -> pd.DataFrame:
-    """Implied − realised on the requested basis."""
-    if basis == "Vol":
-        return implied - realised
-    var = implied ** 2 - realised ** 2
-    if basis == "Variance":
-        return var
-    # Vega-equivalent: variance spread divided by 2K, i.e. what a var swap pays per vega
-    return var / (2.0 * implied.where(implied > 0))
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -348,27 +322,23 @@ def regression_stats(implied: pd.Series, realised: pd.Series, horizon: int) -> d
     }
 
 
-def var_swap_pnl(strike: pd.Series, realised: pd.Series, cap_mult: Optional[float]) -> pd.Series:
-    """Short-variance P&L in variance points: K² − R², capped at K² − (cap·K)²."""
-    pnl = strike ** 2 - realised ** 2
+def vol_swap_pnl(strike: pd.Series, realised: pd.Series, cap_mult: Optional[float]) -> pd.Series:
+    """Short-vol P&L in vol points: K − R, with realised capped at ``cap_mult`` × K."""
     if cap_mult:
-        pnl = np.maximum(pnl, strike ** 2 - (cap_mult * strike) ** 2)
-    return pnl
+        realised = np.minimum(realised, cap_mult * strike)
+    return strike - realised
 
 
 def carry_schedule(implied: pd.Series, realised: pd.Series, horizon: int,
                    cap_mult: Optional[float], offset: int = 0) -> pd.DataFrame:
-    """One non-overlapping short-variance schedule starting at ``offset``."""
+    """One non-overlapping short-vol schedule starting at ``offset``."""
     df = pd.concat([implied.rename("k"), realised.rename("r")], axis=1).dropna()
     if df.empty or offset >= len(df):
         return pd.DataFrame()
     t = df.iloc[offset::horizon].copy()
-    t["var_pnl"] = var_swap_pnl(t["k"], t["r"], cap_mult)
-    t["vega_pnl"] = t["var_pnl"] / (2.0 * t["k"].where(t["k"] > 0))
-    t["cum_var_pnl"] = t["var_pnl"].cumsum()
-    t["cum_vega_pnl"] = t["vega_pnl"].cumsum()
-    peak = t["cum_vega_pnl"].cummax()
-    t["drawdown"] = t["cum_vega_pnl"] - peak
+    t["pnl"] = vol_swap_pnl(t["k"], t["r"], cap_mult)
+    t["cum_pnl"] = t["pnl"].cumsum()
+    t["drawdown"] = t["cum_pnl"] - t["cum_pnl"].cummax()
     return t
 
 
@@ -380,15 +350,15 @@ def carry_all_offsets(implied: pd.Series, realised: pd.Series, horizon: int,
         t = carry_schedule(implied, realised, horizon, cap_mult, offset=off)
         if len(t) < 2:
             continue
-        vega = t["vega_pnl"]
-        sd = float(vega.std(ddof=1))
+        pnl = t["pnl"]
+        sd = float(pnl.std(ddof=1))
         rows.append({
             "offset": off,
             "trades": int(len(t)),
-            "total_vega_pnl": float(vega.sum()),
-            "mean_vega_pnl": float(vega.mean()),
-            "win_rate": float((t["var_pnl"] > 0).mean()),
-            "sharpe": float(vega.mean() / sd * np.sqrt(TRADING_DAYS / horizon)) if sd > 0 else np.nan,
+            "total_pnl": float(pnl.sum()),
+            "mean_pnl": float(pnl.mean()),
+            "win_rate": float((pnl > 0).mean()),
+            "sharpe": float(pnl.mean() / sd * np.sqrt(TRADING_DAYS / horizon)) if sd > 0 else np.nan,
             "max_drawdown": float(t["drawdown"].min()),
         })
     return pd.DataFrame(rows)
@@ -629,7 +599,7 @@ _stored = st.session_state.get("va_series")
 if _stored is not None and any(n not in names for n in _stored):
     st.session_state.pop("va_series", None)
 
-d1, d2, d3, d4 = st.columns([3, 2, 2, 2])
+d1, d2, d3 = st.columns([4, 2, 2])
 with d1:
     selected = st.multiselect("Series", names, default=names[:min(4, len(names))], key="va_series")
 _ref_options = selected or names
@@ -638,13 +608,10 @@ if st.session_state.get("va_ref") not in _ref_options:
 with d2:
     reference = st.selectbox("Reference", _ref_options, key="va_ref")
 with d3:
-    basis = st.radio("Spread basis", list(SPREAD_BASES), horizontal=False, key="va_basis")
-with d4:
-    pct_label = st.radio("Percentile window", list(PCT_WINDOWS), horizontal=False, key="va_pct")
+    pct_label = st.radio("Percentile window", list(PCT_WINDOWS), horizontal=True, key="va_pct")
 
 pct_window = PCT_WINDOWS[pct_label]
-unit = SPREAD_BASES[basis]
-spread_df = spread_frame(implied, realised, basis)
+spread_df = implied - realised
 
 if not selected:
     st.warning("Pick at least one series above.")
@@ -672,15 +639,15 @@ k2.metric(f"ATM implied ({tenor})", _fmt(latest_iv_series.iloc[-1]),
 k3.metric("Realised, last matched", _fmt(rv_matched),
           help=("no completed window yet" if pd.isna(matched_date) else
                 f"Window ending {matched_date:%d %b %Y}, against an implied of {_fmt(iv_matched)}."))
-k4.metric(f"Spread ({unit})", _fmt(current_spread))
+k4.metric(f"Spread ({UNIT})", _fmt(current_spread))
 k5.metric(f"Percentile ({pct_label})", _fmt(pct_win, 0, "%"),
           delta=(f"{pct_win - pct_all:+.0f} vs all history"
                  if np.isfinite(pct_win) and np.isfinite(pct_all) else None))
 k6.metric(f"Z-score ({pct_label})", _fmt(z_win))
 
 st.caption(
-    f"Spread = implied − subsequent realised, {unit}. Positive means the option market "
-    f"charged more than the underlying went on to deliver, so a short-variance position "
+    f"Spread = implied − subsequent realised, in {UNIT}. Positive means the option market "
+    f"charged more vol than the underlying went on to deliver, so a short-vol position "
     f"made money. The last {horizon} trading days are necessarily blank."
 )
 
@@ -703,7 +670,7 @@ with tabs[0]:
         x=[ref_spread.index[-1]], y=[current_spread], mode="markers", name=f"{reference} latest",
         marker=dict(size=12, color=RED, line=dict(color="white", width=1.5)),
         hovertemplate=f"{current_spread:.2f} · P{pct_all:.0f} all history<extra></extra>"))
-    _style(fig, f"{tenor} implied − subsequent realised ({unit})", unit.capitalize(), 560)
+    _style(fig, f"{tenor} implied − subsequent realised ({UNIT})", "Vol points", 560)
     st.plotly_chart(fig, use_container_width=True)
 
     rp = rolling_self_percentile(spread_df[reference], pct_window)
@@ -718,7 +685,7 @@ with tabs[0]:
     st.plotly_chart(pfig, use_container_width=True)
 
     st.download_button("Download spread series (CSV)", spread_df.to_csv().encode(),
-                       file_name=f"spread_{tenor}_{basis.lower()}.csv", key="dl_spread")
+                       file_name=f"spread_{tenor}.csv", key="dl_spread")
 
 # ─── Levels & distribution ──────────────────────────────────────────────────
 with tabs[1]:
@@ -739,11 +706,11 @@ with tabs[1]:
     hf.add_vline(x=float(ref_spread.mean()), line_color=GREY, line_dash="dash", line_width=2,
                  annotation_text=f"mean {ref_spread.mean():.2f}", annotation_position="bottom")
     _style(hf, f"{reference}: distribution of the spread", "Frequency", 380)
-    hf.update_layout(showlegend=False, hovermode="closest", xaxis_title=unit)
+    hf.update_layout(showlegend=False, hovermode="closest", xaxis_title=UNIT)
     st.plotly_chart(hf, use_container_width=True)
 
     q = ref_spread.describe(percentiles=[0.05, 0.25, 0.5, 0.75, 0.95])
-    st.dataframe(q.to_frame(unit).T.style.format("{:.2f}"), use_container_width=True)
+    st.dataframe(q.to_frame(UNIT).T.style.format("{:.2f}"), use_container_width=True)
 
 # ─── Regression ─────────────────────────────────────────────────────────────
 with tabs[2]:
@@ -763,7 +730,7 @@ with tabs[2]:
                   help=f"HAC standard error {_fmt(stats['se_slope'])}.")
         c2.metric("t-stat vs β = 1", _fmt(stats["t_vs_one"]),
                   help="Below −2: implied significantly over-predicts realised, i.e. a "
-                       "statistically robust variance risk premium.")
+                       "statistically robust volatility risk premium.")
         c3.metric("α", _fmt(stats["intercept"]))
         c4.metric("R²", _fmt(stats["r2"]))
         c5.metric("Short-vol win rate", _fmt(100 * stats["hit_ratio"], 0, "%"),
@@ -800,16 +767,15 @@ with tabs[2]:
 with tabs[3]:
     cc1, cc2 = st.columns([1, 3])
     with cc1:
-        capped = st.checkbox("Capped variance", value=True, key="va_capped")
+        capped = st.checkbox("Capped", value=True, key="va_capped")
         cap_mult = st.number_input("Cap × strike", 1.0, 10.0, 2.5, 0.25, key="va_cap",
                                    disabled=not capped)
     with cc2:
         st.caption(
-            "Short a variance swap struck at the implied vol of the day, hold to expiry, "
-            "collect K² − R². Trades never overlap. With the cap on, the realised leg is "
-            f"limited to ({cap_mult:g}·K)², the desk's usual local cap, which truncates the "
-            "left tail exactly where an uncapped short would hurt most. Vega-equivalent P&L "
-            "is the variance P&L divided by 2K, i.e. what the trade pays per unit of vega."
+            "Short a vol swap struck at the implied vol of the day, hold it to expiry, "
+            f"collect K − R in vol points. Trades never overlap. With the cap on, realised "
+            f"is limited to {cap_mult:g}×K, which truncates the left tail exactly where an "
+            "uncapped short would hurt most."
         )
 
     cap_arg = float(cap_mult) if capped else None
@@ -818,13 +784,13 @@ with tabs[3]:
     if schedules.empty:
         st.warning("Not enough completed windows to build a carry schedule.")
     else:
-        best_row = schedules.loc[schedules["total_vega_pnl"].idxmax()]
-        worst_row = schedules.loc[schedules["total_vega_pnl"].idxmin()]
+        best_row = schedules.loc[schedules["total_pnl"].idxmax()]
+        worst_row = schedules.loc[schedules["total_pnl"].idxmin()]
         m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Trades per schedule", int(schedules["trades"].median()))
-        m2.metric("Median total P&L (vega pts)", _fmt(schedules["total_vega_pnl"].median()))
+        m2.metric(f"Median total P&L ({UNIT})", _fmt(schedules["total_pnl"].median()))
         m3.metric("Across start dates",
-                  f"{worst_row['total_vega_pnl']:.1f} … {best_row['total_vega_pnl']:.1f}",
+                  f"{worst_row['total_pnl']:.1f} … {best_row['total_pnl']:.1f}",
                   help="Total P&L of the worst and best of the "
                        f"{len(schedules)} non-overlapping schedules. A wide range means the "
                        "result depends on when you happened to start.")
@@ -842,14 +808,14 @@ with tabs[3]:
         trades = carry_schedule(implied[reference], realised[reference], horizon, cap_arg, offset)
 
         cf = go.Figure()
-        cf.add_trace(go.Bar(x=trades.index, y=trades["vega_pnl"], name="Per trade (vega pts)",
-                            marker_color=[BLUE if v >= 0 else RED for v in trades["vega_pnl"]]))
-        cf.add_trace(go.Scatter(x=trades.index, y=trades["cum_vega_pnl"], mode="lines",
+        cf.add_trace(go.Bar(x=trades.index, y=trades["pnl"], name="Per trade",
+                            marker_color=[BLUE if v >= 0 else RED for v in trades["pnl"]]))
+        cf.add_trace(go.Scatter(x=trades.index, y=trades["cum_pnl"], mode="lines",
                                 name="Cumulative", yaxis="y2",
                                 line=dict(color="#00395D", width=2)))
-        _style(cf, f"Short-variance carry — {reference} ({tenor}, offset {offset})",
-               "Per-trade P&L (vega points)", 520)
-        cf.update_layout(yaxis2=dict(title="Cumulative (vega points)", overlaying="y",
+        _style(cf, f"Short-vol carry — {reference} ({tenor}, offset {offset})",
+               f"Per-trade P&L ({UNIT})", 520)
+        cf.update_layout(yaxis2=dict(title=f"Cumulative ({UNIT})", overlaying="y",
                                      side="right", showgrid=False))
         st.plotly_chart(cf, use_container_width=True)
 
@@ -857,13 +823,13 @@ with tabs[3]:
         ddf.add_trace(go.Scatter(x=trades.index, y=trades["drawdown"], mode="lines",
                                  fill="tozeroy", name="Drawdown",
                                  line=dict(color=RED, width=1)))
-        _style(ddf, "Drawdown of the cumulative carry", "Vega points", 280)
+        _style(ddf, "Drawdown of the cumulative carry", "Vol points", 280)
         st.plotly_chart(ddf, use_container_width=True)
 
         with st.expander("All schedules"):
             st.dataframe(
                 schedules.set_index("offset").style.format({
-                    "trades": "{:.0f}", "total_vega_pnl": "{:.1f}", "mean_vega_pnl": "{:.2f}",
+                    "trades": "{:.0f}", "total_pnl": "{:.1f}", "mean_pnl": "{:.2f}",
                     "win_rate": "{:.0%}", "sharpe": "{:.2f}", "max_drawdown": "{:.1f}",
                 }, na_rep="—"),
                 use_container_width=True)
@@ -891,8 +857,7 @@ with tabs[4]:
                 "Implied now": float(iv_series.iloc[-1]),
                 "Implied at match": iv_m,
                 "Realised": rv_m,
-                "Vol spread": iv_m - rv_m,
-                "Var spread": iv_m ** 2 - rv_m ** 2,
+                "Spread": iv_m - rv_m,
                 "Matched on": date_m,
             })
         if not rows:
@@ -908,7 +873,7 @@ with tabs[4]:
             st.dataframe(
                 term_df.style.format({
                     "Days": "{:.0f}", "Implied now": "{:.2f}", "Implied at match": "{:.2f}",
-                    "Realised": "{:.2f}", "Vol spread": "{:+.2f}", "Var spread": "{:+.1f}",
+                    "Realised": "{:.2f}", "Spread": "{:+.2f}",
                     "Matched on": lambda d: "—" if pd.isna(d) else f"{d:%d %b %Y}",
                 }, na_rep="—"),
                 use_container_width=True)
@@ -925,10 +890,10 @@ with tabs[4]:
             st.plotly_chart(tfig, use_container_width=True)
 
             sfig = go.Figure()
-            sfig.add_trace(go.Bar(x=term_df.index, y=term_df["Vol spread"],
+            sfig.add_trace(go.Bar(x=term_df.index, y=term_df["Spread"],
                                   marker_color=[BLUE if v >= 0 else RED
-                                                for v in term_df["Vol spread"]],
-                                  name="Vol spread"))
+                                                for v in term_df["Spread"]],
+                                  name="Spread"))
             sfig.add_hline(y=0, line_color="#444444", line_width=1)
             _style(sfig, "Premium by tenor (matched dates)", "Vol points", 320)
             sfig.update_layout(showlegend=False, hovermode="x")
@@ -979,20 +944,20 @@ with tabs[5]:
                "Correlation", 500)
         st.plotly_chart(rf, use_container_width=True)
 
-        # Dispersion carry: long single-name variance, short index variance
-        names_var_spread = weighted_avg(iv_names ** 2 - rv_names ** 2, w_valid)
-        index_var_spread = idx_iv ** 2 - idx_rv ** 2
-        disp = (names_var_spread - index_var_spread).dropna()
+        # Dispersion carry: long single-name vol, short index vol
+        names_spread = weighted_avg(iv_names - rv_names, w_valid)
+        index_spread = idx_iv - idx_rv
+        disp = (names_spread - index_spread).dropna()
         if not disp.empty:
             st.subheader("Dispersion carry")
             st.caption(
-                "Weighted single-name variance spread minus the index variance spread — the "
-                "P&L of being long single-name variance and short index variance, in variance "
-                "points, before cap and fees. Positive means dispersion paid."
+                "Weighted single-name spread minus the index spread — the P&L of being long "
+                f"single-name vol and short index vol, in {UNIT}, before cap and fees. "
+                "Positive means dispersion paid."
             )
             dc1, dc2, dc3 = st.columns(3)
-            dc1.metric("Latest", _fmt(disp.iloc[-1], 1))
-            dc2.metric("Mean", _fmt(disp.mean(), 1))
+            dc1.metric("Latest", _fmt(disp.iloc[-1]))
+            dc2.metric("Mean", _fmt(disp.mean()))
             dc3.metric("Share positive", _fmt(100 * (disp > 0).mean(), 0, "%"))
 
             dfig = go.Figure()
@@ -1001,15 +966,15 @@ with tabs[5]:
                                       fillcolor="rgba(0,174,239,0.15)"))
             dfig.add_hline(y=0, line_color="#444444", line_width=1)
             dfig.add_hline(y=float(disp.mean()), line_dash="dash", line_color=GREY, line_width=1,
-                           annotation_text=f"mean {disp.mean():.1f}")
-            _style(dfig, "Single-name minus index variance spread", "Variance points", 420)
+                           annotation_text=f"mean {disp.mean():.2f}")
+            _style(dfig, "Single-name minus index spread", "Vol points", 420)
             st.plotly_chart(dfig, use_container_width=True)
 
         st.subheader("Single-name ranking")
         sn_rows = []
         for t in valid:
             iv_s, rv_s = iv_names[t], rv_names[t]
-            sp = (iv_s ** 2 - rv_s ** 2).dropna()
+            sp = (iv_s - rv_s).dropna()
             iv_clean = iv_s.dropna()
             if sp.empty or iv_clean.empty:
                 continue
@@ -1020,7 +985,7 @@ with tabs[5]:
                 "Implied now": float(iv_clean.iloc[-1]),
                 "Implied at match": iv_m,
                 "Realised": rv_m,
-                "Var spread": float(sp.iloc[-1]),
+                "Spread": float(sp.iloc[-1]),
                 "Percentile": percentile_of_last(sp, None),
                 "Contribution": float(w_valid[t] * sp.iloc[-1]),
             })
@@ -1030,14 +995,14 @@ with tabs[5]:
             sn_df = pd.DataFrame(sn_rows).set_index("Ticker").sort_values(
                 "Contribution", ascending=False)
             st.caption(
-                "*Contribution* is the weight times the variance spread: what each name adds "
-                "to the basket leg of the dispersion trade."
+                "*Contribution* is the weight times the spread: what each name adds to the "
+                "basket leg of the dispersion trade."
             )
             st.dataframe(
                 sn_df.style.format({
                     "Weight": "{:.2%}", "Implied now": "{:.2f}", "Implied at match": "{:.2f}",
-                    "Realised": "{:.2f}", "Var spread": "{:+.1f}", "Percentile": "{:.0f}%",
-                    "Contribution": "{:+.1f}",
+                    "Realised": "{:.2f}", "Spread": "{:+.2f}", "Percentile": "{:.0f}%",
+                    "Contribution": "{:+.2f}",
                 }, na_rep="—"),
                 use_container_width=True)
             st.download_button("Download single names (CSV)", sn_df.to_csv().encode(),
@@ -1057,7 +1022,7 @@ with st.expander("Summary table"):
         rows.append({
             "Name": name,
             "Implied now": float(iv.iloc[-1]),
-            f"Spread ({unit})": float(sp.iloc[-1]),
+            f"Spread ({UNIT})": float(sp.iloc[-1]),
             "Mean spread": float(sp.mean()),
             "P (all)": percentile_of_last(sp, None),
             f"P ({pct_label})": percentile_of_last(sp, pct_window),
@@ -1068,7 +1033,7 @@ with st.expander("Summary table"):
         summary = pd.DataFrame(rows).set_index("Name")
         st.dataframe(
             summary.style.format({
-                "Implied now": "{:.2f}", f"Spread ({unit})": "{:+.2f}", "Mean spread": "{:+.2f}",
+                "Implied now": "{:.2f}", f"Spread ({UNIT})": "{:+.2f}", "Mean spread": "{:+.2f}",
                 "P (all)": "{:.0f}%", f"P ({pct_label})": "{:.0f}%",
                 f"Z ({pct_label})": "{:+.2f}", "N": "{:.0f}",
             }, na_rep="—"),
@@ -1091,14 +1056,11 @@ page.
 **Realised vol** — annualised over the **forward** {horizon}-trading-day window, so the
 value carried at a date is what an option struck that day went on to face.
 {'Sample standard deviation of log returns (demeaned).' if cfg['demean'] else
- 'Variance-swap convention: √(mean of squared log returns), no mean subtraction, which is what a variance swap settles on.'}
+ 'Swap convention: √(mean of squared log returns), no mean subtraction, which is what a vol or variance swap settles on.'}
 Annualisation by √{TRADING_DAYS}. The last {horizon} trading days have no completed
 window and are blank everywhere.
 
-**Spread bases** — *Vol* is implied − realised in vol points, the intuitive one.
-*Variance* is implied² − realised², the native unit of a variance swap. *Vega-equivalent*
-is the variance spread divided by 2·K, i.e. the variance P&L expressed per unit of vega,
-which is how the payoff is usually quoted.
+**Spread** — implied − realised, in vol points throughout the page.
 
 **Basket** — `{BASKET}` is a weighted **average of single-name vols**, renormalised each
 day on the names that have data. It is not a correlation-adjusted basket volatility; for
@@ -1108,13 +1070,12 @@ that, use the Dispersion tab with an index ticker.
 Daily observations of a {horizon}-day forward window overlap almost completely, so plain
 OLS standard errors overstate precision by roughly √{horizon}. The reported t-stat tests
 β = 1, which is the hypothesis that implied is an unbiased forecast; a significantly
-negative t-stat is the variance risk premium.
+negative t-stat is the volatility risk premium.
 
-**Carry** — non-overlapping short-variance trades. Because the schedule depends on which
-day you start, every one of the {horizon} possible offsets is computed and the header
-shows the median and the full range across them. With the cap on, the realised leg is
-capped at (cap·K)², matching a capped variance swap. Vega-equivalent P&L is the variance
-P&L over 2·K.
+**Carry** — non-overlapping short-vol trades paying K − R in vol points. Because the
+schedule depends on which day you start, every one of the {horizon} possible offsets is
+computed and the header shows the median and the full range across them. With the cap
+on, realised is capped at cap·K before the subtraction.
 
 **Implied correlation** — ρ = (σ_idx² − Σ wᵢ²σᵢ²) / ((Σ wᵢσᵢ)² − Σ wᵢ²σᵢ²), left
 unclipped so that a basket which does not replicate the index shows up as ρ outside
