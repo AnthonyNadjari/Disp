@@ -1357,14 +1357,14 @@ with tab1:
                            "For lower-is-better criteria (Max drawdown, Weighted strike) "
                            "the plateau is BELOW the target.")
                 _tgt_specs = [
-                    ('last_carry', 'Last carry', 'v (vol points)'),
-                    ('mean_payoff', 'Mean payoff', 'v (vol points)'),
-                    ('hit_ratio', 'Hit ratio', 'fraction 0–1'),
-                    ('min_payoff', 'Min payoff', 'v (vol points)'),
-                    ('max_drawdown', 'Max drawdown', 'v (vol points)'),
-                    ('cvar_5', 'CVaR 5%', 'v (vol points)'),
-                    ('sharpe_payoff', 'Sharpe', 'ratio'),
-                    ('weighted_strike', 'Weighted strike', 'decimal (0.25 = 25%)'),
+                    ('last_carry', 'Last carry', 'vol points (mean of the last trade payoffs)'),
+                    ('mean_payoff', 'Mean payoff', 'vol points (mean payoff per trade, e.g. 0.5)'),
+                    ('hit_ratio', 'Hit ratio', 'fraction 0–1 (0.65 = 65% winning trades)'),
+                    ('min_payoff', 'Min payoff', 'vol points (worst single trade, negative)'),
+                    ('max_drawdown', 'Max drawdown', 'vol points, positive magnitude of the worst drop — plateau BELOW the target'),
+                    ('cvar_5', 'CVaR 5%', 'vol points (mean of the 5% worst trades, negative)'),
+                    ('sharpe_payoff', 'Sharpe', 'annualized ratio (mean/std × √252)'),
+                    ('weighted_strike', 'Weighted strike', 'decimal vol (0.25 = 25%) — plateau BELOW the target'),
                 ]
                 metric_targets = {}
                 for _mname, _mlabel, _munit in _tgt_specs:
