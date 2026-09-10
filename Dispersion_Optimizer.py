@@ -291,22 +291,42 @@ def _cross_entry_point_fig(df_cross, start_date):
     if len(data) == 0:
         return None
     avail = data.columns
-    corr_sum = pd.Series(0.0, index=data.index)
-    idx_sum = pd.Series(0.0, index=data.index)
-    w_used = 0.0
-    for (stk, idx), w in zip(pairs, wts):
-        if stk in avail and idx in avail:
-            corr_sum += data[stk].fillna(0) * w
-            idx_sum += data[idx].fillna(0) * w
-            w_used += w
-    if w_used == 0:
+    used_pairs = [(stk, idx, w) for (stk, idx), w in zip(pairs, wts)
+                  if stk in avail and idx in avail]
+    if not used_pairs:
         return None
+    # ffill each IV series (a missing print must not zero a name's contribution —
+    # that was the source of mid-series spikes), then start where every used name
+    # has data (leading listing gaps only)
+    used_cols = sorted({t for stk, idx, _ in used_pairs for t in (stk, idx)})
+    sub = data[used_cols].ffill().dropna()
+    if len(sub) < 5:
+        return None
+    w_used = sum(w for _, _, w in used_pairs)
+    corr_sum = pd.Series(0.0, index=sub.index)
+    idx_sum = pd.Series(0.0, index=sub.index)
+    for stk, idx, w in used_pairs:
+        corr_sum += sub[stk] * w
+        idx_sum += sub[idx] * w
     result = (corr_sum - idx_sum) / w_used  # renormalize over pairs with data
     if result.abs().sum() == 0:
         return None
+    # Light smoothing: centered 5d rolling median kills single-day bad prints
+    result = result.rolling(5, min_periods=1, center=True).median()
+    # Same color / styling as the mono entry point — pulled from the desk _charts
+    # module at runtime so the two charts can never drift apart
+    _line_color = getattr(func_graph, 'BARCLAYS_LINE_ENTRY', '#00395D')
     fig = go.Figure(go.Scatter(x=result.index, y=result.values, mode='lines',
                                name='Implied Vol Spread',
-                               line=dict(color='#00395D', width=3)))
+                               line=dict(color=_line_color, width=3)))
+    _std = getattr(func_graph, 'standardize_chart_display', None)
+    if callable(_std):
+        try:
+            fig = _std(fig, 'Entry Point — 18M Implied Vol Spread', show_legend=False,
+                       is_entry_point=True)
+            return _decorate_entry_point(fig)
+        except Exception:
+            pass
     fig.update_layout(title="Entry Point — 18M Implied Vol Spread (corridor assets − index, weighted avg)",
                       xaxis_title='Date', yaxis_title='18M implied vol spread (vol pts)',
                       hovermode='x unified', height=500,
