@@ -5216,8 +5216,24 @@ class PricingEngine(VolSwapMixin):
                     row['Maturity Date'] = cfg.last_obs_date.strftime("%d/%m/%Y")
                     row['Down Var (%)'] = f"{cfg.dvar * 100:.2f}%"
                     row['Up Var (%)'] = f"{cfg.uvar * 100:.2f}%"
-                    # NOTE: strike values are stored as vol (e.g. 0.2168), not variance
-                    row['Strike (%)'] = f"{r.strike_variance_asset * 100:.2f}%" if r.strike_variance_asset else 'FAILED'
+                    # NOTE: strike values are stored as vol (e.g. 0.2168), not variance.
+                    # Label explicitly: this is the UNCAPPED solve (capped priced
+                    # strikes are separate columns below when Capped is on).
+                    row['Strike LV Uncapped (%)'] = f"{r.strike_variance_asset * 100:.2f}%" if r.strike_variance_asset else 'FAILED'
+                    if r.strike_lsv is not None:
+                        row['Strike LSV Uncapped (%)'] = f"{r.strike_lsv * 100:.2f}%"
+                    # ── Capped strikes (priced in Phase 2b when Capped is on) ──
+                    if cfg.is_capped:
+                        if r.strike_cap_priced_lv is not None:
+                            row['Strike Cap Priced LV (%)'] = f"{r.strike_cap_priced_lv * 100:.2f}%"
+                        if r.strike_cap_priced_lsv is not None:
+                            row['Strike Cap Priced LSV (%)'] = f"{r.strike_cap_priced_lsv * 100:.2f}%"
+                        if r.strike_cap_priced_lcm is not None:
+                            row['Strike Cap Priced LCM (%)'] = f"{r.strike_cap_priced_lcm * 100:.2f}%"
+                        if r.ev_cap_cross_lv is not None:
+                            row['EV Cap LV (%)'] = f"{r.ev_cap_cross_lv * 100:.2f}%"
+                        if r.cap_impact_bp is not None and r.cap_impact_bp > 0:
+                            row['Cap Theoretical Impact (bp)'] = f"{r.cap_impact_bp:.2f}"
                     # ── EV (mono corridor) — was missing in mono mode ──
                     if r.ev_mono is not None:
                         row['EV Mono LV (%)'] = f"{r.ev_mono:.2f}%"
