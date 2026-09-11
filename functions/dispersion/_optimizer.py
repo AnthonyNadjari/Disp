@@ -20,6 +20,7 @@ import math
 import random
 import time
 import os
+import warnings
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
@@ -1802,41 +1803,39 @@ class DispersionOptimizer:
         # weighted strikes so the strike objective normalises like any metric)
         self._score_fn.build_reference(sample_pnls, ctx, sample_extras=sample_extras)
         # Non-degeneracy for extras-carried ACTIVE metrics (weighted_strike,
-        # axe criteria): a constant reference saturates the rank normalizer
-        # (every candidate scores 0 under strictly-less tie semantics)
+        # axe criteria): a constant reference means the metric cannot rank
+        # anything — the saturation path in ScoreFunction now handles it (full
+        # marks for all, no crash). Warn loudly: easy axe targets are usually
+        # an input problem the user wants to know about.
         _active_extras = (set(self._score_fn.weights.active_names)
                           & {"weighted_strike", "axe_book_cleaned", "axe_package_recycled"})
         for _name in sorted(_active_extras):
             _vals = np.array([e[_name] for e in sample_extras if _name in e], dtype=np.float64)
             _vals = _vals[np.isfinite(_vals)]
             if len(_vals) > 10 and np.std(_vals) < 1e-10:
-                raise RuntimeError(
-                    f"Reference sample non-degenerate check failed: metric '{_name}' "
-                    f"has zero spread (all values ≈ {_vals[0]:.6f}) across the sampled "
-                    f"baskets — the quantile normalizer would score every candidate 0. "
-                    f"Vary the inputs (targets/caps/strikes) or deactivate the metric."
+                warnings.warn(
+                    f"Metric '{_name}' is constant (≈ {_vals[0]:.4f}) across all "
+                    f"sampled baskets — it cannot rank anything and scores full "
+                    f"marks for every candidate this run. If unintended, vary the "
+                    f"inputs (axe targets/caps/strikes) or deactivate the metric.",
+                    stacklevel=2,
                 )
         self._reference_size = len(sample_pnls)
         self._ref_n_samples = int(n_samples)
-        # Sanity: verify max_drawdown (and all metrics) have non-degenerate spread
-        # If std==0 for any active metric, the quantile normalizer is saturated
+        # Sanity: warn (no longer fatal — ScoreFunction saturates constant metrics
+        # to full marks) when an active metric has zero spread on the reference
         for m in self._score_fn.metrics:
             if m.name not in self._score_fn.weights.active_names:
                 continue
             vals = np.array([m.compute(p, ctx) for p in sample_pnls], dtype=np.float64)
             vals = vals[np.isfinite(vals)]
             if len(vals) > 10 and np.std(vals) < 1e-10:
-                # DEBUG: Print first 10 baskets for root cause analysis
-                for i in range(min(10, len(sample_pnls))):
-                    pnl = sample_pnls[i]
-                    last_val = float(np.mean(pnl[-1:]))
-                    mean_ret = float(np.mean(pnl))
-                    cumsum = float(np.sum(pnl))
-                raise RuntimeError(
-                    f"Reference sample non-degenerate check failed: metric '{m.name}' "
-                    f"has zero spread (all values ≈ {vals[0]:.6f}). The quantile normalizer "
-                    f"will saturate and this metric will have no effect on scoring. "
-                    f"Check that the weight strategy mix produces diverse baskets."
+                warnings.warn(
+                    f"Metric '{m.name}' is constant (≈ {vals[0]:.4f}) across the "
+                    f"reference sample — it cannot rank anything this run and scores "
+                    f"full marks for every candidate. If unintended, vary the inputs "
+                    f"or deactivate the metric.",
+                    stacklevel=2,
                 )
         ref_elapsed = time.time() - ref_start
         self.log("INFO", f"✅ Reference sample fitted ({len(sample_pnls)} baskets, {attempts} attempts) → bilevel scoring active [{ref_elapsed:.1f}s]")
