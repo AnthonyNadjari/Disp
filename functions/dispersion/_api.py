@@ -244,10 +244,32 @@ def _df_to_legs(df: pd.DataFrame, is_cross_corridor: bool) -> List[DispersionLeg
 
         # Absolute-Vega mode inputs (optional columns, absolute Vega units)
         def _opt_float(v):
+            """Optional float accepting '100 000' / '1,000' / '100k' / '2M'
+            (thousands separators and k/M suffixes are stripped). A non-empty
+            but unparseable cell raises — a silently dropped axe cap/target
+            is worse than an error."""
+            if v is None:
+                return None
+            if isinstance(v, str):
+                s = (v.strip().replace(" ", "").replace(" ", "")
+                     .replace(" ", "").replace(",", ""))
+                if not s or s.lower() in ("nan", "none", "-"):
+                    return None
+                mult = 1.0
+                if s[-1:].lower() == "k":
+                    mult, s = 1e3, s[:-1]
+                elif s[-1:].lower() == "m":
+                    mult, s = 1e6, s[:-1]
+                try:
+                    return float(s) * mult
+                except ValueError:
+                    raise ValueError(
+                        f"Vega cap/target cell {v!r} is not a number — fix it or blank it.")
             try:
                 f = float(v)
             except (TypeError, ValueError):
-                return None
+                raise ValueError(
+                    f"Vega cap/target cell {v!r} is not a number — fix it or blank it.")
             return None if pd.isna(f) else f
 
         axe_target = _opt_float(row.get('Axe Target', None))
