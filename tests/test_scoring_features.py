@@ -242,3 +242,23 @@ def test_list_metrics_api():
     assert {"mean_payoff", "hit_ratio", "weighted_strike"} <= set(df.index)
     assert df.loc["max_drawdown", "direction"] == "lower is better"
     assert bool(df.loc["mean_payoff", "core"])
+
+
+def test_metric_targets_full_saturation_does_not_crash():
+    """Reference sample entirely past the threshold: the capped metric is a
+    constant — the fit must survive, and ranking must come from the rest."""
+    w = MetricWeights({"mean_payoff": 0.5, "hit_ratio": 0.5})
+    ctx = ScoreContext(n_days=N_DAYS)
+    samples = [RNG.normal(mu, 2.0, N_DAYS) for mu in RNG.uniform(0.7, 0.9, 120)]
+    sf = make_default_score_function(weights=w, targets={"mean_payoff": 0.3})
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        sf.build_reference(samples, ctx)
+    assert any("constant" in str(w_.message) for w_ in rec)
+    # Both baskets above the 0.3 target on mean payoff; b has the better hit ratio
+    a = np.concatenate([np.full(200, 1.0), np.full(100, -0.4)])   # mean 0.533, hit 2/3
+    b = np.concatenate([np.full(250, 0.9), np.full(50, -0.9)])    # mean 0.6,   hit 5/6
+    sa, sb = sf.score(a, ctx), sf.score(b, ctx)
+    assert sb > sa  # ranking driven by hit_ratio alone
+    # saturated metric gives full marks to everyone
+    assert np.isfinite(sa) and np.isfinite(sb)

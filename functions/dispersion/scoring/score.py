@@ -352,11 +352,19 @@ class ScoreFunction:
         # are excluded from the fit (they stay usable only at weight 0).
         raw_arrays: Dict[str, np.ndarray] = {}
         self._unfitted_metrics: set = set()
+        self._saturated_metrics: set = set()
         for name, vals in raw_by_metric.items():
             arr = np.array(vals, dtype=np.float64)
             arr = arr[np.isfinite(arr)]
             if arr.size < 2:
                 self._unfitted_metrics.add(name)
+            elif np.unique(arr).size < 2:
+                # The indifference threshold swallowed the whole reference
+                # sample: the metric is a constant across all feasible baskets
+                # and cannot rank anything. It scores full marks for everyone
+                # (the plateau is, by definition, "as good as it gets") and is
+                # left out of the normalizer fit — a constant would crash it.
+                self._saturated_metrics.add(name)
             else:
                 raw_arrays[name] = arr
 
@@ -371,6 +379,14 @@ class ScoreFunction:
             warnings.warn(
                 f"build_reference: metrics {sorted(self._unfitted_metrics)} have no "
                 f"finite reference — they stay inactive (weight 0) for this run.",
+                stacklevel=2,
+            )
+        if self._saturated_metrics:
+            warnings.warn(
+                f"build_reference: metrics {sorted(self._saturated_metrics)} are "
+                f"constant across the calibration sample (every basket is past "
+                f"their indifference threshold) — they score full marks for all "
+                f"candidates and do not rank anything this run.",
                 stacklevel=2,
             )
 
@@ -495,9 +511,15 @@ class ScoreFunction:
         """Normalize raw values to [0, 1] using the fitted normalizer."""
         normalized: Dict[str, float] = {}
         unfitted = getattr(self, "_unfitted_metrics", set())
+        saturated = getattr(self, "_saturated_metrics", set())
         for m in self._metrics:
             if m.name in unfitted:
                 normalized[m.name] = 0.0  # no reference — inactive by construction
+                continue
+            if m.name in saturated:
+                # Constant across the calibration sample (threshold plateau) —
+                # full marks for everyone: identical contribution, no ranking effect.
+                normalized[m.name] = 1.0
                 continue
             val = raw.get(m.name)
             if val is None or not np.isfinite(val):
