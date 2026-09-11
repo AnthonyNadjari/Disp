@@ -68,6 +68,21 @@ BLUE, ORANGE, RED, GREY = "#00AEEF", "#F2A900", "#D62728", "#8C8C8C"
 # INPUT PARSING
 # ────────────────────────────────────────────────────────────────────────────
 
+def _to_bbg_name(name: str) -> str:
+    """Accept RICs ('NVDA.O', '.SPX') as well as BBG tickers — the rest of the
+    desk stack is RIC-first, so pastes from the pricing tab land here unchanged.
+    Anything that does not look like a RIC passes through untouched."""
+    name = str(name).strip()
+    import re as _re
+    if not name or not (name.startswith(".") or _re.match(r"^[A-Z0-9]{1,12}\.[A-Z]{1,4}$", name)):
+        return name
+    try:
+        from functions.common.tickers import ric_to_bbg
+        return ric_to_bbg(name) or name
+    except Exception:
+        return name
+
+
 def parse_universe(text: str) -> tuple[list[str], Optional[np.ndarray]]:
     """Parse the underlyings box.
 
@@ -252,7 +267,10 @@ def percentile_of_last(series: pd.Series, window: Optional[int]) -> float:
 
 
 def rolling_self_percentile(series: pd.Series, window: Optional[int]) -> pd.Series:
-    s = pd.to_numeric(series, errors="coerce")
+    # dropna first: the last `horizon` days of the spread are blank BY DESIGN
+    # (no completed realised window) — with NaNs kept, the trailing value is NaN
+    # and (x <= NaN) is False everywhere, so the curve read 0 at the right edge.
+    s = pd.to_numeric(series, errors="coerce").dropna()
 
     def pct(x: np.ndarray) -> float:
         return 100.0 * float((x <= x[-1]).mean())
@@ -539,6 +557,8 @@ with st.expander("⚙️  Inputs", expanded=not _has_run):
     if submitted:
         try:
             tickers, weights = parse_universe(universe_text)
+            tickers = [_to_bbg_name(t) for t in tickers]
+            index_ticker = _to_bbg_name(index_ticker) if index_ticker else index_ticker
             if not tickers:
                 raise ValueError("Enter at least one ticker.")
             if start_date >= end_date:
@@ -645,6 +665,17 @@ k5.metric(f"Percentile ({pct_label})", _fmt(pct_win, 0, "%"),
                  if np.isfinite(pct_win) and np.isfinite(pct_all) else None))
 k6.metric(f"Z-score ({pct_label})", _fmt(z_win))
 
+# Verdict strip — the punchline first: level, context, and whether short vol paid
+_verdict_sched = carry_all_offsets(implied[reference], realised[reference], horizon, None)
+_win_rate = 100.0 * float((ref_spread > 0).mean())
+_carry_med = float(_verdict_sched["mean_pnl"].median()) if not _verdict_sched.empty else np.nan
+st.markdown(
+    f"**Verdict — {reference} ({tenor}):** implied {_fmt(latest_iv_series.iloc[-1])} vs "
+    f"realised {_fmt(rv_matched)} → spread **{current_spread:+.2f}v** "
+    f"(P{pct_win:.0f} on {pct_label}). Short vol won **{_win_rate:.0f}%** of the "
+    f"{len(ref_spread)} windows; median carry **{_carry_med:+.2f}v** per trade (uncapped)."
+)
+
 st.caption(
     f"Spread = implied − subsequent realised, in {UNIT}. Positive means the option market "
     f"charged more vol than the underlying went on to deliver, so a short-vol position "
@@ -689,12 +720,24 @@ with tabs[0]:
 
 # ─── Levels & distribution ──────────────────────────────────────────────────
 with tabs[1]:
+    show_all_levels = st.toggle("Show all selected names", value=False, key="va_levels_all",
+                                help="Off: only the reference pair (cleanest read). On: "
+                                     "implied + realised for every selected name.")
+    names_lvl = selected if show_all_levels else [reference]
     lf = go.Figure()
-    for name in selected:
+    for name in names_lvl:
         lf.add_trace(go.Scatter(x=implied.index, y=implied[name], mode="lines",
                                 name=f"{name} implied"))
         lf.add_trace(go.Scatter(x=realised.index, y=realised[name], mode="lines",
                                 name=f"{name} realised", line=dict(dash="dot")))
+    # Last-point marker on the reference implied (same language as the other pages)
+    _iv_ref = implied[reference].dropna()
+    if not _iv_ref.empty:
+        lf.add_trace(go.Scatter(x=[_iv_ref.index[-1]], y=[_iv_ref.iloc[-1]], mode="markers",
+                                name=f"{reference} implied now", showlegend=False,
+                                marker=dict(size=11, color=RED, line=dict(color="white", width=1.5)),
+                                hovertemplate=f"implied {_iv_ref.iloc[-1]:.2f} · "
+                                              f"{_iv_ref.index[-1]:%d %b %Y}<extra></extra>"))
     _style(lf, f"{tenor} implied vs subsequent realised", "Annualised vol (%)", 520)
     st.plotly_chart(lf, use_container_width=True)
 
@@ -813,6 +856,13 @@ with tabs[3]:
         cf.add_trace(go.Scatter(x=trades.index, y=trades["cum_pnl"], mode="lines",
                                 name="Cumulative", yaxis="y2",
                                 line=dict(color="#00395D", width=2)))
+        if capped:
+            # Same schedule without the cap — shows exactly what the cap buys
+            trades_unc = carry_schedule(implied[reference], realised[reference], horizon, None, offset)
+            if not trades_unc.empty:
+                cf.add_trace(go.Scatter(x=trades_unc.index, y=trades_unc["cum_pnl"], mode="lines",
+                                        name="Cumulative (uncapped)", yaxis="y2",
+                                        line=dict(color=GREY, width=1.5, dash="dot")))
         _style(cf, f"Short-vol carry — {reference} ({tenor}, offset {offset})",
                f"Per-trade P&L ({UNIT})", 520)
         cf.update_layout(yaxis2=dict(title=f"Cumulative ({UNIT})", overlaying="y",
@@ -967,6 +1017,12 @@ with tabs[5]:
             dfig.add_hline(y=0, line_color="#444444", line_width=1)
             dfig.add_hline(y=float(disp.mean()), line_dash="dash", line_color=GREY, line_width=1,
                            annotation_text=f"mean {disp.mean():.2f}")
+            # Last-point marker + its all-history percentile (entry-point language)
+            _disp_pct = percentile_of_last(disp, None)
+            dfig.add_trace(go.Scatter(x=[disp.index[-1]], y=[disp.iloc[-1]], mode="markers",
+                                      name="Latest", showlegend=False,
+                                      marker=dict(size=12, color=RED, line=dict(color="white", width=1.5)),
+                                      hovertemplate=f"{disp.iloc[-1]:+.2f}v · P{_disp_pct:.0f} all history<extra></extra>"))
             _style(dfig, "Single-name minus index spread", "Vol points", 420)
             st.plotly_chart(dfig, use_container_width=True)
 
@@ -998,6 +1054,16 @@ with tabs[5]:
                 "*Contribution* is the weight times the spread: what each name adds to the "
                 "basket leg of the dispersion trade."
             )
+            bfig = go.Figure(go.Bar(
+                y=sn_df.index, x=sn_df["Contribution"], orientation="h",
+                marker_color=[BLUE if v >= 0 else RED for v in sn_df["Contribution"]],
+                hovertemplate="%{y}: %{x:+.2f}v<extra></extra>"))
+            _style(bfig, "Contribution to the basket leg (weight × spread)", "Vol points",
+                   max(260, 34 * len(sn_df)))
+            bfig.update_layout(showlegend=False, hovermode="closest",
+                               yaxis=dict(autorange="reversed"))
+            bfig.add_vline(x=0, line_color="#444444", line_width=1)
+            st.plotly_chart(bfig, use_container_width=True)
             st.dataframe(
                 sn_df.style.format({
                     "Weight": "{:.2%}", "Implied now": "{:.2f}", "Implied at match": "{:.2f}",
