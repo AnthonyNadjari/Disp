@@ -500,7 +500,7 @@ def _dispersion_lcm_properties(cfg, lcm_properties: Optional[dict]) -> dict:
         return props
     old_p, old_a = props.get("LambdaPricing"), props.get("LambdaAtm")
     props["LambdaPricing"] = lam
-    props["LambdaAtm"] = [lam] if isinstance(old_a, (list, tuple)) or old_a is None else lam
+    props["LambdaAtm"] = [lam]   # portal expects list form, whatever the caller passed
     _safe_print(f"[LCM] lambda policy: LambdaPricing {old_p} -> {lam}, LambdaAtm {old_a} -> {props['LambdaAtm']} "
                 f"(= EqEq lambda / ACEqEqSpread). CallSkew={props.get('CallSkew')} PutSkew={props.get('PutSkew')} "
                 f"LambdaFromRho0={props.get('LambdaFromRho0')}. LCM0 = same with skews 0.")
@@ -3509,9 +3509,11 @@ class PricingEngine(VolSwapMixin):
         else:
             _per_ticker_corr_mode = False
 
+        # Bound on EVERY path: Phase 2b reads it unconditionally (per-ticker
+        # correlation mode + Capped used to hit UnboundLocalError here).
+        unified_scenario = None
         if not _per_ticker_corr_mode:
             # ── Build unified scenario via common helper ──
-            unified_scenario = None
             use_lsv_solve = lsv_scenario is not None
             use_lcm_solve = cfg.lcm_params is not None and cfg.lcm_params.get('enabled', False)
 
