@@ -54,19 +54,30 @@ def build_lcm_bumps(
     Build LCM mutators for inclusion in a scenario axis.
 
     Returns a dict with:
-        "lcm_mutator": The OverrideLCMWithRealisedReference mutator.
+        "lcm_mutator":  The OverrideLCMWithRealisedReference mutator.
+        "lcm0_mutator": Same mutator, same lambdas, CallSkew = PutSkew = 0 —
+                        the flat-correlation control (the LCM analogue of LSV0).
+                        LCM − LCM0 isolates the correlation-skew contribution and
+                        cancels the level gap + MC noise between LV and LCM.
         "null_mutator": A GenericMutatorNull for padding other bumps.
 
     Usage in batch scenario assembly:
         parts = build_lcm_bumps(pp, lcm_properties)
         # Add parts["lcm_mutator"] to the "LCM" bump
+        # Add parts["lcm0_mutator"] to the "LCM0" bump (optional)
         # Add parts["null_mutator"] to pad other bumps in the LCM slot
     """
     props = lcm_properties if lcm_properties is not None else DEFAULT_LCM_PROPERTIES
+    props0 = lcm0_properties(props)
 
     lcm_mutator = pricing_portal.create_scenario_mutator(
         name="GenericMutatorOverrideLCMWithRealisedReference",
         mutator_properties=pricing_portal.create_scenario_mutator_properties(props),
+        mutator_properties_asset_overrides=[],
+    )
+    lcm0_mutator = pricing_portal.create_scenario_mutator(
+        name="GenericMutatorOverrideLCMWithRealisedReference",
+        mutator_properties=pricing_portal.create_scenario_mutator_properties(props0),
         mutator_properties_asset_overrides=[],
     )
     null_mutator = pricing_portal.create_scenario_mutator(
@@ -74,7 +85,17 @@ def build_lcm_bumps(
         mutator_properties=pricing_portal.create_scenario_mutator_properties({}),
         mutator_properties_asset_overrides=[],
     )
-    return {"lcm_mutator": lcm_mutator, "null_mutator": null_mutator}
+    return {"lcm_mutator": lcm_mutator, "lcm0_mutator": lcm0_mutator, "null_mutator": null_mutator}
+
+
+def lcm0_properties(lcm_properties: Dict[str, Any]) -> Dict[str, Any]:
+    """LCM0 = the same LCM property bag with CallSkew and PutSkew zeroed.
+    List-valued keys stay lists (the portal expects ``[x]``)."""
+    props0 = dict(lcm_properties)
+    for k in ("CallSkew", "PutSkew"):
+        v = lcm_properties.get(k)
+        props0[k] = [0.0] if isinstance(v, (list, tuple)) else 0.0
+    return props0
 
 
 def build_lcm_scenario(
@@ -269,15 +290,21 @@ def build_unified_scenario(
     correl_bump: float = 0,
     correl_bump_style: str = "Relative",
     lcm_properties: Optional[Dict[str, Any]] = None,
+    include_lcm0: bool = False,
 ) -> Optional[Any]:
     """
     Build a unified scenario axis with proper mutator padding.
 
     Depending on flags:
         Neither:       returns None (no scenario)
-        LCM only:      [LV, LCM]           — 2 bumps × 2 mutators
-        LSV only:      [LV, LSV0, LSV]     — 3 bumps × 2 mutators
-        LSV + LCM:     [LV, LSV0, LSV, LCM] — 4 bumps × 3 mutators
+        LCM only:      [LV, LCM]                 — 2 bumps × 2 mutators
+        LSV only:      [LV, LSV0, LSV]           — 3 bumps × 2 mutators
+        LSV + LCM:     [LV, LSV0, LSV, LCM]      — 4 bumps × 3 mutators
+    With ``include_lcm0=True`` an extra "LCM0" bump (LCM with CallSkew =
+    PutSkew = 0, see ``build_lcm_bumps``) is inserted before "LCM":
+        LCM only:      [LV, LCM0, LCM]
+        LSV + LCM:     [LV, LSV0, LSV, LCM0, LCM]
+    Off by default so existing consumers keep their MC cost and response shape.
 
     All bumps within an axis have equal mutator count (padded with GenericMutatorNull).
 
@@ -290,12 +317,12 @@ def build_unified_scenario(
     # ── LCM only ──
     if use_lcm and not use_lsv:
         lcm_parts = build_lcm_bumps(pricing_portal, lcm_properties)
-        scenario = pricing_portal.create_scenario(axes=[
-            pricing_portal.create_scenario_axis(bumps=[
-                pricing_portal.create_scenario_bump(name="LV", mutators=[lcm_parts["null_mutator"], lcm_parts["null_mutator"]]),
-                pricing_portal.create_scenario_bump(name="LCM", mutators=[lcm_parts["null_mutator"], lcm_parts["lcm_mutator"]]),
-            ])
-        ])
+        null = lcm_parts["null_mutator"]
+        bumps = [pricing_portal.create_scenario_bump(name="LV", mutators=[null, null])]
+        if include_lcm0:
+            bumps.append(pricing_portal.create_scenario_bump(name="LCM0", mutators=[null, lcm_parts["lcm0_mutator"]]))
+        bumps.append(pricing_portal.create_scenario_bump(name="LCM", mutators=[null, lcm_parts["lcm_mutator"]]))
+        scenario = pricing_portal.create_scenario(axes=[pricing_portal.create_scenario_axis(bumps=bumps)])
         return scenario
 
     # ── LSV only ──
@@ -309,14 +336,17 @@ def build_unified_scenario(
     # All bumps need 3 mutators: [LSV_slot, Correl_slot, LCM_slot]
     pad = lcm_parts["null_mutator"]
 
-    scenario = pricing_portal.create_scenario(axes=[
-        pricing_portal.create_scenario_axis(bumps=[
-            pricing_portal.create_scenario_bump(name="LV", mutators=lsv_parts["lv_mutators"] + [pad]),
-            pricing_portal.create_scenario_bump(name="LSV0", mutators=lsv_parts["lsv0_mutators"] + [pad]),
-            pricing_portal.create_scenario_bump(name="LSV", mutators=lsv_parts["lsv_mutators"] + [pad]),
-            pricing_portal.create_scenario_bump(name="LCM", mutators=[pad, lsv_parts["null_mutator"], lcm_parts["lcm_mutator"]]),
-        ])
-    ])
+    bumps = [
+        pricing_portal.create_scenario_bump(name="LV", mutators=lsv_parts["lv_mutators"] + [pad]),
+        pricing_portal.create_scenario_bump(name="LSV0", mutators=lsv_parts["lsv0_mutators"] + [pad]),
+        pricing_portal.create_scenario_bump(name="LSV", mutators=lsv_parts["lsv_mutators"] + [pad]),
+    ]
+    if include_lcm0:
+        bumps.append(pricing_portal.create_scenario_bump(
+            name="LCM0", mutators=[pad, lsv_parts["null_mutator"], lcm_parts["lcm0_mutator"]]))
+    bumps.append(pricing_portal.create_scenario_bump(
+        name="LCM", mutators=[pad, lsv_parts["null_mutator"], lcm_parts["lcm_mutator"]]))
+    scenario = pricing_portal.create_scenario(axes=[pricing_portal.create_scenario_axis(bumps=bumps)])
     return scenario
 
 

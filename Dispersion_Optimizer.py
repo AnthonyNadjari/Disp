@@ -2829,15 +2829,39 @@ with tab4:
                                                             step=0.05, format="%.4f", key="p_lcm_cs")
                         lcm_put_skew_var = st.number_input("Put Skew", value=float(_lcm_defaults["PutSkew"]), step=0.05,
                                                            format="%.4f", key="p_lcm_ps")
-                        lcm_lambda_atm_var = st.number_input("λ ATM", value=float(_lcm_defaults["LambdaAtm"]),
-                                                             step=0.01, format="%.7f", key="p_lcm_atm")
                         lcm_lambda_rho0_var = st.number_input("λ Rho0", value=float(_lcm_defaults["LambdaFromRho0"]),
                                                               step=0.01, format="%.4f", key="p_lcm_rho0")
-                        lcm_lambda_pricing_var = st.number_input("λ Pricing",
-                                                                 value=float(_lcm_defaults["LambdaPricing"]), step=0.01,
-                                                                 format="%.4f", key="p_lcm_pr")
-                        st.caption(
-                            f"ℹ️ LCM uses ACEqEqSpread = λ Pricing ({lcm_lambda_pricing_var:.4f}), not EqEq λ input")
+                        # ── λ ATM / λ Pricing: NOT editable — pinned to the EqEq λ input ──
+                        # Desk convention: one lambda. The EqEq λ above is the ACEqEqSpread
+                        # of the model context (LV / LSV / LCM alike) AND the LCM mutator's
+                        # LambdaPricing + LambdaAtm. Enforced engine-side in
+                        # functions.dispersion._pricing._dispersion_lcm_properties; shown
+                        # here so everyone sees which lambda is used.
+                        if eqeq_lambda_var > 0:
+                            lcm_lambda_atm_var = eqeq_lambda_var
+                            lcm_lambda_pricing_var = eqeq_lambda_var
+                            _lam_c1, _lam_c2 = st.columns(2)
+                            _lam_c1.metric("λ ATM (= EqEq λ)", f"{lcm_lambda_atm_var:.4f}",
+                                           delta=f"CSV: {float(_lcm_defaults['LambdaAtm']):.4f}", delta_color="off")
+                            _lam_c2.metric("λ Pricing (= EqEq λ)", f"{lcm_lambda_pricing_var:.4f}",
+                                           delta=f"CSV: {float(_lcm_defaults['LambdaPricing']):.4f}", delta_color="off")
+                            st.info(
+                                f"**LCM lambda policy** — EqEq λ = **{eqeq_lambda_var:.4f}** is used everywhere: "
+                                f"`ACEqEqSpread` of the model context (LV / LSV / LCM) **and** the LCM mutator's "
+                                f"`LambdaPricing` + `LambdaAtm`. The CSV values for those two are shown for reference only. "
+                                f"Call Skew / Put Skew / λ Rho0 stay as set above.\n\n"
+                                f"**LCM impact = EV(LCM) − EV(LCM0)**, where LCM0 = same LCM with Call Skew = Put Skew = 0 "
+                                f"(the LSV0 analogue). Strike LCM = √(−(EV_LV + EV_LCM − EV_LCM0) / RA). "
+                                f"'LCM Raw' columns = √(−EV_LCM / RA) without the LCM0 control."
+                            )
+                        else:
+                            # Individual Correlations mode passes eqeq_lambda = 0 → engine keeps CSV lambdas
+                            lcm_lambda_atm_var = float(_lcm_defaults["LambdaAtm"])
+                            lcm_lambda_pricing_var = float(_lcm_defaults["LambdaPricing"])
+                            st.warning(
+                                f"EqEq λ is not set in this correlation mode (0). LCM keeps the CSV lambdas: "
+                                f"λ ATM = {lcm_lambda_atm_var:.4f}, λ Pricing = {lcm_lambda_pricing_var:.4f}. "
+                                f"LCM impact is still EV(LCM) − EV(LCM0).")
         else:
             apply_lsv_var = False
             apply_lcm_var = False
