@@ -179,8 +179,8 @@ _ZCB_CACHE: Dict[tuple, float] = {}
 # EV vs the cap-priced strike).  Column label carries the move.
 #   functions.common.pricing_utils.CORRELATION_SENS_BUMP   the move (0.01 = +1 pt)
 #   PRICING_CORRSENS_BUMP / _PARAMS / _DEBUG                env overrides
-from functions.common.pricing_scenarios import LcmParamSet, lcm_bump_layout
-from functions.dispersion.lcm_sets import resolve_lcm_sets, lcm_column_suffix
+from functions.common.pricing_scenarios import LcmParamSet, lcm_bump_layout, lcm0_properties
+from functions.dispersion.lcm_sets import resolve_lcm_sets, lcm_column_suffix, lcm0_lambda_for
 from functions.common.pricing_utils import (
     CORRELATION_SENS_METRIC as _CORRSENS_METRIC,
     correlation_sens_bump as _corrsens_bump,
@@ -478,23 +478,30 @@ def _ra_from_payout_trace(n_corridor_obs: float, n_total_obs: int, zcb: float) -
 # priced once, every set on the same market and MC paths, LCM0 bumps shared
 # between sets with identical lambdas. Per set:
 #
-#     strike_LCM = sqrt( -(EV_LV + EV_LCM - EV_LCM0) / RA )     (LCM0 = skews 0)
+#     strike_LCM = sqrt( -(EV_LV + EV_LCM - EV_LCM0) / RA )
+#
+# LCM0 is ALWAYS LambdaPricing = LambdaAtm = the EqEq lambda (= ACEqEqSpread
+# of the model context), skews 0 — whatever lambdas a set uses. One LCM0 bump
+# therefore serves every set (with the same rho0).
 #
 # Defaults policy (functions.dispersion.lcm_sets.resolve_lcm_sets): a set's
-# LambdaPricing / LambdaAtm default to the run's EqEq lambda (= ACEqEqSpread of
-# the model context) unless given explicitly; other fields default to the desk
-# CSV values. The legacy single ``cfg.lcm_params`` dict is accepted as one
-# unnamed set (bump names LCM / LCM0, un-suffixed columns).
+# LambdaPricing / LambdaAtm default to the run's EqEq lambda unless given
+# explicitly; other fields default to the desk CSV values. The legacy single
+# ``cfg.lcm_params`` dict is accepted as one unnamed set (bump names LCM /
+# LCM0, un-suffixed columns).
 
-def _lcm_params_label(props: dict) -> str:
-    """Compact audit string of the LCM properties actually sent, for the results table."""
-    def _v(k):
-        v = props.get(k)
+def _lcm_params_label(props: dict, props0: Optional[dict] = None) -> str:
+    """Compact audit string of the LCM (and LCM0) properties actually sent."""
+    def _v(p, k):
+        v = p.get(k)
         if isinstance(v, (list, tuple)):
             v = v[0] if v else None
         return "?" if v is None else f"{float(v):.4g}"
-    return (f"lamP={_v('LambdaPricing')} lamATM={_v('LambdaAtm')} rho0={_v('LambdaFromRho0')} "
-            f"CS={_v('CallSkew')} PS={_v('PutSkew')}")
+    s = (f"lamP={_v(props, 'LambdaPricing')} lamATM={_v(props, 'LambdaAtm')} rho0={_v(props, 'LambdaFromRho0')} "
+         f"CS={_v(props, 'CallSkew')} PS={_v(props, 'PutSkew')}")
+    if props0:
+        s += f" | LCM0: lamP={_v(props0, 'LambdaPricing')} lamATM={_v(props0, 'LambdaAtm')} CS=PS=0"
+    return s
 
 
 def _resolve_lcm_sets_for(cfg) -> List[LcmParamSet]:
@@ -505,6 +512,16 @@ def _resolve_lcm_sets_for(cfg) -> List[LcmParamSet]:
         getattr(cfg, "lcm_params", None),
         log=lambda m: _safe_print("[LCM] " + m),
     )
+
+
+def _lcm0_lambda_for(cfg) -> Optional[float]:
+    """Lambda LCM0 is pinned to for this run (EqEq lambda), None if unusable."""
+    return lcm0_lambda_for(getattr(cfg, "eqeq_lambda", None))
+
+
+def _lcm_layout_for(cfg, lcm_sets_eff):
+    """``[(set, bump_lcm, bump_lcm0)]`` with LCM0 pinned to the EqEq lambda."""
+    return lcm_bump_layout(lcm_sets_eff, _lcm0_lambda_for(cfg))
 
 
 # Module-level state (portal connection)
@@ -1679,7 +1696,8 @@ class LcmLegResult:
     set_name: str
     bump_lcm: str
     bump_lcm0: str
-    properties: dict = field(default_factory=dict)      # effective mutator properties sent
+    properties: dict = field(default_factory=dict)      # effective LCM mutator properties sent
+    properties0: dict = field(default_factory=dict)     # effective LCM0 mutator properties sent
     # solve mode
     ev_cross: Optional[float] = None
     ev_cross0: Optional[float] = None
@@ -2537,7 +2555,7 @@ class PricingEngine(VolSwapMixin):
         unified_scenario = None
         use_lsv = cfg.use_lsv_cross_ev and cfg.lsv_params is not None
         lcm_sets_eff = _resolve_lcm_sets_for(cfg)
-        lcm_layout = lcm_bump_layout(lcm_sets_eff)      # [(set, bump_lcm, bump_lcm0)]
+        lcm_layout = _lcm_layout_for(cfg, lcm_sets_eff)      # [(set, bump_lcm, bump_lcm0)]
         use_lcm = bool(lcm_sets_eff)
 
         if use_lcm:
@@ -2568,6 +2586,7 @@ class PricingEngine(VolSwapMixin):
                 correl_bump=cfg.lsv_correl_bump,
                 correl_bump_style=cfg.lsv_correl_bump_style,
                 lcm_sets=lcm_sets_eff,
+                lcm0_lambda=_lcm0_lambda_for(cfg),
             )
             _bump_names = ["LV", "LSV0", "LSV"] if use_lsv else ["LV"]
             _bump_names += list(dict.fromkeys(b0 for _, _, b0 in lcm_layout)) + [b for _, b, _ in lcm_layout]
@@ -2752,6 +2771,7 @@ class PricingEngine(VolSwapMixin):
                     lcm_legs = {
                         s.name: LcmLegResult(set_name=s.name, bump_lcm=b, bump_lcm0=b0,
                                              properties=s.to_properties(),
+                                             properties0=lcm0_properties(s.to_properties(), _lcm0_lambda_for(cfg)),
                                              mid_lcm=_extract(idx, "FairValue", b),
                                              mid_lcm0=_extract(idx, "FairValue", b0))
                         for s, b, b0 in lcm_layout
@@ -3580,7 +3600,7 @@ class PricingEngine(VolSwapMixin):
             # ── Build unified scenario via common helper ──
             use_lsv_solve = lsv_scenario is not None
             lcm_sets_eff = _resolve_lcm_sets_for(cfg)
-            lcm_layout = lcm_bump_layout(lcm_sets_eff)      # [(set, bump_lcm, bump_lcm0)]
+            lcm_layout = _lcm_layout_for(cfg, lcm_sets_eff)      # [(set, bump_lcm, bump_lcm0)]
             use_lcm_solve = bool(lcm_sets_eff)
 
             if use_lcm_solve:
@@ -3609,6 +3629,7 @@ class PricingEngine(VolSwapMixin):
                     correl_bump=cfg.lsv_correl_bump,
                     correl_bump_style=cfg.lsv_correl_bump_style,
                     lcm_sets=lcm_sets_eff,
+                    lcm0_lambda=_lcm0_lambda_for(cfg),
                 )
                 _bump_names = ["LV", "LSV0", "LSV"] if use_lsv_solve else ["LV"]
                 _bump_names += list(dict.fromkeys(b0 for _, _, b0 in lcm_layout)) + [b for _, b, _ in lcm_layout]
@@ -4287,6 +4308,7 @@ class PricingEngine(VolSwapMixin):
                 for _s, _b, _b0 in lcm_layout:
                     _leg = LcmLegResult(set_name=_s.name, bump_lcm=_b, bump_lcm0=_b0,
                                         properties=_s.to_properties(),
+                                        properties0=lcm0_properties(_s.to_properties(), _lcm0_lambda_for(cfg)),
                                         ev_cross=ev_lcm_by_set.get(_s.name, [None] * n_ev)[idx],
                                         ev_cross0=ev_lcm0_by_set.get(_s.name, [None] * n_ev)[idx])
                     if _leg.ev_cross is not None and ra_val is not None and ra_val != 0:
@@ -5267,7 +5289,7 @@ class PricingEngine(VolSwapMixin):
                         if _leg.impact is not None:
                             row[f'LCM Impact Cross{_sfx} (%)'] = f"{_leg.impact * 100:.2f}%"
                         if _leg.ev_cross is not None:   # solve mode; price mode writes it below
-                            row[f'LCM Params{_sfx}'] = _lcm_params_label(_leg.properties)
+                            row[f'LCM Params{_sfx}'] = _lcm_params_label(_leg.properties, _leg.properties0)
 
                     if r.range_accrual is not None:
                         # Mono and cross legs share the corridor asset → one RA column
@@ -5349,7 +5371,7 @@ class PricingEngine(VolSwapMixin):
                         if _leg.mid_impact is not None:
                             row[f'LCM Impact Variance Asset{_sfx} (%)'] = f"{_leg.mid_impact * 100:.2f}%"
                         if _leg.mid_lcm is not None:
-                            row[f'LCM Params{_sfx}'] = _lcm_params_label(_leg.properties)
+                            row[f'LCM Params{_sfx}'] = _lcm_params_label(_leg.properties, _leg.properties0)
                     if r.zero_strike_mid_variance_asset is not None:
                         row['Realized Var Variance Asset (%)'] = f"{r.zero_strike_mid_variance_asset * 100:.2f}%"
                     if r.zero_strike_mid_corridor_asset is not None:

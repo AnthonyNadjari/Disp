@@ -15,6 +15,11 @@ Policy
 * When the EqEq lambda is not usable (``<= 0``, e.g. Individual Correlations
   mode passes 0.0) the lambdas fall back to ``DEFAULT_LCM_PROPERTIES`` and the
   fact is reported through ``log``.
+* **LCM0** (the control every set's impact is measured against) is ALWAYS
+  LambdaPricing = LambdaAtm = the EqEq lambda, skews 0 — whatever lambdas the
+  set itself uses (``lcm0_lambda_for``). One LCM0 bump therefore serves every
+  set with the same ρ0. When the EqEq lambda is not usable, LCM0 falls back to
+  the set's own lambdas (skews 0).
 * Set names must be unique; ``""`` is allowed only for a single set (legacy
   bump names ``LCM`` / ``LCM0``, un-suffixed result columns).
 """
@@ -93,10 +98,20 @@ def resolve_lcm_sets(
         if "lambda_pricing" in missing or "lambda_atm" in missing:
             which = [k for k in ("lambda_pricing", "lambda_atm") if k in missing]
             lam_note = f" ({', '.join(which)} <- {lam_src})"
+        lcm0_lam = lcm0_lambda_for(eqeq_lambda)
+        lcm0_note = (f"LCM0 = LambdaPricing=LambdaAtm={lcm0_lam:g} (EqEq lambda), skews 0"
+                     if lcm0_lam is not None else "LCM0 = same lambdas, skews 0")
         log(f"{tag} LambdaPricing={f.lambda_pricing:g} LambdaAtm={f.lambda_atm:g} "
             f"LambdaFromRho0={f.lambda_from_rho0:g} CallSkew={f.call_skew:g} PutSkew={f.put_skew:g}"
-            f"{lam_note}; LCM0 = same lambdas, skews 0")
+            f"{lam_note}; {lcm0_note}")
     return out
+
+
+def lcm0_lambda_for(eqeq_lambda: Optional[float]) -> Optional[float]:
+    """The lambda LCM0 is pinned to: the EqEq lambda when usable, else ``None``
+    (LCM0 then keeps each set's own lambdas)."""
+    lam = float(eqeq_lambda or 0.0)
+    return lam if lam > 0.0 else None
 
 
 def lcm_column_suffix(set_name: str) -> str:

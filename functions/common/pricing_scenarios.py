@@ -86,9 +86,13 @@ class LcmParamSet:
     def bump_lcm0(self) -> str:
         return "LCM0" if not self.name else f"LCM0_{self.name}"
 
-    def lcm0_key(self) -> Tuple:
-        """LCM0 depends on the lambdas only (skews are zeroed) — sets sharing
-        this key share one LCM0 bump."""
+    def lcm0_key(self, lcm0_lambda: Optional[float] = None) -> Tuple:
+        """What the LCM0 bump depends on (skews are zeroed) — sets sharing this
+        key share one LCM0 bump. With ``lcm0_lambda`` given, LCM0's
+        LambdaPricing and LambdaAtm are both pinned to it, so only ρ0 and the
+        aggregator can still split sets."""
+        if lcm0_lambda is not None:
+            return (float(lcm0_lambda), float(lcm0_lambda), self.lambda_from_rho0, self.aggregator_type)
         return (self.lambda_pricing, self.lambda_atm, self.lambda_from_rho0, self.aggregator_type)
 
     # ---- defaults / conversion ----
@@ -144,11 +148,14 @@ class LcmParamSet:
         raise TypeError(f"cannot coerce {type(obj).__name__} to LcmParamSet")
 
 
-def lcm_bump_layout(lcm_sets: Sequence[LcmParamSet]) -> List[Tuple[LcmParamSet, str, str]]:
+def lcm_bump_layout(lcm_sets: Sequence[LcmParamSet],
+                    lcm0_lambda: Optional[float] = None) -> List[Tuple[LcmParamSet, str, str]]:
     """``[(set, lcm_bump_name, lcm0_bump_name), ...]`` in input order.
 
-    LCM0 bumps are shared between sets with the same ``lcm0_key`` (the first
-    set owns the bump name). Raises on duplicate set names."""
+    LCM0 bumps are shared between sets with the same ``lcm0_key(lcm0_lambda)``
+    (the first set owns the bump name). With ``lcm0_lambda`` every LCM0 uses
+    LambdaPricing = LambdaAtm = lcm0_lambda, so all sets with the same ρ0 share
+    ONE LCM0 bump. Raises on duplicate set names."""
     seen_names = set()
     lcm0_owner: Dict[Tuple, str] = {}
     out = []
@@ -156,7 +163,7 @@ def lcm_bump_layout(lcm_sets: Sequence[LcmParamSet]) -> List[Tuple[LcmParamSet, 
         if s.name in seen_names:
             raise ValueError(f"duplicate LcmParamSet name {s.name!r}")
         seen_names.add(s.name)
-        key = s.lcm0_key()
+        key = s.lcm0_key(lcm0_lambda)
         lcm0 = lcm0_owner.setdefault(key, s.bump_lcm0)
         out.append((s, s.bump_lcm, lcm0))
     return out
@@ -212,13 +219,18 @@ def build_lcm_bumps(
     return {"lcm_mutator": lcm_mutator, "lcm0_mutator": lcm0_mutator, "null_mutator": null_mutator}
 
 
-def lcm0_properties(lcm_properties: Dict[str, Any]) -> Dict[str, Any]:
-    """LCM0 = the same LCM property bag with CallSkew and PutSkew zeroed.
-    List-valued keys stay lists (the portal expects ``[x]``)."""
+def lcm0_properties(lcm_properties: Dict[str, Any], lcm0_lambda: Optional[float] = None) -> Dict[str, Any]:
+    """LCM0 = the LCM property bag with CallSkew and PutSkew zeroed and, when
+    ``lcm0_lambda`` is given, LambdaPricing = LambdaAtm = lcm0_lambda (the
+    flat-correlation control at the run's reference lambda). List-valued keys
+    stay lists (the portal expects ``[x]``)."""
     props0 = dict(lcm_properties)
     for k in ("CallSkew", "PutSkew"):
         v = lcm_properties.get(k)
         props0[k] = [0.0] if isinstance(v, (list, tuple)) else 0.0
+    if lcm0_lambda is not None:
+        props0["LambdaPricing"] = float(lcm0_lambda)
+        props0["LambdaAtm"] = [float(lcm0_lambda)]
     return props0
 
 
@@ -416,6 +428,7 @@ def build_unified_scenario(
     lcm_properties: Optional[Dict[str, Any]] = None,
     include_lcm0: bool = False,
     lcm_sets: Optional[Sequence[LcmParamSet]] = None,
+    lcm0_lambda: Optional[float] = None,
 ) -> Optional[Any]:
     """
     Build a unified scenario axis with proper mutator padding.
@@ -423,9 +436,12 @@ def build_unified_scenario(
     LCM can be given two ways:
       * ``lcm_sets`` — N fully-filled ``LcmParamSet``; each contributes an
         ``LCM_<name>`` bump plus an ``LCM0_<name>`` bump (skews = 0), LCM0
-        bumps shared between sets with identical lambdas (``lcm_bump_layout``).
-        ``use_lcm`` is implied. This is the multi-set path: one call, LV priced
-        once, every set priced on the same market and MC paths.
+        bumps shared between sets with identical ``lcm0_key`` (``lcm_bump_layout``).
+        With ``lcm0_lambda`` every LCM0 is pinned to LambdaPricing = LambdaAtm
+        = lcm0_lambda (the run's reference lambda) whatever the set's lambdas,
+        so sets with the same ρ0 share one LCM0. ``use_lcm`` is implied. This
+        is the multi-set path: one call, LV priced once, every set priced on
+        the same market and MC paths.
       * ``lcm_properties`` (+ ``include_lcm0``) — legacy single set, bump names
         ``LCM`` / ``LCM0``. Unchanged behaviour for existing consumers.
 
@@ -439,11 +455,12 @@ def build_unified_scenario(
     # ── Normalise the LCM input to a layout ──
     layout: List[Tuple[LcmParamSet, str, str]] = []
     if lcm_sets:
-        layout = lcm_bump_layout(list(lcm_sets))
+        layout = lcm_bump_layout(list(lcm_sets), lcm0_lambda)
         use_lcm = True
     elif use_lcm:
         legacy = LcmParamSet.from_properties(lcm_properties or DEFAULT_LCM_PROPERTIES, name="")
         layout = [(legacy, legacy.bump_lcm, legacy.bump_lcm0 if include_lcm0 else None)]
+        lcm0_lambda = None      # legacy path: LCM0 keeps the set's own lambdas
 
     if not use_lsv and not use_lcm:
         return None
@@ -456,7 +473,7 @@ def build_unified_scenario(
         props = s.to_properties()
         lcm_mutators[b_lcm] = build_lcm_mutator(pricing_portal, props)
         if b_lcm0 is not None and b_lcm0 not in lcm_mutators:
-            lcm_mutators[b_lcm0] = build_lcm_mutator(pricing_portal, lcm0_properties(props))
+            lcm_mutators[b_lcm0] = build_lcm_mutator(pricing_portal, lcm0_properties(props, lcm0_lambda))
     lcm0_names = [b for _, _, b in layout if b is not None]
     lcm0_names = list(dict.fromkeys(lcm0_names))          # unique, input order
     lcm_names = [b for _, b, _ in layout]

@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from functions.common.pricing_scenarios import (  # noqa: E402
     DEFAULT_LCM_PROPERTIES, LcmParamSet, lcm_bump_layout, lcm0_properties, build_unified_scenario,
 )
-from functions.dispersion.lcm_sets import resolve_lcm_sets, lcm_column_suffix  # noqa: E402
+from functions.dispersion.lcm_sets import resolve_lcm_sets, lcm_column_suffix, lcm0_lambda_for  # noqa: E402
 
 
 class FakePortal:
@@ -126,6 +126,36 @@ def test_layout_shares_lcm0_between_same_lambdas():
         ("A", "LCM_A", "LCM0_A"), ("B", "LCM_B", "LCM0_A"), ("C", "LCM_C", "LCM0_C")]
 
 
+def test_layout_pinned_lcm0_lambda_shares_one_lcm0_across_lambdas():
+    """LCM0 pinned to the EqEq lambda: sets with different lambdas still share
+    ONE LCM0 (only rho0 can split it)."""
+    sets = resolve_lcm_sets(0.4, [{"name": "A"},
+                                  {"name": "B", "lambda_pricing": 0.55, "lambda_atm": 0.3},
+                                  {"name": "C", "lambda_from_rho0": 0.2}])
+    lay = lcm_bump_layout(sets, lcm0_lambda=0.4)
+    assert [(s.name, b, b0) for s, b, b0 in lay] == [
+        ("A", "LCM_A", "LCM0_A"), ("B", "LCM_B", "LCM0_A"), ("C", "LCM_C", "LCM0_C")]
+
+
+def test_lcm0_properties_pinned_lambda():
+    p = LcmParamSet(name="B", lambda_pricing=0.55, lambda_atm=0.3, lambda_from_rho0=0.1,
+                    call_skew=-0.5, put_skew=-0.9, aggregator_type="Basket").to_properties()
+    p0 = lcm0_properties(p, lcm0_lambda=0.4)
+    assert p0["LambdaPricing"] == 0.4 and p0["LambdaAtm"] == [0.4]
+    assert p0["CallSkew"] == [0.0] and p0["PutSkew"] == [0.0] and p0["LambdaFromRho0"] == 0.1
+    assert p["LambdaPricing"] == 0.55          # the LCM bag itself is untouched
+
+
+def test_scenario_pinned_lcm0(pp):
+    sets = resolve_lcm_sets(0.4, [{"name": "A"}, {"name": "B", "lambda_pricing": 0.55, "lambda_atm": 0.3}])
+    sc = build_unified_scenario(pp, use_lsv=False, lcm_sets=sets, lcm0_lambda=0.4)
+    assert _bump_names(sc) == ["LV", "LCM0_A", "LCM_A", "LCM_B"]       # one LCM0 for both
+    assert _lcm_props_of(sc, "LCM0_A")["LambdaPricing"] == 0.4
+    assert _lcm_props_of(sc, "LCM0_A")["LambdaAtm"] == [0.4]
+    assert _lcm_props_of(sc, "LCM_B")["LambdaPricing"] == 0.55
+    assert _lcm_props_of(sc, "LCM_B")["LambdaAtm"] == [0.3]
+
+
 def test_layout_rejects_duplicate_names():
     with pytest.raises(ValueError):
         lcm_bump_layout([LcmParamSet(name="A"), LcmParamSet(name="A")])
@@ -205,6 +235,17 @@ def test_resolve_naming_rules():
         resolve_lcm_sets(0.4, [{"name": "A"}, {"name": "A"}])
     with pytest.raises(ValueError):
         resolve_lcm_sets(0.4, [LcmParamSet(name=""), LcmParamSet(name="B")])
+
+
+def test_lcm0_lambda_for():
+    assert lcm0_lambda_for(0.4) == 0.4
+    assert lcm0_lambda_for(0.0) is None and lcm0_lambda_for(None) is None and lcm0_lambda_for(-1) is None
+
+
+def test_resolve_log_mentions_pinned_lcm0():
+    logs = []
+    resolve_lcm_sets(0.4, [{"name": "B", "lambda_pricing": 0.55}], log=logs.append)
+    assert "LCM0 = LambdaPricing=LambdaAtm=0.4" in logs[-1]
 
 
 def test_column_suffix():

@@ -140,6 +140,33 @@ def test_results_df_missing_lcm0_leaves_strike_empty_keeps_raw(pricing):
 
 
 def test_params_label(pricing):
-    lab = pricing._lcm_params_label({"LambdaPricing": 0.4, "LambdaAtm": [0.4], "LambdaFromRho0": 0.1,
-                                     "CallSkew": [-0.5], "PutSkew": [-0.9]})
-    assert lab == "lamP=0.4 lamATM=0.4 rho0=0.1 CS=-0.5 PS=-0.9"
+    p = {"LambdaPricing": 0.55, "LambdaAtm": [0.3], "LambdaFromRho0": 0.1, "CallSkew": [-0.5], "PutSkew": [-0.9]}
+    assert pricing._lcm_params_label(p) == "lamP=0.55 lamATM=0.3 rho0=0.1 CS=-0.5 PS=-0.9"
+    p0 = {"LambdaPricing": 0.4, "LambdaAtm": [0.4], "CallSkew": [0.0], "PutSkew": [0.0]}
+    assert pricing._lcm_params_label(p, p0).endswith("| LCM0: lamP=0.4 lamATM=0.4 CS=PS=0")
+
+
+def test_engine_layout_pins_lcm0_to_eqeq_lambda(pricing):
+    cfg = _cfg(pricing, lcm_sets=[{"name": "A"}, {"name": "B", "lambda_pricing": 0.55, "lambda_atm": 0.3}])
+    sets = pricing._resolve_lcm_sets_for(cfg)
+    lay = pricing._lcm_layout_for(cfg, sets)
+    assert [b0 for _, _, b0 in lay] == ["LCM0_A", "LCM0_A"]          # one shared LCM0
+    assert pricing._lcm0_lambda_for(cfg) == 0.4
+    # results carry both property bags
+    tr = pricing.TickerResult(ticker="X.PA", corridor_asset=".STOXX50E", success=True, currency="EUR",
+                              strike_variance_asset=0.2, strike_corridor_asset=0.22)
+    from functions.common.pricing_scenarios import lcm0_properties
+    s = sets[1]
+    tr.lcm["B"] = pricing.LcmLegResult(set_name="B", bump_lcm="LCM_B", bump_lcm0="LCM0_A",
+                                       properties=s.to_properties(),
+                                       properties0=lcm0_properties(s.to_properties(), 0.4),
+                                       ev_cross=-0.03, ev_cross0=-0.029, strike=0.2, strike_raw=0.19)
+    df = pricing.PricingEngine(cfg)._build_results_df([tr])
+    assert df["LCM Params [B]"].iloc[0] == "lamP=0.55 lamATM=0.3 rho0=0.1 CS=-0.5 PS=-0.9 | LCM0: lamP=0.4 lamATM=0.4 CS=PS=0"
+
+
+def test_engine_lcm0_falls_back_when_eqeq_unusable(pricing):
+    cfg = _cfg(pricing, eqeq_lambda=0.0, lcm_sets=[{"name": "A"}, {"name": "B", "lambda_pricing": 0.6}])
+    sets = pricing._resolve_lcm_sets_for(cfg)
+    assert pricing._lcm0_lambda_for(cfg) is None
+    assert [b0 for _, _, b0 in pricing._lcm_layout_for(cfg, sets)] == ["LCM0_A", "LCM0_B"]   # own lambdas → split

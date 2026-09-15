@@ -2892,20 +2892,26 @@ with tab4:
                         if len(set(_names)) != len(_names):
                             st.error(f"LCM sets: duplicate names {sorted({n for n in _names if _names.count(n) > 1})} — rename the rows.")
                         if _lam_ok:
+                            st.warning(
+                                f"**Reminder — LCM0 is fixed:** λ Pricing = λ ATM = EqEq λ = **{eqeq_lambda_var:.4f}**, "
+                                f"Call/Put Skew = 0, for every set, whatever lambdas the row uses. "
+                                f"One LCM0 is priced per distinct λ Rho0 and shared by the sets."
+                            )
                             st.info(
                                 f"**Lambda used** — EqEq λ = **{eqeq_lambda_var:.4f}** is `ACEqEqSpread` in the model "
-                                f"context for every bump (LV / LSV / LCM). λ Pricing and λ ATM above default to that same "
-                                f"value; edit a row to price a set with different lambdas. CSV reference: "
-                                f"λ Pricing {float(_lcm_defaults['LambdaPricing']):.4f}, λ ATM {float(_lcm_defaults['LambdaAtm']):.4f}.\n\n"
-                                f"**LCM impact = EV(LCM) − EV(LCM0)** per set, LCM0 = same lambdas with Call/Put Skew = 0 "
-                                f"(the LSV0 analogue). Strike LCM = √(−(EV_LV + EV_LCM − EV_LCM0) / RA). "
-                                f"'LCM Raw' = √(−EV_LCM / RA) without the LCM0 control. The exact parameters sent are "
-                                f"in the 'LCM Params [set]' result column."
+                                f"context for every bump (LV / LSV / LCM). λ Pricing and λ ATM in the table default to that "
+                                f"same value; edit a row to price its LCM with other lambdas (LCM0 stays at EqEq λ). "
+                                f"CSV reference: λ Pricing {float(_lcm_defaults['LambdaPricing']):.4f}, "
+                                f"λ ATM {float(_lcm_defaults['LambdaAtm']):.4f}.\n\n"
+                                f"**LCM impact = EV(LCM) − EV(LCM0)** per set. Strike LCM = √(−(EV_LV + EV_LCM − EV_LCM0) / RA). "
+                                f"'LCM Raw' = √(−EV_LCM / RA) without the LCM0 control. The exact LCM and LCM0 parameters "
+                                f"sent are in the 'LCM Params [set]' result column."
                             )
                         else:
                             st.warning(
                                 f"EqEq λ is not set in this correlation mode (0). λ Pricing / λ ATM are prefilled from the "
-                                f"CSV instead ({_lam_p_default:.4f} / {_lam_a_default:.4f}). LCM impact is still EV(LCM) − EV(LCM0).")
+                                f"CSV instead ({_lam_p_default:.4f} / {_lam_a_default:.4f}); LCM0 then uses each row's own "
+                                f"lambdas with skews 0. LCM impact is still EV(LCM) − EV(LCM0).")
         else:
             apply_lsv_var = False
             apply_lcm_var = False
