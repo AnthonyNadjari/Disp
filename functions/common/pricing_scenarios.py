@@ -80,10 +80,12 @@ class LcmParamSet:
     # ---- bump naming ----
     @property
     def bump_lcm(self) -> str:
+        """Scenario bump name of this set's LCM price (``LCM`` / ``LCM_<name>``)."""
         return "LCM" if not self.name else f"LCM_{self.name}"
 
     @property
     def bump_lcm0(self) -> str:
+        """Scenario bump name of this set's LCM0 control (``LCM0`` / ``LCM0_<name>``)."""
         return "LCM0" if not self.name else f"LCM0_{self.name}"
 
     def lcm0_key(self, lcm0_lambda: Optional[float] = None) -> Tuple:
@@ -97,6 +99,7 @@ class LcmParamSet:
 
     # ---- defaults / conversion ----
     def missing(self) -> List[str]:
+        """Names of the fields still ``None`` (to be filled before ``to_properties``)."""
         return [f for f in self._FIELDS if getattr(self, f) is None]
 
     def filled(self, **defaults) -> "LcmParamSet":
@@ -170,6 +173,9 @@ def lcm_bump_layout(lcm_sets: Sequence[LcmParamSet],
 
 
 def build_lcm_mutator(pricing_portal, props: Dict[str, Any]):
+    """The ``GenericMutatorOverrideLCMWithRealisedReference`` mutator for one
+    LCM property bag (as produced by ``LcmParamSet.to_properties`` /
+    ``lcm0_properties``)."""
     return pricing_portal.create_scenario_mutator(
         name="GenericMutatorOverrideLCMWithRealisedReference",
         mutator_properties=pricing_portal.create_scenario_mutator_properties(props),
