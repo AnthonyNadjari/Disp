@@ -49,13 +49,16 @@ def _desk_defaults() -> dict:
 
 
 def resolve_lcm_sets(
-    eqeq_lambda: Optional[float],
+    reference_lambda: Optional[float],
     lcm_sets: Optional[Sequence[LcmSetInput]] = None,
     legacy_lcm_params: Optional[dict] = None,
     log: Callable[[str], None] = lambda _m: None,
+    lambda_label: str = "EqEq lambda",
 ) -> List[LcmParamSet]:
     """Fully-filled, validated LCM sets for one pricing run. ``[]`` = LCM off.
 
+    ``reference_lambda`` is the run's lambda the LCM lambdas default to
+    (dispersion: the EqEq lambda); ``lambda_label`` names it in the log.
     ``lcm_sets`` wins over ``legacy_lcm_params`` (``{'enabled': bool,
     'lcm_properties': dict}``). Dicts in ``lcm_sets`` may be field-keyed
     (``{'name': 'A', 'lambda_pricing': 0.4}``) or portal-keyed
@@ -83,13 +86,13 @@ def resolve_lcm_sets(
 
     # ── defaults ──
     defaults = _desk_defaults()
-    lam = float(eqeq_lambda or 0.0)
+    lam = float(reference_lambda or 0.0)
     if lam > 0.0:
         defaults["lambda_pricing"] = lam
         defaults["lambda_atm"] = lam
-        lam_src = f"EqEq lambda {lam:g}"
+        lam_src = f"{lambda_label} {lam:g}"
     else:
-        lam_src = (f"desk defaults (EqEq lambda={lam:g} not usable): "
+        lam_src = (f"desk defaults ({lambda_label}={lam:g} not usable): "
                    f"LambdaPricing={defaults['lambda_pricing']:g}, LambdaAtm={defaults['lambda_atm']:g}")
 
     out: List[LcmParamSet] = []
@@ -102,8 +105,8 @@ def resolve_lcm_sets(
         if "lambda_pricing" in missing or "lambda_atm" in missing:
             which = [k for k in ("lambda_pricing", "lambda_atm") if k in missing]
             lam_note = f" ({', '.join(which)} <- {lam_src})"
-        lcm0_lam = lcm0_lambda_for(eqeq_lambda)
-        lcm0_note = (f"LCM0 = LambdaPricing=LambdaAtm={lcm0_lam:g} (EqEq lambda), skews 0"
+        lcm0_lam = lcm0_lambda_for(reference_lambda)
+        lcm0_note = (f"LCM0 = LambdaPricing=LambdaAtm={lcm0_lam:g} ({lambda_label}), skews 0"
                      if lcm0_lam is not None else "LCM0 = same lambdas, skews 0")
         log(f"{tag} LambdaPricing={f.lambda_pricing:g} LambdaAtm={f.lambda_atm:g} "
             f"LambdaFromRho0={f.lambda_from_rho0:g} CallSkew={f.call_skew:g} PutSkew={f.put_skew:g}"
@@ -111,10 +114,10 @@ def resolve_lcm_sets(
     return out
 
 
-def lcm0_lambda_for(eqeq_lambda: Optional[float]) -> Optional[float]:
-    """The lambda LCM0 is pinned to: the EqEq lambda when usable, else ``None``
-    (LCM0 then keeps each set's own lambdas)."""
-    lam = float(eqeq_lambda or 0.0)
+def lcm0_lambda_for(reference_lambda: Optional[float]) -> Optional[float]:
+    """The lambda LCM0 is pinned to: the reference lambda when usable, else
+    ``None`` (LCM0 then keeps each set's own lambdas)."""
+    lam = float(reference_lambda or 0.0)
     return lam if lam > 0.0 else None
 
 
