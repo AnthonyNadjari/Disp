@@ -499,6 +499,8 @@ def _df_from_paste(text: str, cols) -> pd.DataFrame:
         'vega cap', 'axe target', 'axe cap', 'currency', 'correlation',
         'ticker', 'tickers', 'name', 'names', 'ric', 'rics',
         'volofvar', 'eq/volcorrel', 'meanreversion',
+        'set', 'λ pricing', 'λ atm', 'λ rho0', 'lambda pricing', 'lambda atm', 'lambda rho0',
+        'call skew', 'put skew',
     }
     _row0 = [str(v).strip().casefold() for v in df.iloc[0].tolist()]
     if sum(1 for v in _row0 if v in _known) >= 2:
@@ -2849,8 +2851,41 @@ with tab4:
                         # rows to fill by hand). Edits survive a change of N; a change of EqEq λ
                         # or region re-seeds the table.
                         _seed_sig = f"{_lam_p_default:.6f}_{_lcm_region}"
+                        _LCM_COLS = ["Set", "λ Pricing", "λ ATM", "λ Rho0", "Call Skew", "Put Skew"]
+                        # ── Paste + Fill (same parser as the basket tables) ──
+                        _lcm_pasted = st.text_area(
+                            "Paste LCM sets here:",
+                            height=80,
+                            key="p_lcm_paste",
+                            help="One row per set, tab/comma separated: Set, λ Pricing, λ ATM, λ Rho0, Call Skew, Put Skew. "
+                                 "A header row is skipped. Blank cells take the prefill (EqEq λ / CSV values).",
+                        )
+                        if st.button("Fill LCM sets", key="p_lcm_fill"):
+                            if _lcm_pasted:
+                                try:
+                                    _pdf = _df_from_paste(_lcm_pasted, _LCM_COLS)
+                                    _rows = []
+                                    for _i, _r in _pdf.iterrows():
+                                        _row = {"Set": str(_r["Set"]).strip() if str(_r["Set"]).strip() not in ("", "nan") else ""}
+                                        for _c in _LCM_COLS[1:]:
+                                            try:
+                                                _v = float(str(_r[_c]).replace(",", ".").strip())
+                                            except (TypeError, ValueError):
+                                                _v = _prefill_row[_c]
+                                            _row[_c] = _v
+                                        _rows.append(_row)
+                                    if not _rows:
+                                        raise ValueError("no rows parsed")
+                                    st.session_state["p_lcm_sets_rows"] = _rows
+                                    st.session_state["p_lcm_sets_sig"] = _seed_sig
+                                    st.session_state["p_lcm_n_sets"] = len(_rows)
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Error processing LCM sets: {e}")
+                        if "p_lcm_n_sets" not in st.session_state:
+                            st.session_state["p_lcm_n_sets"] = 1
                         _n_lcm_sets = int(st.number_input("Number of LCM sets", min_value=1, max_value=12,
-                                                          value=1, step=1, key="p_lcm_n_sets"))
+                                                          step=1, key="p_lcm_n_sets"))
                         _prev_rows = st.session_state.get("p_lcm_sets_rows") or []
                         if st.session_state.get("p_lcm_sets_sig") != _seed_sig:
                             _prev_rows = []
