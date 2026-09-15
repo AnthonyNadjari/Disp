@@ -22,9 +22,6 @@ __all__ = [
     "generate_fpf_vol",
     "solve_volswap_strike_single",
     "solve_volswap_strikes_multithreaded",
-    # LSV / LCM
-    "calculate_lsv_v2",
-    "compute_lcm_cross_impact",
     # Classes (swap — used by non-batch fallback)
     "CrossCorridorVarianceSwap",
     # Utilities
@@ -794,53 +791,9 @@ def build_corridor_fpf(
     return new_fpf.to_fpf_string()
 
 
-def calculate_lsv_v2(fpf, underlyings, premium_date, currency, df_lsv_input, eqeq_spread, eqeq_floor,
-                     correl_bump_lsv_style="Relative", correl_bump_lsv=0):
-    """Compute LSV impact (LSV - LV) for a single FPF. Uses shared scenario builder."""
-    from functions.pricing_models.lsv import calculate_lsv_v2 as _calculate_lsv_v2
-    # Reuse the shared implementation
-    return _calculate_lsv_v2(
-        fpf=fpf,
-        underlyings=underlyings,
-        premium_date=premium_date,
-        currency=currency,
-        df_lsv_input=df_lsv_input,
-        eqeq_spread=eqeq_spread,
-        eqeq_floor=eqeq_floor,
-        correl_bump_lsv_style=correl_bump_lsv_style,
-        correl_bump_lsv=correl_bump_lsv,
-    )
-
-
-def compute_lcm_cross_impact(
-        fpf,
-        underlyings,
-        premium_date,
-        currency,
-        model_context,
-        calculation_parameters=None,
-        valuation_date=None,
-        lcm_properties=None,
-        price_id="lcm_cross",
-        snap_name=None,
-):
-    """
-    Price LV vs LCM on the cross-corridor leg only and return (lv, lcm, impact=lcm-lv).
-    IMPORTANT: Call this ONLY on the variance-asset instrument so the corridor asset leg is untouched.
-    """
-    from functions.pricing_models.lcm import compute_lcm_cross_impact as _compute_lcm_cross_impact
-    return _compute_lcm_cross_impact(
-        fpf=fpf,
-        underlyings=underlyings,
-        premium_date=premium_date,
-        currency=currency,
-        model_context=model_context,
-        calculation_parameters=calculation_parameters,
-        valuation_date=valuation_date,
-        lcm_properties=lcm_properties,
-        price_id=price_id,
-        snap_name=snap_name,
-    )
+# (calculate_lsv_v2 / compute_lcm_cross_impact removed: they wrapped a
+#  functions.pricing_models package that no longer exists. LSV / LCM are priced
+#  as scenario bumps in the batch path — see functions.common.pricing_scenarios.)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1063,10 +1016,6 @@ class CrossCorridorVarianceSwap:
         self.eqeq_lambda = eqeq_lambda
         self.correl_floor = correl_floor
         self.eqfx_shift = eqfx_shift
-        # LCM/LSV fields preserved for future use - currently unused
-        self.lcm_impact_ref = None
-        self.lcm_lv_price_ref = None
-        self.lcm_adjusted_price_ref = None
         # ATMF vol storage (populated by solve_strike or compute_atmf_volspread)
         self.ref_atmf_vol = None
         self.linked_atmf_vol = None
@@ -1403,83 +1352,6 @@ class CrossCorridorVarianceSwap:
             self.vol_spread = None
             self.ref_atmf_vol = None
             self.linked_atmf_vol = None
-            return None
-
-    def calculate_lcm_impact(self, lcm_properties=None):
-        """
-        Calculate LCM impact for the cross-corridor leg only.
-        Only applicable when ref_asset != linked_asset.
-
-        NOTE: ACEqEqSpread uses LambdaPricing from lcm_properties (NOT self.eqeq_lambda).
-        self.eqeq_lambda is used for solve/LSV only. For LCM, the model context
-        correlation surface must be calibrated at the LambdaPricing level.
-
-        Args:
-            lcm_properties: Optional dict with LCM parameters
-        Returns:
-            dict with 'lv', 'lcm', 'impact' keys
-        """
-        if self.ref_asset == self.linked_asset:
-            dbg.warn("LCM", f"{self.ref_asset}: not cross-corridor, skipping LCM")
-            return None
-        if self.strike_variance_asset is None:
-            dbg.err("LCM", f"{self.ref_asset}: strike not computed")
-            return None
-        try:
-            _ensure_portal()
-            # Generate FPF for cross-corridor leg only
-            fpf_cross = build_corridor_fpf(
-                tickers=[self.ref_asset],
-                last_obs_date=self.last_obs_date,
-                strike_date=self.strike_date,
-            obs_start_date=self.obs_start_date,
-                strikes=[self.strike_variance_asset],
-                weights=[1.0],
-                low_barrier=self.dvar,
-                high_barrier=self.uvar,
-                is_capped=self.is_capped,
-                corr_asset=self.linked_asset,
-                currency=self.currency,
-                use_parameters=False
-            )
-            # Get underlyings
-            underlyings = [
-                pricing_portal.load_instrument(schema=NovaIdSource.REUTERS, instrument_id=ric)
-                for ric in set([self.ref_asset, self.linked_asset])
-            ]
-            # Create model context — use LambdaPricing for ACEqEqSpread (NOT self.eqeq_lambda)
-            # LCM pricing requires the correlation surface at LambdaPricing level
-            _lambda_pricing = float(lcm_properties.get('LambdaPricing', 0.36)) if lcm_properties else 0.36
-            model_params = {
-                'ACEqEqSpread': str(_lambda_pricing),
-                "EqEqCorrFloor": str(self.correl_floor),
-                "ACEqFxShift": str(self.eqfx_shift)
-            }
-            _apply_special_rics_param(model_params, [self.ref_asset, self.linked_asset])
-            model_context = pricing_portal.create_model_context(
-                "EMEA-Stocks-MC-LV-MultiAsset",
-                instrument_model_parameters=model_params
-            )
-            # Calculate LCM impact
-            lcm_result = compute_lcm_cross_impact(
-                fpf=fpf_cross,
-                underlyings=underlyings,
-                premium_date=datetime.datetime.now().date(),
-                currency=self.currency,
-                model_context=model_context,
-                lcm_properties=lcm_properties
-            )
-            # Store results
-            self.lcm_lv_price_ref = lcm_result['lv']
-            self.lcm_adjusted_price_ref = lcm_result['lcm']
-            self.lcm_impact_ref = lcm_result['impact']
-            dbg.ok("LCM",
-                   f"{self.ref_asset}: LV={lcm_result['lv']:.6f}, LCM={lcm_result['lcm']:.6f}, impact={lcm_result['impact']:.6f}")
-            return lcm_result
-        except Exception as e:
-            dbg.err("LCM", f"{self.ref_asset}: calculation failed: {e}")
-            import traceback
-            dbg.note("trace", traceback.format_exc())
             return None
 
     def count_observation_dates(self):
