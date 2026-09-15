@@ -87,9 +87,9 @@ def test_results_df_cross_capped_two_sets(pricing):
                               fpf_string=f"FPF-{s.name}", fpf_string_cap=f"FPFCAP-{s.name}")
     tr.sync_legacy_lcm()
     df = pricing.PricingEngine(cfg)._build_results_df([tr])
-    for col in ["Strike Cross Corr LCM [A] (%)", "Strike Cross Corr LCM Raw [B] (%)",
+    for col in ["Strike Cross Corr LCM [A] (%)", "Strike Cross Corr LCM [B] (%)",
                 "EV Cross LCM [A] (%)", "EV Cross LCM0 [A] (%)", "LCM Impact Cross [A] (%)",
-                "Strike Cross Corr Cap Priced LCM [B] (%)", "Strike Cross Corr Cap Priced LCM Raw [A] (%)",
+                "Strike Cross Corr Cap Priced LCM [B] (%)",
                 "EV Cap Cross LCM [A] (%)", "EV Cap Cross LCM0 [A] (%)",
                 "LCM Params [A]", "LCM Params [B]",
                 "FPF Cross LCM Uncapped [A]", "FPF Cross LCM Cap [B]"]:
@@ -135,7 +135,8 @@ def test_results_df_missing_lcm0_leaves_strike_empty_keeps_raw(pricing):
     tr.lcm["A"] = _leg(pricing, s, ev_cross=-0.03, ev_cross0=None, strike=None, strike_raw=0.19)
     df = pricing.PricingEngine(cfg)._build_results_df([tr])
     assert "Strike Cross Corr LCM [A] (Uncapped) (%)" not in df.columns
-    assert df["Strike Cross Corr LCM Raw [A] (Uncapped) (%)"].iloc[0] == "19.00%"
+    assert not [c for c in df.columns if "Raw" in c]          # raw strike not displayed
+    assert tr.lcm["A"].strike_raw == 0.19                      # but kept on the object
     assert "LCM Impact Cross [A] (%)" not in df.columns
 
 

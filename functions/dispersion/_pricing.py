@@ -5232,8 +5232,7 @@ class PricingEngine(VolSwapMixin):
                         _sfx = lcm_column_suffix(_leg.set_name)
                         if _leg.strike is not None:
                             row[f'Strike Cross Corr LCM{_sfx}{_uncap_label} (%)'] = f"{_leg.strike * 100:.2f}%"
-                        if _leg.strike_raw is not None:
-                            row[f'Strike Cross Corr LCM Raw{_sfx}{_uncap_label} (%)'] = f"{_leg.strike_raw * 100:.2f}%"
+                        # strike_raw (no LCM0 control) stays on the object, not displayed
                     if _is_capped:
                         if r.cap_impact_bp is not None and r.cap_impact_bp > 0:
                             row['Cap Theoretical Impact (bp)'] = f"{r.cap_impact_bp:.2f}"
@@ -5247,8 +5246,6 @@ class PricingEngine(VolSwapMixin):
                             _sfx = lcm_column_suffix(_leg.set_name)
                             if _leg.strike_cap_priced is not None:
                                 row[f'Strike Cross Corr Cap Priced LCM{_sfx} (%)'] = f"{_leg.strike_cap_priced * 100:.2f}%"
-                            if _leg.strike_cap_priced_raw is not None:
-                                row[f'Strike Cross Corr Cap Priced LCM Raw{_sfx} (%)'] = f"{_leg.strike_cap_priced_raw * 100:.2f}%"
                     # ── Mono Corridor Strikes ──
                     row[
                         f'Strike Mono Corr LV{_uncap_label} (%)'] = f"{r.strike_corridor_asset * 100:.2f}%" if r.strike_corridor_asset else 'FAILED'

@@ -2962,8 +2962,7 @@ with tab4:
                                 f"CSV reference: λ Pricing {float(_lcm_defaults['LambdaPricing']):.4f}, "
                                 f"λ ATM {float(_lcm_defaults['LambdaAtm']):.4f}.\n\n"
                                 f"**LCM impact = EV(LCM) − EV(LCM0)** per set. Strike LCM = √(−(EV_LV + EV_LCM − EV_LCM0) / RA). "
-                                f"'LCM Raw' = √(−EV_LCM / RA) without the LCM0 control. The exact LCM and LCM0 parameters "
-                                f"sent are in the 'LCM Params [set]' result column."
+                                f"The exact LCM and LCM0 parameters sent are in the 'LCM Params [set]' result column."
                             )
                         else:
                             st.warning(
