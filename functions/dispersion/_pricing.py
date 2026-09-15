@@ -501,6 +501,60 @@ def _lcm_params_label(props: dict, props0: Optional[dict] = None) -> str:
     return s
 
 
+def _lcm_row_fields(leg: "LcmLegResult", is_capped: bool, uncap_label: str) -> Dict[str, str]:
+    """Result-table columns of ONE LCM set, grouped together (strike, EV, impact,
+    capped, price-mode FV, params). Suffix ``[name]`` sits after the
+    ``(Uncapped)`` label like the LV/LSV columns' own labels. FPF strings are
+    emitted separately with the other FPF columns."""
+    sfx = lcm_column_suffix(leg.set_name)
+    pct = lambda v: f"{v * 100:.2f}%"
+    out: Dict[str, str] = {}
+    if leg.strike is not None:
+        out[f'Strike Cross Corr LCM{uncap_label}{sfx} (%)'] = pct(leg.strike)
+    if is_capped and leg.strike_cap_priced is not None:
+        out[f'Strike Cross Corr Cap Priced LCM{sfx} (%)'] = pct(leg.strike_cap_priced)
+    if leg.ev_cross is not None:
+        out[f'EV Cross LCM{sfx} (%)'] = pct(leg.ev_cross)
+    if leg.ev_cross0 is not None:
+        out[f'EV Cross LCM0{sfx} (%)'] = pct(leg.ev_cross0)
+    if leg.impact is not None:
+        out[f'LCM Impact Cross{sfx} (%)'] = pct(leg.impact)
+    if is_capped and leg.ev_cap_cross is not None:
+        out[f'EV Cap Cross LCM{sfx} (%)'] = pct(leg.ev_cap_cross)
+    if is_capped and leg.ev_cap_cross0 is not None:
+        out[f'EV Cap Cross LCM0{sfx} (%)'] = pct(leg.ev_cap_cross0)
+    # price mode: FV under LCM0 / LCM, impact = LCM − LCM0 (skew contribution)
+    if leg.mid_lcm0 is not None:
+        out[f'FV Variance Asset LCM0{sfx} (%)'] = pct(leg.mid_lcm0)
+    if leg.mid_lcm is not None:
+        out[f'FV Variance Asset LCM{sfx} (%)'] = pct(leg.mid_lcm)
+    if leg.mid_impact is not None:
+        out[f'LCM Impact Variance Asset{sfx} (%)'] = pct(leg.mid_impact)
+    if leg.ev_cross is not None or leg.mid_lcm is not None:
+        out[f'LCM Params{sfx}'] = _lcm_params_label(leg.properties, leg.properties0)
+    return out
+
+
+def _validate_lcm_cross_corridor(tickers: List[str], corr_assets: List[str]) -> None:
+    """LCM is a cross-corridor concept: every leg must have Variance Asset != Corridor Asset."""
+    for ticker, corr in zip(tickers, corr_assets):
+        if ticker == corr:
+            raise ValueError(
+                f"LCM is only applicable to cross-corridor structures "
+                f"(Variance Asset must differ from Corridor Asset). "
+                f"Ticker '{ticker}' has Variance Asset == Corridor Asset."
+            )
+
+
+def _emit(progress_callback: Optional[Callable], event: dict) -> None:
+    """Progress event that can never abort a pricing run (UI callbacks may raise)."""
+    if progress_callback:
+        try:
+            progress_callback(event)
+        except Exception:
+            pass
+
+
 def _resolve_lcm_sets_for(cfg) -> List[LcmParamSet]:
     """Filled, validated ``LcmParamSet`` list for this run (``[]`` = LCM off)."""
     return resolve_lcm_sets(
@@ -1647,7 +1701,6 @@ class TickerResult:
     zero_strike_mid_variance_asset: Optional[float] = None
     zero_strike_mid_corridor_asset: Optional[float] = None
     lsv_charge: Optional[float] = None
-    lcm_impact: Optional[float] = None
     correlation: Optional[float] = None
     correlation_sens: Optional[float] = None  # portal CorrelationSens, (variance asset, corridor asset) entry; cross legs only
     correlation_sens_strike: Optional[float] = None  # strike differential for +1 correl point: √(−(EV+Sens)/RA) − K (Sens = ΔEV); capped: on the priced capped EV vs cap-priced strike (vol decimal)
@@ -1655,13 +1708,9 @@ class TickerResult:
     mid_variance_asset_lv: Optional[float] = None  # FV_LV (variance asset)
     mid_variance_asset_lsv0: Optional[float] = None  # FV_LSV0 (variance asset)
     mid_variance_asset_lsv: Optional[float] = None  # FV_LSV (variance asset)
-    # LCM fields — impact measured against LCM0 (skews = 0), like LSV vs LSV0
-    mid_variance_asset_lcm: Optional[float] = None  # FV_LCM (variance asset, price mode)
-    mid_variance_asset_lcm0: Optional[float] = None  # FV_LCM0 (variance asset, price mode)
+    # LCM legacy mirrors of the FIRST set (full detail lives in ``lcm``):
+    # kept only where read outside the engine (page, demo notebook)
     strike_variance_asset_lcm: Optional[float] = None  # sqrt(-(EV_LV + EV_LCM - EV_LCM0) / RA) (solve mode)
-    strike_variance_asset_lcm_raw: Optional[float] = None  # sqrt(-EV_LCM / RA), no LCM0 control (solve mode)
-    ev_cross_lcm: Optional[Union[float, str]] = None  # raw EV_LCM (solve mode)
-    ev_cross_lcm0: Optional[Union[float, str]] = None  # raw EV_LCM0 (solve mode)
     # Cap adjustment fields (solve mode)
     strike_cap_adjusted: Optional[float] = None  # analytical proxy cap-adjusted strike (vol level)
     cap_impact_bp: Optional[float] = None  # cap theoretical impact in bp
@@ -1670,14 +1719,11 @@ class TickerResult:
     strike_cap_priced_lsv: Optional[float] = None  # real priced capped CROSS LSV strike (vol level)
     strike_cap_priced_lsv_mono: Optional[float] = None  # real priced capped MONO LSV strike (vol level)
     strike_cap_priced_lcm: Optional[float] = None  # real priced capped LCM strike, LV_cap + (LCM_cap − LCM0_cap) (vol level)
-    strike_cap_priced_lcm_raw: Optional[float] = None  # real priced capped LCM strike, raw EV_LCM_cap (vol level)
     strike_cap_priced_mono: Optional[float] = None  # real priced capped Mono strike (vol level)
     # Capped EV components (for transparency)
     ev_cap_cross_lv: Optional[float] = None  # capped EV cross under LV
     ev_cap_cross_lsv0: Optional[float] = None  # capped EV cross under LSV0
     ev_cap_cross_lsv: Optional[float] = None  # capped EV cross under LSV
-    ev_cap_cross_lcm: Optional[float] = None  # capped EV cross under LCM
-    ev_cap_cross_lcm0: Optional[float] = None  # capped EV cross under LCM0
     ev_cap_mono_lv: Optional[float] = None  # capped EV mono under LV
     ev_cap_mono_lsv0: Optional[float] = None  # capped EV mono under LSV0
     ev_cap_mono_lsv: Optional[float] = None  # capped EV mono under LSV
@@ -1695,23 +1741,16 @@ class TickerResult:
         return next(iter(self.lcm.values()), None)
 
     def sync_legacy_lcm(self) -> None:
-        """Mirror the first LCM set into the legacy scalar fields."""
+        """Mirror the first LCM set into the legacy scalar fields still read
+        outside the engine (page: strike_variance_asset_lcm / strike_cap_priced_lcm;
+        notebook: fpf_string_cap_lcm)."""
         leg = self.first_lcm()
         if leg is None:
             return
-        pct = lambda v: v * 100 if v is not None else None
-        self.ev_cross_lcm = pct(leg.ev_cross)
-        self.ev_cross_lcm0 = pct(leg.ev_cross0)
         self.strike_variance_asset_lcm = leg.strike
-        self.strike_variance_asset_lcm_raw = leg.strike_raw
         self.strike_cap_priced_lcm = leg.strike_cap_priced if leg.strike_cap_priced is not None else leg.strike_cap_proxy
-        self.strike_cap_priced_lcm_raw = leg.strike_cap_priced_raw
-        self.ev_cap_cross_lcm = leg.ev_cap_cross
-        self.ev_cap_cross_lcm0 = leg.ev_cap_cross0
         self.fpf_string_lcm = leg.fpf_string
         self.fpf_string_cap_lcm = leg.fpf_string_cap
-        self.mid_variance_asset_lcm = leg.mid_lcm
-        self.mid_variance_asset_lcm0 = leg.mid_lcm0
 
 @dataclass
 class PricingResult:
@@ -2432,14 +2471,7 @@ class PricingEngine(VolSwapMixin):
         use_lcm = bool(lcm_sets_eff)
 
         if use_lcm:
-            # Validation: LCM requires cross-corridor (Variance Asset ≠ Corridor Asset)
-            for i, ticker in enumerate(tickers):
-                if ticker == corr_assets[i]:
-                    raise ValueError(
-                        f"LCM is only applicable to cross-corridor structures "
-                        f"(Variance Asset must differ from Corridor Asset). "
-                        f"Ticker '{ticker}' has Variance Asset == Corridor Asset."
-                    )
+            _validate_lcm_cross_corridor(tickers, corr_assets)
 
         if use_lsv or use_lcm:
             from functions.common.pricing_scenarios import build_unified_scenario
@@ -2519,15 +2551,14 @@ class PricingEngine(VolSwapMixin):
                 all_results_raw[start] = {"raw": {}, "chunk_size": len(chunk)}
 
             # Emit batch progress event
-            if progress_callback:
-                progress_callback({
-                    "status": "pricing_batch",
-                    "batch": _batch_counter_price[0],
-                    "total_batches": _total_batches_price,
-                    "call_batch": _batch_counter_price[0],
-                    "call_total": _total_batches_price,
-                    "label": "price",
-                })
+            _emit(progress_callback, {
+                "status": "pricing_batch",
+                "batch": _batch_counter_price[0],
+                "total_batches": _total_batches_price,
+                "call_batch": _batch_counter_price[0],
+                "call_total": _total_batches_price,
+                "label": "price",
+            })
             _batch_counter_price[0] += 1
 
         self._batch_timings['http_price'] = time.time() - t_price
@@ -3261,31 +3292,29 @@ class PricingEngine(VolSwapMixin):
                     all_results[start] = {"raw": results_dict, "chunk_size": len(chunk), "global_idx": global_idx}
 
                     # Emit batch progress event
-                    if progress_callback:
-                        progress_callback({
-                            "status": "pricing_batch",
-                            "batch": _batch_counter[0],
-                            "total_batches": _total_batches,
-                            "call_batch": chunk_num,
-                            "call_total": n_chunks,
-                            "label": batch_label,
-                        })
+                    _emit(progress_callback, {
+                        "status": "pricing_batch",
+                        "batch": _batch_counter[0],
+                        "total_batches": _total_batches,
+                        "call_batch": chunk_num,
+                        "call_total": n_chunks,
+                        "label": batch_label,
+                    })
 
                 except Exception as e:
                     # Light error message
                     _safe_print(f"\r[BATCH] Chunk {chunk_num} failed: {type(e).__name__}       ")
                     # Store empty — no slow individual fallback
                     all_results[start] = {"raw": {}, "chunk_size": len(chunk), "global_idx": global_idx}
-                    if progress_callback:
-                        progress_callback({
-                            "status": "pricing_batch",
-                            "batch": _batch_counter[0],
-                            "total_batches": _total_batches,
-                            "call_batch": chunk_num,
-                            "call_total": n_chunks,
-                            "label": batch_label,
-                            "failed": True,
-                        })
+                    _emit(progress_callback, {
+                        "status": "pricing_batch",
+                        "batch": _batch_counter[0],
+                        "total_batches": _total_batches,
+                        "call_batch": chunk_num,
+                        "call_total": n_chunks,
+                        "label": batch_label,
+                        "failed": True,
+                    })
 
                 _batch_counter[0] += 1
                 global_idx += len(chunk)
@@ -3500,14 +3529,7 @@ class PricingEngine(VolSwapMixin):
             use_lcm_solve = bool(lcm_sets_eff)
 
             if use_lcm_solve:
-                # Validation: LCM requires cross-corridor
-                for i, ticker in enumerate(tickers):
-                    if ticker == corr_assets[i]:
-                        raise ValueError(
-                            f"LCM is only applicable to cross-corridor structures "
-                            f"(Variance Asset must differ from Corridor Asset). "
-                            f"Ticker '{ticker}' has Variance Asset == Corridor Asset."
-                        )
+                _validate_lcm_cross_corridor(tickers, corr_assets)
 
             if use_lsv_solve or use_lcm_solve:
                 from functions.common.pricing_scenarios import build_unified_scenario
@@ -4103,7 +4125,8 @@ class PricingEngine(VolSwapMixin):
                                     fv = raw["Price"].get("FairValue", [])
                                     pp_errors.append(f"FairValue array len={len(fv)}, local_idx={local}")
                                 else:
-                                    pp_errors.append(f"Raw keys: {list(raw.keys())}")
+                                    pp_errors.append("chunk returned no results (portal call failed)"
+                                                     if not raw else f"Raw keys: {list(raw.keys())}")
                                 break
                             running += cd["chunk_size"]
                     except Exception as e:
@@ -4466,8 +4489,7 @@ class PricingEngine(VolSwapMixin):
         # Errors are per-item: a failed serialization marks its ticker failed
         # (same semantics as the old inline try/except).
         if _fpf_serial_jobs:
-            if progress_callback:
-                progress_callback({'status': 'phase', 'message': 'Serializing FPFs...'})
+            _emit(progress_callback, {'status': 'phase', 'message': 'Serializing FPFs...'})
             _t_fpf_serial = time.time()
 
             def _safe_serialize(o):
@@ -4497,8 +4519,7 @@ class PricingEngine(VolSwapMixin):
         if cfg.is_capped:
             t_cap = time.time()
             dbg.step("batch", "Phase 2b: Capped re-pricing...")
-            if progress_callback:
-                progress_callback({'status': 'phase', 'message': 'Capped re-pricing...'})
+            _emit(progress_callback, {'status': 'phase', 'message': 'Capped re-pricing...'})
 
             # Collect successful tickers that need capped pricing
             cap_tasks = []  # [(idx, variant, cap_value, strike_theo)]
@@ -4517,11 +4538,11 @@ class PricingEngine(VolSwapMixin):
                     cap_tasks.append((idx, 'lsv', cap_lsv,
                                       result.strike_cap_priced_lsv if result.strike_cap_priced_lsv is not None else result.strike_cross_lsv))
                 # LCM: one capped instrument per parameter set whose strike was solved
-                for _name, _leg in result.lcm.items():
+                for _leg in result.lcm.values():
                     if _leg.strike is None:
                         continue
                     _k = _leg.strike_cap_proxy if _leg.strike_cap_proxy is not None else _leg.strike
-                    cap_tasks.append((idx, f'lcm:{_name}', (cfg.cap_multiplier ** 2 - 1) * (_k ** 2), _k))
+                    cap_tasks.append((idx, f'lcm:{_leg.set_name}', (cfg.cap_multiplier ** 2 - 1) * (_k ** 2), _k))
                 # MONO: if corridor asset differs from ticker (cross-corridor), build capped mono FPF
                 if corr_assets[idx] != tickers[idx] and result.strike_corridor_asset is not None:
                     cap_mono = (cfg.cap_multiplier ** 2 - 1) * (result.strike_corridor_asset ** 2)
@@ -5126,11 +5147,6 @@ class PricingEngine(VolSwapMixin):
                         f'Strike Cross Corr LV{_uncap_label} (%)'] = f"{r.strike_variance_asset * 100:.2f}%" if r.strike_variance_asset else 'FAILED'
                     if r.strike_cross_lsv is not None:
                         row[f'Strike Cross Corr LSV{_uncap_label} (%)'] = f"{r.strike_cross_lsv * 100:.2f}%"
-                    for _leg in r.lcm.values():
-                        _sfx = lcm_column_suffix(_leg.set_name)
-                        if _leg.strike is not None:
-                            row[f'Strike Cross Corr LCM{_sfx}{_uncap_label} (%)'] = f"{_leg.strike * 100:.2f}%"
-                        # strike_raw (no LCM0 control) stays on the object, not displayed
                     if _is_capped:
                         if r.cap_impact_bp is not None and r.cap_impact_bp > 0:
                             row['Cap Theoretical Impact (bp)'] = f"{r.cap_impact_bp:.2f}"
@@ -5140,10 +5156,9 @@ class PricingEngine(VolSwapMixin):
                             row['Strike Cross Corr Cap Priced LV (%)'] = f"{r.strike_cap_priced_lv * 100:.2f}%"
                         if r.strike_cap_priced_lsv is not None:
                             row['Strike Cross Corr Cap Priced LSV (%)'] = f"{r.strike_cap_priced_lsv * 100:.2f}%"
-                        for _leg in r.lcm.values():
-                            _sfx = lcm_column_suffix(_leg.set_name)
-                            if _leg.strike_cap_priced is not None:
-                                row[f'Strike Cross Corr Cap Priced LCM{_sfx} (%)'] = f"{_leg.strike_cap_priced * 100:.2f}%"
+                    # ── LCM: one grouped block per parameter set ──
+                    for _leg in r.lcm.values():
+                        row.update(_lcm_row_fields(_leg, _is_capped, _uncap_label))
                     # ── Mono Corridor Strikes ──
                     row[
                         f'Strike Mono Corr LV{_uncap_label} (%)'] = f"{r.strike_corridor_asset * 100:.2f}%" if r.strike_corridor_asset else 'FAILED'
@@ -5175,16 +5190,6 @@ class PricingEngine(VolSwapMixin):
                         row['EV Cross LV (%)'] = f"{r.ev_cross:.2f}%"
                     if r.ev_cross_lsv is not None:
                         row['EV Cross LSV Adjusted (%)'] = f"{r.ev_cross_lsv:.2f}%"
-                    for _leg in r.lcm.values():
-                        _sfx = lcm_column_suffix(_leg.set_name)
-                        if _leg.ev_cross is not None:
-                            row[f'EV Cross LCM{_sfx} (%)'] = f"{_leg.ev_cross * 100:.2f}%"
-                        if _leg.ev_cross0 is not None:
-                            row[f'EV Cross LCM0{_sfx} (%)'] = f"{_leg.ev_cross0 * 100:.2f}%"
-                        if _leg.impact is not None:
-                            row[f'LCM Impact Cross{_sfx} (%)'] = f"{_leg.impact * 100:.2f}%"
-                        if _leg.ev_cross is not None:   # solve mode; price mode writes it below
-                            row[f'LCM Params{_sfx}'] = _lcm_params_label(_leg.properties, _leg.properties0)
 
                     if r.range_accrual is not None:
                         # Mono and cross legs share the corridor asset → one RA column
@@ -5207,12 +5212,6 @@ class PricingEngine(VolSwapMixin):
                         row['EV Cap Cross LSV0 (%)'] = f"{r.ev_cap_cross_lsv0 * 100:.2f}%"
                     if r.ev_cap_cross_lsv is not None:
                         row['EV Cap Cross LSV Adjusted (%)'] = f"{r.ev_cap_cross_lsv * 100:.2f}%"
-                    for _leg in r.lcm.values():
-                        _sfx = lcm_column_suffix(_leg.set_name)
-                        if _leg.ev_cap_cross is not None:
-                            row[f'EV Cap Cross LCM{_sfx} (%)'] = f"{_leg.ev_cap_cross * 100:.2f}%"
-                        if _leg.ev_cap_cross0 is not None:
-                            row[f'EV Cap Cross LCM0{_sfx} (%)'] = f"{_leg.ev_cap_cross0 * 100:.2f}%"
                     if r.ev_cap_mono_lv is not None:
                         row['EV Cap Mono LV (%)'] = f"{r.ev_cap_mono_lv * 100:.2f}%"
                     if r.ev_cap_mono_lsv0 is not None:
@@ -5255,18 +5254,6 @@ class PricingEngine(VolSwapMixin):
                     if r.mid_variance_asset_lsv is not None and r.mid_variance_asset_lsv0 is not None:
                         row[
                             'LSV Impact Variance Asset (%)'] = f"{(r.mid_variance_asset_lsv - r.mid_variance_asset_lsv0) * 100:.2f}%"
-                    # LCM columns (price mode), one block per parameter set;
-                    # impact = LCM − LCM0 (skew contribution), not LCM − LV
-                    for _leg in r.lcm.values():
-                        _sfx = lcm_column_suffix(_leg.set_name)
-                        if _leg.mid_lcm0 is not None:
-                            row[f'FV Variance Asset LCM0{_sfx} (%)'] = f"{_leg.mid_lcm0 * 100:.2f}%"
-                        if _leg.mid_lcm is not None:
-                            row[f'FV Variance Asset LCM{_sfx} (%)'] = f"{_leg.mid_lcm * 100:.2f}%"
-                        if _leg.mid_impact is not None:
-                            row[f'LCM Impact Variance Asset{_sfx} (%)'] = f"{_leg.mid_impact * 100:.2f}%"
-                        if _leg.mid_lcm is not None:
-                            row[f'LCM Params{_sfx}'] = _lcm_params_label(_leg.properties, _leg.properties0)
                     if r.zero_strike_mid_variance_asset is not None:
                         row['Realized Var Variance Asset (%)'] = f"{r.zero_strike_mid_variance_asset * 100:.2f}%"
                     if r.zero_strike_mid_corridor_asset is not None:
@@ -5276,16 +5263,16 @@ class PricingEngine(VolSwapMixin):
                         row['FPF Cross LV Uncapped'] = r.fpf_string_cross
                     if r.fpf_string_lsv:
                         row['FPF Cross LSV Uncapped'] = r.fpf_string_lsv
-                    for _leg in r.lcm.values():
-                        if _leg.fpf_string:
-                            row[f'FPF Cross LCM Uncapped{lcm_column_suffix(_leg.set_name)}'] = _leg.fpf_string
                     if r.fpf_string_cap_lv:
                         row['FPF Cross LV Cap'] = r.fpf_string_cap_lv
                     if r.fpf_string_cap_lsv:
                         row['FPF Cross LSV Cap'] = r.fpf_string_cap_lsv
                     for _leg in r.lcm.values():
+                        _sfx = lcm_column_suffix(_leg.set_name)
+                        if _leg.fpf_string:
+                            row[f'FPF Cross LCM Uncapped{_sfx}'] = _leg.fpf_string
                         if _leg.fpf_string_cap:
-                            row[f'FPF Cross LCM Cap{lcm_column_suffix(_leg.set_name)}'] = _leg.fpf_string_cap
+                            row[f'FPF Cross LCM Cap{_sfx}'] = _leg.fpf_string_cap
                     if r.fpf_string_mono:
                         row['FPF Mono LV Uncapped'] = r.fpf_string_mono
                     if r.fpf_string_cap_mono:

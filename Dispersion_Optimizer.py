@@ -2843,7 +2843,7 @@ with tab4:
                             "Call Skew": float(_lcm_defaults["CallSkew"]),
                             "Put Skew": float(_lcm_defaults["PutSkew"]),
                         }
-                        _lcm_table_default = pd.DataFrame([{"Set": "", **_prefill_row}])
+                        _lcm_table_default = pd.DataFrame([{"Set": "1", **_prefill_row}])
                         st.markdown("**LCM parameter sets** — one row per set. All sets are priced in the "
                                     "same portal call: LV is computed once, each set adds an LCM bump "
                                     "(LCM0 is shared).")
@@ -2898,7 +2898,7 @@ with tab4:
                             if _i < len(_prev_rows):
                                 _seed_rows.append({**{"Set": "", **_prefill_row}, **_prev_rows[_i]})
                             else:
-                                _seed_rows.append({"Set": "" if _n_lcm_sets == 1 else str(_i + 1), **_prefill_row})
+                                _seed_rows.append({"Set": str(_i + 1), **_prefill_row})
                         _lcm_table_default = pd.DataFrame(_seed_rows)[["Set", *_prefill_row.keys()]]
                         _lcm_sets_df = st.data_editor(
                             _lcm_table_default,
@@ -2938,8 +2938,8 @@ with tab4:
                         for _i, _row in _lcm_sets_df.reset_index(drop=True).iterrows():
                             _nm = str(_row.get("Set") if _row.get("Set") is not None and not pd.isna(_row.get("Set")) else "").strip()
                             lcm_sets_var.append({
-                                # blank name: "" for a single set (legacy columns), "1","2",… when several
-                                "name": _nm or ("" if _n_rows == 1 else str(_i + 1)),
+                                # the Set name IS the column suffix "[name]"; blank → row number
+                                "name": _nm or str(_i + 1),
                                 "lambda_pricing": _cell(_row, "λ Pricing"),
                                 "lambda_atm": _cell(_row, "λ ATM"),
                                 "lambda_from_rho0": _cell(_row, "λ Rho0"),
@@ -2952,8 +2952,8 @@ with tab4:
                         if _lam_ok:
                             st.warning(
                                 f"**Reminder — LCM0 is fixed:** λ Pricing = λ ATM = EqEq λ = **{eqeq_lambda_var:.4f}**, "
-                                f"Call/Put Skew = 0, for every set, whatever lambdas the row uses. "
-                                f"One LCM0 is priced per distinct λ Rho0 and shared by the sets."
+                                f"Call/Put Skew = 0. The rows below change only the LCM price; LCM0 always uses "
+                                f"EqEq λ (one LCM0 per distinct λ Rho0, shared by the sets)."
                             )
                             st.info(
                                 f"**Lambda used** — EqEq λ = **{eqeq_lambda_var:.4f}** is `ACEqEqSpread` in the model "
@@ -3207,8 +3207,11 @@ with tab4:
             # Ensure all values are strings to avoid Arrow serialization errors (mixed int/str/None)
             _df_t = _df_t.fillna('').astype(str)
 
+            # LCM strike rows carry a "[set]" suffix → match by prefix
+            _highlight_prefixes = ('Strike Cross Corr Cap Priced LCM', 'Strike Cross Corr LCM')
+
             def _highlight_key_rows(row):
-                if row.name in _highlight_rows:
+                if row.name in _highlight_rows or str(row.name).startswith(_highlight_prefixes):
                     return ['background-color: #fff3cd'] * len(row)
                 return [''] * len(row)
 

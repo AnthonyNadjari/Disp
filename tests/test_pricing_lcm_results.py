@@ -68,11 +68,23 @@ def test_sync_legacy_mirrors_first_set(pricing):
     tr.lcm["B"] = _leg(pricing, b, ev_cross=-0.02, ev_cross0=-0.02, strike=0.3, strike_raw=0.3)
     tr.sync_legacy_lcm()
     assert tr.strike_variance_asset_lcm == 0.201
-    assert tr.strike_variance_asset_lcm_raw == 0.19
-    assert tr.ev_cross_lcm == pytest.approx(-3.1)
     assert tr.strike_cap_priced_lcm == 0.199          # proxy until the capped batch fills it
     assert tr.fpf_string_lcm == "FPF-A"
     assert tr.lcm["A"].impact == pytest.approx(-0.0005)
+    assert tr.lcm["A"].strike_raw == 0.19             # raw strike lives on the leg only
+
+
+def test_sync_legacy_noop_without_lcm(pricing):
+    tr = pricing.TickerResult(ticker="X.PA", corridor_asset=".STOXX50E", success=True)
+    tr.sync_legacy_lcm()
+    assert tr.first_lcm() is None and tr.strike_variance_asset_lcm is None and tr.fpf_string_cap_lcm is None
+
+
+def test_leg_impact_none_when_one_side_missing(pricing):
+    leg = pricing.LcmLegResult(set_name="A", bump_lcm="LCM_A", bump_lcm0="LCM0_A", ev_cross=-0.03)
+    assert leg.impact is None and leg.mid_impact is None
+    leg.mid_lcm, leg.mid_lcm0 = 0.012, 0.011
+    assert leg.mid_impact == pytest.approx(0.001)
 
 
 def test_results_df_cross_capped_two_sets(pricing):
@@ -100,6 +112,54 @@ def test_results_df_cross_capped_two_sets(pricing):
     assert "lamP=0.55" in row["LCM Params [B]"] and "lamATM=0.4" in row["LCM Params [B]"]
     assert "lamP=0.4 " in row["LCM Params [A]"]
     assert row["FPF Cross LCM Cap [B]"] == "FPFCAP-B"
+    # columns grouped per set: every [A] metric column precedes the first [B] one,
+    # and the block sits right after the LSV cap strike, before the mono strikes
+    cols = list(df.columns)
+    a_cols = [c for c in cols if "[A]" in c and not c.startswith("FPF")]
+    b_cols = [c for c in cols if "[B]" in c and not c.startswith("FPF")]
+    assert max(cols.index(c) for c in a_cols) < min(cols.index(c) for c in b_cols)
+    assert cols.index("Strike Cross Corr LCM [A] (%)") < cols.index("Strike Mono Corr LV (%)")
+
+
+def test_results_df_uncapped_suffix_after_label(pricing):
+    cfg = _cfg(pricing, is_capped=False, lcm_sets=[{"name": "A"}])
+    (s,) = pricing._resolve_lcm_sets_for(cfg)
+    tr = pricing.TickerResult(ticker="X.PA", corridor_asset=".STOXX50E", success=True, currency="EUR",
+                              strike_variance_asset=0.2, strike_corridor_asset=0.22)
+    tr.lcm["A"] = _leg(pricing, s, ev_cross=-0.03, ev_cross0=-0.03, strike=0.2, strike_raw=0.2)
+    df = pricing.PricingEngine(cfg)._build_results_df([tr])
+    assert "Strike Cross Corr LCM (Uncapped) [A] (%)" in df.columns      # same shape as "… LV (Uncapped) (%)"
+    assert "Strike Cross Corr LV (Uncapped) (%)" in df.columns
+
+
+def test_results_df_without_lcm(pricing):
+    cfg = _cfg(pricing)
+    tr = pricing.TickerResult(ticker="X.PA", corridor_asset=".STOXX50E", success=True, currency="EUR",
+                              strike_variance_asset=0.2, strike_corridor_asset=0.22)
+    df = pricing.PricingEngine(cfg)._build_results_df([tr])
+    assert not [c for c in df.columns if "LCM" in c]
+
+
+def test_results_df_mono_branch(pricing):
+    cfg = _cfg(pricing, is_cross_corridor=False)
+    tr = pricing.TickerResult(ticker=".STOXX50E", corridor_asset=".STOXX50E", success=True, currency="EUR",
+                              strike_variance_asset=0.2, range_accrual_mono=0.85, discount_factor=0.97)
+    df = pricing.PricingEngine(cfg)._build_results_df([tr])
+    assert df["Strike LV Uncapped (%)"].iloc[0] == "20.00%"
+    assert df["RA (%)"].iloc[0] == "0.85%"
+    assert "Ticker" in df.columns and "Index Ticker" not in df.columns
+
+
+def test_emit_never_raises(pricing):
+    def bad(_): raise RuntimeError("ui gone")
+    pricing._emit(bad, {"status": "phase"})          # swallowed
+    pricing._emit(None, {"status": "phase"})         # no callback
+
+
+def test_validate_lcm_cross_corridor(pricing):
+    pricing._validate_lcm_cross_corridor(["X.PA"], [".STOXX50E"])
+    with pytest.raises(ValueError, match="cross-corridor"):
+        pricing._validate_lcm_cross_corridor(["X.PA", ".SPX"], [".STOXX50E", ".SPX"])
 
 
 def test_results_df_single_unnamed_set_keeps_legacy_columns(pricing):
@@ -124,7 +184,8 @@ def test_results_df_price_mode_impact_vs_lcm0(pricing):
     df = pricing.PricingEngine(cfg)._build_results_df([tr])
     assert df["FV Variance Asset LCM0 [A] (%)"].iloc[0] == "1.10%"
     assert df["LCM Impact Variance Asset [A] (%)"].iloc[0] == "0.10%"
-    assert tr.mid_variance_asset_lcm == 0.012
+    assert "LCM Params [A]" in df.columns
+    assert tr.lcm["A"].mid_lcm == 0.012
 
 
 def test_results_df_missing_lcm0_leaves_strike_empty_keeps_raw(pricing):

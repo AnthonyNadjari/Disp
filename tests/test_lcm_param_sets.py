@@ -247,6 +247,24 @@ def test_resolve_log_mentions_pinned_lcm0():
     assert "LCM0 = LambdaPricing=LambdaAtm=0.4" in logs[-1]
 
 
+def test_extract_scenario_metric_both_formats():
+    from functions.common.pricing_scenarios import extract_scenario_metric
+    fmt_a = {"Price": {"LV": [{"FairValue": [{"value": 1.0}]}, {"FairValue": [{"value": 2.0}]}]}}
+    assert extract_scenario_metric(fmt_a, "Price", "LV", 1) == 2.0
+    fmt_b = {"Price": {"LV": [{"FairValue": [{"value": 1.0}]}]},
+             "Price_1": {"LV": [{"FairValue": [{"value": 2.5}]}]}}
+    assert extract_scenario_metric(fmt_b, "Price", "LV", 1) == 2.5
+    assert extract_scenario_metric(fmt_b, "Price", "LCM_A", 1) is None       # bump absent → None
+    assert extract_scenario_metric({}, "Price", "LV", 0) is None
+
+
+def test_from_properties_without_aggregator_and_coerce_name_priority():
+    s = LcmParamSet.from_properties({"LambdaPricing": 0.4})
+    assert s.aggregator_type is None and s.lambda_pricing == 0.4 and "aggregator_type" in s.missing()
+    c = LcmParamSet.coerce({"name": "X", "LambdaPricing": 0.5}, name="Y")
+    assert c.name == "X"                                                   # dict's own name wins
+
+
 def test_column_suffix():
     assert lcm_column_suffix("") == ""
     assert lcm_column_suffix("A") == " [A]"
