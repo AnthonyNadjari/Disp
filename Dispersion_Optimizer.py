@@ -2880,17 +2880,14 @@ with tab4:
                                         raise ValueError("no rows parsed")
                                     st.session_state["p_lcm_sets_rows"] = _rows
                                     st.session_state["p_lcm_sets_sig"] = _seed_sig
-                                    st.session_state["p_lcm_n_sets"] = len(_rows)
                                     st.rerun()
                                 except Exception as e:
                                     st.error(f"Error processing LCM sets: {e}")
-                        if "p_lcm_n_sets" not in st.session_state:
-                            st.session_state["p_lcm_n_sets"] = 1
-                        _n_lcm_sets = int(st.number_input("Number of LCM sets", min_value=1, max_value=12,
-                                                          step=1, key="p_lcm_n_sets"))
+                        # Row count = what was pasted (1 prefilled row before any paste).
                         _prev_rows = st.session_state.get("p_lcm_sets_rows") or []
                         if st.session_state.get("p_lcm_sets_sig") != _seed_sig:
                             _prev_rows = []
+                        _n_lcm_sets = max(1, len(_prev_rows))
                         _seed_rows = []
                         for _i in range(_n_lcm_sets):
                             if _i < len(_prev_rows):
@@ -2900,7 +2897,7 @@ with tab4:
                         _lcm_table_default = pd.DataFrame(_seed_rows)[["Set", *_prefill_row.keys()]]
                         _lcm_sets_df = st.data_editor(
                             _lcm_table_default,
-                            num_rows="fixed", hide_index=True, use_container_width=True,
+                            num_rows="dynamic", hide_index=True, use_container_width=True,
                             key=f"p_lcm_sets_{_seed_sig}_{_n_lcm_sets}",
                             column_config={
                                 "Set": st.column_config.TextColumn("Set", help="Short name (letters/digits/_ . -); becomes the column suffix [name]"),
