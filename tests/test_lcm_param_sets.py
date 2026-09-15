@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from functions.common.pricing_scenarios import (  # noqa: E402
     DEFAULT_LCM_PROPERTIES, LcmParamSet, lcm_bump_layout, lcm0_properties, build_unified_scenario,
 )
-from functions.dispersion.lcm_sets import resolve_lcm_sets, lcm_column_suffix, lcm0_lambda_for  # noqa: E402
+from functions.common.lcm_sets import resolve_lcm_sets, lcm_column_suffix, lcm0_lambda_for  # noqa: E402
 
 
 class FakePortal:
@@ -176,7 +176,6 @@ def test_scenario_lcm_only_multi_set(pp):
 
 def test_scenario_legacy_kwargs_unchanged(pp):
     assert _bump_names(build_unified_scenario(pp, use_lsv=False, use_lcm=True)) == ["LV", "LCM"]
-    assert _bump_names(build_unified_scenario(pp, use_lsv=False, use_lcm=True, include_lcm0=True)) == ["LV", "LCM0", "LCM"]
     assert build_unified_scenario(pp, use_lsv=False, use_lcm=False) is None
 
 

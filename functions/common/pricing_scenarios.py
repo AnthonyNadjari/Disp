@@ -185,38 +185,24 @@ def build_lcm_bumps(
     Build LCM mutators for inclusion in a scenario axis.
 
     Returns a dict with:
-        "lcm_mutator":  The OverrideLCMWithRealisedReference mutator.
-        "lcm0_mutator": Same mutator, same lambdas, CallSkew = PutSkew = 0 —
-                        the flat-correlation control (the LCM analogue of LSV0).
-                        LCM − LCM0 isolates the correlation-skew contribution and
-                        cancels the level gap + MC noise between LV and LCM.
+        "lcm_mutator": The OverrideLCMWithRealisedReference mutator.
         "null_mutator": A GenericMutatorNull for padding other bumps.
 
     Usage in batch scenario assembly:
         parts = build_lcm_bumps(pp, lcm_properties)
         # Add parts["lcm_mutator"] to the "LCM" bump
-        # Add parts["lcm0_mutator"] to the "LCM0" bump (optional)
         # Add parts["null_mutator"] to pad other bumps in the LCM slot
+    For the LCM0 control (skews = 0) use ``lcm0_properties`` + ``build_lcm_mutator``
+    or, for N parameter sets at once, ``build_unified_scenario(lcm_sets=...)``.
     """
     props = lcm_properties if lcm_properties is not None else DEFAULT_LCM_PROPERTIES
-    props0 = lcm0_properties(props)
-
-    lcm_mutator = pricing_portal.create_scenario_mutator(
-        name="GenericMutatorOverrideLCMWithRealisedReference",
-        mutator_properties=pricing_portal.create_scenario_mutator_properties(props),
-        mutator_properties_asset_overrides=[],
-    )
-    lcm0_mutator = pricing_portal.create_scenario_mutator(
-        name="GenericMutatorOverrideLCMWithRealisedReference",
-        mutator_properties=pricing_portal.create_scenario_mutator_properties(props0),
-        mutator_properties_asset_overrides=[],
-    )
+    lcm_mutator = build_lcm_mutator(pricing_portal, props)
     null_mutator = pricing_portal.create_scenario_mutator(
         name="GenericMutatorNull",
         mutator_properties=pricing_portal.create_scenario_mutator_properties({}),
         mutator_properties_asset_overrides=[],
     )
-    return {"lcm_mutator": lcm_mutator, "lcm0_mutator": lcm0_mutator, "null_mutator": null_mutator}
+    return {"lcm_mutator": lcm_mutator, "null_mutator": null_mutator}
 
 
 def lcm0_properties(lcm_properties: Dict[str, Any], lcm0_lambda: Optional[float] = None) -> Dict[str, Any]:
@@ -426,7 +412,6 @@ def build_unified_scenario(
     correl_bump: float = 0,
     correl_bump_style: str = "Relative",
     lcm_properties: Optional[Dict[str, Any]] = None,
-    include_lcm0: bool = False,
     lcm_sets: Optional[Sequence[LcmParamSet]] = None,
     lcm0_lambda: Optional[float] = None,
 ) -> Optional[Any]:
@@ -442,8 +427,8 @@ def build_unified_scenario(
         so sets with the same ρ0 share one LCM0. ``use_lcm`` is implied. This
         is the multi-set path: one call, LV priced once, every set priced on
         the same market and MC paths.
-      * ``lcm_properties`` (+ ``include_lcm0``) — legacy single set, bump names
-        ``LCM`` / ``LCM0``. Unchanged behaviour for existing consumers.
+      * ``lcm_properties`` — legacy single set, bump name ``LCM`` (no LCM0).
+        Unchanged behaviour for existing consumers.
 
     Layouts (mutator counts are equal within the axis, padded with
     GenericMutatorNull):
@@ -459,8 +444,7 @@ def build_unified_scenario(
         use_lcm = True
     elif use_lcm:
         legacy = LcmParamSet.from_properties(lcm_properties or DEFAULT_LCM_PROPERTIES, name="")
-        layout = [(legacy, legacy.bump_lcm, legacy.bump_lcm0 if include_lcm0 else None)]
-        lcm0_lambda = None      # legacy path: LCM0 keeps the set's own lambdas
+        layout = [(legacy, legacy.bump_lcm, None)]
 
     if not use_lsv and not use_lcm:
         return None

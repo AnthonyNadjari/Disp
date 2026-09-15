@@ -3,7 +3,7 @@ LCM parameter sets — resolution policy (portal-free, unit-testable, product-ag
 
 Lives in functions.common so any product (dispersion, correlation toolbox, vol
 feedback, ...) can turn user input into filled ``LcmParamSet`` with the same
-rules. ``functions.dispersion.lcm_sets`` re-exports this module.
+rules.
 
 Turns whatever the caller gave (nothing, the legacy ``lcm_params`` dict, or a
 list of ``LcmParamSet`` / dicts) into a list of fully-filled ``LcmParamSet``

@@ -180,7 +180,7 @@ _ZCB_CACHE: Dict[tuple, float] = {}
 #   functions.common.pricing_utils.CORRELATION_SENS_BUMP   the move (0.01 = +1 pt)
 #   PRICING_CORRSENS_BUMP / _PARAMS / _DEBUG                env overrides
 from functions.common.pricing_scenarios import LcmParamSet, lcm_bump_layout, lcm0_properties
-from functions.dispersion.lcm_sets import resolve_lcm_sets, lcm_column_suffix, lcm0_lambda_for
+from functions.common.lcm_sets import resolve_lcm_sets, lcm_column_suffix, lcm0_lambda_for
 from functions.common.pricing_utils import (
     CORRELATION_SENS_METRIC as _CORRSENS_METRIC,
     correlation_sens_bump as _corrsens_bump,
@@ -484,7 +484,7 @@ def _ra_from_payout_trace(n_corridor_obs: float, n_total_obs: int, zcb: float) -
 # of the model context), skews 0 — whatever lambdas a set uses. One LCM0 bump
 # therefore serves every set (with the same rho0).
 #
-# Defaults policy (functions.dispersion.lcm_sets.resolve_lcm_sets): a set's
+# Defaults policy (functions.common.lcm_sets.resolve_lcm_sets): a set's
 # LambdaPricing / LambdaAtm default to the run's EqEq lambda unless given
 # explicitly; other fields default to the desk CSV values. The legacy single
 # ``cfg.lcm_params`` dict is accepted as one unnamed set (bump names LCM /
