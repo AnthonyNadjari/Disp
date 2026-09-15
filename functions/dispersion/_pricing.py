@@ -40,7 +40,7 @@ import threading
 import numpy as np
 import datetime
 import pandas as pd
-from typing import List, Optional, Dict, Tuple, Any, Callable
+from typing import List, Optional, Dict, Tuple, Any, Callable, Union
 from functools import lru_cache
 from dataclasses import dataclass, field
 
@@ -888,7 +888,7 @@ def _solve_single_ev_ra(
                     "ACEqFxShift": str(eqfx_shift),
                 }
             _model = "EMEA-Stocks-MC-LV-MultiAsset"
-        _apply_special_rics_param(model_params, tickers)
+        _apply_special_rics_param(model_params, [ticker, corr_asset])   # was `tickers`: undefined here
         model_context = pricing_portal.create_model_context(_model, instrument_model_parameters=model_params)
         valuation_date = strike_date if isinstance(strike_date, datetime.datetime) else datetime.datetime.combine(
             strike_date if isinstance(strike_date, datetime.date) else datetime.datetime.strptime(str(strike_date),
