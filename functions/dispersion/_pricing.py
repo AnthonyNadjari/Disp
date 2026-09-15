@@ -4161,7 +4161,7 @@ class PricingEngine(VolSwapMixin):
         # FPF clone objects are built inline (cheap); the expensive
         # to_fpf_string() serialization runs ONCE in a parallel pool after the
         # loop (CPU-bound, thread-safe) — see _fpf_serial_jobs.
-        _fpf_serial_jobs = []  # [(result_obj, attr_name, clone_obj)]
+        _fpf_serial_jobs = []  # [(target_obj, attr_name, clone_spec, owner TickerResult)]
         for idx, ticker in enumerate(tickers):
             # Mono corridor index (for LSV extraction)
             m_idx = mono_corr_order.index(corr_assets[idx]) if corr_assets[idx] in mono_corr_order else None
@@ -5266,7 +5266,8 @@ class PricingEngine(VolSwapMixin):
                             row[f'EV Cross LCM0{_sfx} (%)'] = f"{_leg.ev_cross0 * 100:.2f}%"
                         if _leg.impact is not None:
                             row[f'LCM Impact Cross{_sfx} (%)'] = f"{_leg.impact * 100:.2f}%"
-                        row[f'LCM Params{_sfx}'] = _lcm_params_label(_leg.properties)
+                        if _leg.ev_cross is not None:   # solve mode; price mode writes it below
+                            row[f'LCM Params{_sfx}'] = _lcm_params_label(_leg.properties)
 
                     if r.range_accrual is not None:
                         # Mono and cross legs share the corridor asset → one RA column

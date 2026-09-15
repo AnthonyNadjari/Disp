@@ -2835,7 +2835,7 @@ with tab4:
                         _lam_p_default = eqeq_lambda_var if _lam_ok else float(_lcm_defaults["LambdaPricing"])
                         _lam_a_default = eqeq_lambda_var if _lam_ok else float(_lcm_defaults["LambdaAtm"])
                         _lcm_table_default = pd.DataFrame([{
-                            "Set": "1",
+                            "Set": "",      # blank + single row → legacy un-suffixed columns
                             "λ Pricing": _lam_p_default,
                             "λ ATM": _lam_a_default,
                             "λ Rho0": float(_lcm_defaults["LambdaFromRho0"]),
@@ -2868,10 +2868,12 @@ with tab4:
                                 return None
 
                         lcm_sets_var = []
+                        _n_rows = len(_lcm_sets_df)
                         for _i, _row in _lcm_sets_df.reset_index(drop=True).iterrows():
                             _nm = str(_row.get("Set") if _row.get("Set") is not None and not pd.isna(_row.get("Set")) else "").strip()
                             lcm_sets_var.append({
-                                "name": _nm or str(_i + 1),
+                                # blank name: "" for a single set (legacy columns), "1","2",… when several
+                                "name": _nm or ("" if _n_rows == 1 else str(_i + 1)),
                                 "lambda_pricing": _num_or_none(_row.get("λ Pricing")),
                                 "lambda_atm": _num_or_none(_row.get("λ ATM")),
                                 "lambda_from_rho0": _num_or_none(_row.get("λ Rho0")),
