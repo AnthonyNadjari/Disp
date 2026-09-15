@@ -2867,6 +2867,14 @@ with tab4:
                             except (TypeError, ValueError):
                                 return None
 
+                        # Blank cell (new rows come in empty) = the prefilled value of row 1:
+                        # EqEq λ for the lambdas, CSV nearest-tenor for ρ0 / skews.
+                        _row1 = _lcm_table_default.iloc[0]
+
+                        def _cell(row, col):
+                            v = _num_or_none(row.get(col))
+                            return float(_row1[col]) if v is None else v
+
                         lcm_sets_var = []
                         _n_rows = len(_lcm_sets_df)
                         for _i, _row in _lcm_sets_df.reset_index(drop=True).iterrows():
@@ -2874,11 +2882,11 @@ with tab4:
                             lcm_sets_var.append({
                                 # blank name: "" for a single set (legacy columns), "1","2",… when several
                                 "name": _nm or ("" if _n_rows == 1 else str(_i + 1)),
-                                "lambda_pricing": _num_or_none(_row.get("λ Pricing")),
-                                "lambda_atm": _num_or_none(_row.get("λ ATM")),
-                                "lambda_from_rho0": _num_or_none(_row.get("λ Rho0")),
-                                "call_skew": _num_or_none(_row.get("Call Skew")),
-                                "put_skew": _num_or_none(_row.get("Put Skew")),
+                                "lambda_pricing": _cell(_row, "λ Pricing"),
+                                "lambda_atm": _cell(_row, "λ ATM"),
+                                "lambda_from_rho0": _cell(_row, "λ Rho0"),
+                                "call_skew": _cell(_row, "Call Skew"),
+                                "put_skew": _cell(_row, "Put Skew"),
                             })
                         _names = [s["name"] for s in lcm_sets_var]
                         if len(set(_names)) != len(_names):
