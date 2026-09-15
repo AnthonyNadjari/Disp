@@ -2780,6 +2780,7 @@ with tab4:
                         correl_bump_lsv_var, correl_bump_lsv_style_var = 0.0, "Relative"
                 with _adv2:
                     apply_lcm_var = st.toggle("Enable LCM", value=False, key="p_apply_lcm")
+                    lcm_sets_var = []   # list of dicts → solve(lcm_sets=...) / price(lcm_sets=...)
                     if apply_lcm_var:
                         # Determine region from model name
                         _lcm_region = "AMER" if "AMER" in (model_name_var or "") else "EMEA"
@@ -2825,46 +2826,80 @@ with tab4:
 
                         st.dataframe(_ref_df.style.apply(_highlight_nearest, axis=1), use_container_width=True,
                                      hide_index=True)
-                        lcm_call_skew_var = st.number_input("Call Skew", value=float(_lcm_defaults["CallSkew"]),
-                                                            step=0.05, format="%.4f", key="p_lcm_cs")
-                        lcm_put_skew_var = st.number_input("Put Skew", value=float(_lcm_defaults["PutSkew"]), step=0.05,
-                                                           format="%.4f", key="p_lcm_ps")
-                        lcm_lambda_rho0_var = st.number_input("λ Rho0", value=float(_lcm_defaults["LambdaFromRho0"]),
-                                                              step=0.01, format="%.4f", key="p_lcm_rho0")
-                        # ── λ ATM / λ Pricing: NOT editable — pinned to the EqEq λ input ──
-                        # Desk convention: one lambda. The EqEq λ above is the ACEqEqSpread
-                        # of the model context (LV / LSV / LCM alike) AND the LCM mutator's
-                        # LambdaPricing + LambdaAtm. Enforced engine-side in
-                        # functions.dispersion._pricing._dispersion_lcm_properties; shown
-                        # here so everyone sees which lambda is used.
-                        if eqeq_lambda_var > 0:
-                            lcm_lambda_atm_var = eqeq_lambda_var
-                            lcm_lambda_pricing_var = eqeq_lambda_var
-                            _lam_c1, _lam_c2 = st.columns(2)
-                            _lam_c1.metric("λ ATM (= EqEq λ)", f"{lcm_lambda_atm_var:.4f}",
-                                           delta=f"CSV: {float(_lcm_defaults['LambdaAtm']):.4f}", delta_color="off")
-                            _lam_c2.metric("λ Pricing (= EqEq λ)", f"{lcm_lambda_pricing_var:.4f}",
-                                           delta=f"CSV: {float(_lcm_defaults['LambdaPricing']):.4f}", delta_color="off")
+                        # ── LCM parameter sets: one row = one set, ALL priced in the same call ──
+                        # λ Pricing / λ ATM are inputs. They are PREFILLED with the EqEq λ
+                        # entered above (the same number that is ACEqEqSpread in the model
+                        # context) and can be overridden per row. λ Rho0 / skews are prefilled
+                        # from the CSV (nearest tenor). Rows can be added/removed.
+                        _lam_ok = eqeq_lambda_var > 0
+                        _lam_p_default = eqeq_lambda_var if _lam_ok else float(_lcm_defaults["LambdaPricing"])
+                        _lam_a_default = eqeq_lambda_var if _lam_ok else float(_lcm_defaults["LambdaAtm"])
+                        _lcm_table_default = pd.DataFrame([{
+                            "Set": "1",
+                            "λ Pricing": _lam_p_default,
+                            "λ ATM": _lam_a_default,
+                            "λ Rho0": float(_lcm_defaults["LambdaFromRho0"]),
+                            "Call Skew": float(_lcm_defaults["CallSkew"]),
+                            "Put Skew": float(_lcm_defaults["PutSkew"]),
+                        }])
+                        st.markdown("**LCM parameter sets** — one row per set. All sets are priced in the "
+                                    "same portal call: LV is computed once, each set adds an LCM and an LCM0 bump.")
+                        _lcm_sets_df = st.data_editor(
+                            _lcm_table_default,
+                            num_rows="dynamic", hide_index=True, use_container_width=True,
+                            # key carries the prefill so the table re-seeds when EqEq λ / region change
+                            key=f"p_lcm_sets_{_lam_p_default:.6f}_{_lcm_region}",
+                            column_config={
+                                "Set": st.column_config.TextColumn("Set", help="Short name (letters/digits/_ . -); becomes the column suffix [name]"),
+                                "λ Pricing": st.column_config.NumberColumn("λ Pricing", format="%.4f", step=0.01,
+                                                                           help="Default = EqEq λ. Blank → EqEq λ."),
+                                "λ ATM": st.column_config.NumberColumn("λ ATM", format="%.4f", step=0.01,
+                                                                       help="Default = EqEq λ. Blank → EqEq λ."),
+                                "λ Rho0": st.column_config.NumberColumn("λ Rho0", format="%.4f", step=0.01),
+                                "Call Skew": st.column_config.NumberColumn("Call Skew", format="%.4f", step=0.05),
+                                "Put Skew": st.column_config.NumberColumn("Put Skew", format="%.4f", step=0.05),
+                            },
+                        )
+
+                        def _num_or_none(v):
+                            try:
+                                return None if v is None or pd.isna(v) else float(v)
+                            except (TypeError, ValueError):
+                                return None
+
+                        lcm_sets_var = []
+                        for _i, _row in _lcm_sets_df.reset_index(drop=True).iterrows():
+                            _nm = str(_row.get("Set") if _row.get("Set") is not None and not pd.isna(_row.get("Set")) else "").strip()
+                            lcm_sets_var.append({
+                                "name": _nm or str(_i + 1),
+                                "lambda_pricing": _num_or_none(_row.get("λ Pricing")),
+                                "lambda_atm": _num_or_none(_row.get("λ ATM")),
+                                "lambda_from_rho0": _num_or_none(_row.get("λ Rho0")),
+                                "call_skew": _num_or_none(_row.get("Call Skew")),
+                                "put_skew": _num_or_none(_row.get("Put Skew")),
+                            })
+                        _names = [s["name"] for s in lcm_sets_var]
+                        if len(set(_names)) != len(_names):
+                            st.error(f"LCM sets: duplicate names {sorted({n for n in _names if _names.count(n) > 1})} — rename the rows.")
+                        if _lam_ok:
                             st.info(
-                                f"**LCM lambda policy** — EqEq λ = **{eqeq_lambda_var:.4f}** is used everywhere: "
-                                f"`ACEqEqSpread` of the model context (LV / LSV / LCM) **and** the LCM mutator's "
-                                f"`LambdaPricing` + `LambdaAtm`. The CSV values for those two are shown for reference only. "
-                                f"Call Skew / Put Skew / λ Rho0 stay as set above.\n\n"
-                                f"**LCM impact = EV(LCM) − EV(LCM0)**, where LCM0 = same LCM with Call Skew = Put Skew = 0 "
+                                f"**Lambda used** — EqEq λ = **{eqeq_lambda_var:.4f}** is `ACEqEqSpread` in the model "
+                                f"context for every bump (LV / LSV / LCM). λ Pricing and λ ATM above default to that same "
+                                f"value; edit a row to price a set with different lambdas. CSV reference: "
+                                f"λ Pricing {float(_lcm_defaults['LambdaPricing']):.4f}, λ ATM {float(_lcm_defaults['LambdaAtm']):.4f}.\n\n"
+                                f"**LCM impact = EV(LCM) − EV(LCM0)** per set, LCM0 = same lambdas with Call/Put Skew = 0 "
                                 f"(the LSV0 analogue). Strike LCM = √(−(EV_LV + EV_LCM − EV_LCM0) / RA). "
-                                f"'LCM Raw' columns = √(−EV_LCM / RA) without the LCM0 control."
+                                f"'LCM Raw' = √(−EV_LCM / RA) without the LCM0 control. The exact parameters sent are "
+                                f"in the 'LCM Params [set]' result column."
                             )
                         else:
-                            # Individual Correlations mode passes eqeq_lambda = 0 → engine keeps CSV lambdas
-                            lcm_lambda_atm_var = float(_lcm_defaults["LambdaAtm"])
-                            lcm_lambda_pricing_var = float(_lcm_defaults["LambdaPricing"])
                             st.warning(
-                                f"EqEq λ is not set in this correlation mode (0). LCM keeps the CSV lambdas: "
-                                f"λ ATM = {lcm_lambda_atm_var:.4f}, λ Pricing = {lcm_lambda_pricing_var:.4f}. "
-                                f"LCM impact is still EV(LCM) − EV(LCM0).")
+                                f"EqEq λ is not set in this correlation mode (0). λ Pricing / λ ATM are prefilled from the "
+                                f"CSV instead ({_lam_p_default:.4f} / {_lam_a_default:.4f}). LCM impact is still EV(LCM) − EV(LCM0).")
         else:
             apply_lsv_var = False
             apply_lcm_var = False
+            lcm_sets_var = []
             correl_bump_lsv_var, correl_bump_lsv_style_var = 0.0, "Relative"
         # ── Underlyings editor ──
         st.divider()
@@ -3003,15 +3038,8 @@ with tab4:
                                 'Variance Asset']
                         if 'Currency' not in pricing_df.columns:
                             pricing_df['Currency'] = ''  # empty → PricingEngine auto-detects from portal
-                        # ── Build LCM properties dict from UI inputs ──
-                        _lcm_props = {
-                            "AggregatorType": "Basket",
-                            "CallSkew": [lcm_call_skew_var],
-                            "PutSkew": [lcm_put_skew_var],
-                            "LambdaAtm": [lcm_lambda_atm_var],
-                            "LambdaFromRho0": lcm_lambda_rho0_var,
-                            "LambdaPricing": lcm_lambda_pricing_var,
-                        } if apply_lcm_var else None
+                        # ── LCM parameter sets from the table (None = LCM off) ──
+                        _lcm_sets = list(lcm_sets_var) if (apply_lcm_var and lcm_sets_var) else None
                         if is_solve_var:
                             results = solve(
                                 df=pricing_df,
@@ -3028,8 +3056,8 @@ with tab4:
                                 lsv_params=st.session_state.get('edited_df_lsv_p') if apply_lsv_var else None,
                                 lsv_correl_bump=correl_bump_lsv_var,
                                 lsv_correl_bump_style=correl_bump_lsv_style_var,
-                                use_lcm=apply_lcm_var,
-                                lcm_properties=_lcm_props,
+                                use_lcm=bool(_lcm_sets),
+                                lcm_sets=_lcm_sets,
                                 progress_callback=update_progress,
                             )
                         else:
@@ -3048,8 +3076,8 @@ with tab4:
                                 lsv_params=st.session_state.get('edited_df_lsv_p') if apply_lsv_var else None,
                                 lsv_correl_bump=correl_bump_lsv_var,
                                 lsv_correl_bump_style=correl_bump_lsv_style_var,
-                                use_lcm=apply_lcm_var,
-                                lcm_properties=_lcm_props,
+                                use_lcm=bool(_lcm_sets),
+                                lcm_sets=_lcm_sets,
                                 progress_callback=update_progress,
                             )
                         if results and hasattr(results, 'success') and results.success:

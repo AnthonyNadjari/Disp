@@ -59,7 +59,7 @@ import warnings
 import numpy as np
 import pandas as pd
 from datetime import date
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from functions.dispersion._logging import logger as _engine_log
 from functions.dispersion.models import (
@@ -434,6 +434,7 @@ def solve(
     lsv_correl_bump_style: str = "Relative",
     use_lcm: bool = False,
     lcm_properties: dict = None,
+    lcm_sets: Sequence = None,
     progress_callback: Callable[[dict], None] = None,
 ) -> SolveResult:
     """
@@ -466,6 +467,16 @@ def solve(
         "Global Parameters" or "Individual Correlations"
     model_name : str, optional
         Override pricing model name.
+    use_lcm, lcm_properties : legacy single LCM set (portal-keyed dict).
+    lcm_sets : sequence of LcmParamSet | dict, optional
+        N LCM parameter sets priced in ONE call (LV priced once). Each set
+        yields its own columns suffixed " [name]". A set's lambda_pricing /
+        lambda_atm default to ``eqeq_lambda``; other fields default to the
+        desk CSV values. Wins over use_lcm/lcm_properties. Example::
+
+            lcm_sets=[{"name": "base"},
+                      {"name": "flat", "call_skew": 0.0, "put_skew": 0.0},
+                      LcmParamSet(name="hi", lambda_pricing=0.55)]
     progress_callback : callable, optional
         Called with progress dict.
 
@@ -508,6 +519,7 @@ def solve(
         lsv_correl_bump=lsv_correl_bump,
         lsv_correl_bump_style=lsv_correl_bump_style,
         lcm_params={'enabled': use_lcm, 'lcm_properties': lcm_properties} if use_lcm else None,
+        lcm_sets=list(lcm_sets) if lcm_sets else None,
     )
     result = PricingEngine(pricing_cfg).run(tickers_df=engine_df, progress_callback=progress_callback)
 
@@ -543,6 +555,7 @@ def price(
     lsv_correl_bump_style: str = "Relative",
     use_lcm: bool = False,
     lcm_properties: dict = None,
+    lcm_sets: Sequence = None,
     progress_callback: Callable[[dict], None] = None,
 ) -> PriceResult:
     """
@@ -593,6 +606,7 @@ def price(
         lsv_correl_bump=lsv_correl_bump,
         lsv_correl_bump_style=lsv_correl_bump_style,
         lcm_params={'enabled': use_lcm, 'lcm_properties': lcm_properties} if use_lcm else None,
+        lcm_sets=list(lcm_sets) if lcm_sets else None,
     )
     result = PricingEngine(pricing_cfg).run(tickers_df=engine_df, progress_callback=progress_callback)
 

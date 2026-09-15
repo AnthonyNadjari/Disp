@@ -6,7 +6,9 @@ scenario axes (LSV, LCM, spot bumps, etc.) attached to portal price() calls.
 """
 from __future__ import annotations
 
-from typing import List, Dict, Optional, Callable, Any
+import re
+from dataclasses import dataclass, replace as _dc_replace
+from typing import List, Dict, Optional, Callable, Any, Sequence, Tuple, ClassVar
 import pandas as pd
 
 
@@ -45,6 +47,128 @@ _INDEX_RICS = {".STOXX50E", ".SPX", ".FTSE", ".N225", ".HSI", ".FCHI", ".GDAXI",
 # ══════════════════════════════════════════════════════════════════════════════
 # LCM — Local Correlation Model
 # ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class LcmParamSet:
+    """One LCM parameter set = one (LCM, LCM0) bump pair in a scenario axis.
+
+    ``None`` fields mean "not specified" — the caller fills them with its own
+    defaults (``filled``) before ``to_properties`` is called. Product-specific
+    policies (e.g. dispersion: lambdas default to the EqEq lambda) live in the
+    product, not here.
+
+    Bump names derive from ``name``: ``""`` → ``LCM`` / ``LCM0`` (legacy single
+    set); ``"A"`` → ``LCM_A`` / ``LCM0_A``. Names are restricted to
+    ``[A-Za-z0-9_.-]`` so they survive as portal result keys.
+    """
+    name: str = ""
+    lambda_pricing: Optional[float] = None
+    lambda_atm: Optional[float] = None
+    lambda_from_rho0: Optional[float] = None
+    call_skew: Optional[float] = None
+    put_skew: Optional[float] = None
+    aggregator_type: Optional[str] = None
+
+    _NAME_RE: ClassVar = re.compile(r"^[A-Za-z0-9_.\-]*$")
+    _FIELDS: ClassVar = ("lambda_pricing", "lambda_atm", "lambda_from_rho0",
+                         "call_skew", "put_skew", "aggregator_type")
+
+    def __post_init__(self):
+        if not isinstance(self.name, str) or not self._NAME_RE.match(self.name):
+            raise ValueError(f"LcmParamSet.name {self.name!r}: use only letters, digits, '_', '.', '-'")
+
+    # ---- bump naming ----
+    @property
+    def bump_lcm(self) -> str:
+        return "LCM" if not self.name else f"LCM_{self.name}"
+
+    @property
+    def bump_lcm0(self) -> str:
+        return "LCM0" if not self.name else f"LCM0_{self.name}"
+
+    def lcm0_key(self) -> Tuple:
+        """LCM0 depends on the lambdas only (skews are zeroed) — sets sharing
+        this key share one LCM0 bump."""
+        return (self.lambda_pricing, self.lambda_atm, self.lambda_from_rho0, self.aggregator_type)
+
+    # ---- defaults / conversion ----
+    def missing(self) -> List[str]:
+        return [f for f in self._FIELDS if getattr(self, f) is None]
+
+    def filled(self, **defaults) -> "LcmParamSet":
+        """Copy with every ``None`` field replaced by ``defaults[field]`` when given."""
+        upd = {f: defaults[f] for f in self._FIELDS if getattr(self, f) is None and f in defaults}
+        return _dc_replace(self, **upd) if upd else self
+
+    def to_properties(self) -> Dict[str, Any]:
+        """Portal property bag (list form where the portal expects lists)."""
+        miss = self.missing()
+        if miss:
+            raise ValueError(f"LcmParamSet {self.name!r}: unfilled fields {miss} — call filled(...) first")
+        return {
+            "AggregatorType": self.aggregator_type,
+            "CallSkew": [float(self.call_skew)],
+            "PutSkew": [float(self.put_skew)],
+            "LambdaAtm": [float(self.lambda_atm)],
+            "LambdaFromRho0": float(self.lambda_from_rho0),
+            "LambdaPricing": float(self.lambda_pricing),
+        }
+
+    @classmethod
+    def from_properties(cls, props: Dict[str, Any], name: str = "") -> "LcmParamSet":
+        """Inverse of ``to_properties`` (accepts scalars or one-element lists)."""
+        def _s(v):
+            if isinstance(v, (list, tuple)):
+                return float(v[0]) if v else None
+            return None if v is None else (v if isinstance(v, str) else float(v))
+        p = props or {}
+        return cls(
+            name=name,
+            lambda_pricing=_s(p.get("LambdaPricing")),
+            lambda_atm=_s(p.get("LambdaAtm")),
+            lambda_from_rho0=_s(p.get("LambdaFromRho0")),
+            call_skew=_s(p.get("CallSkew")),
+            put_skew=_s(p.get("PutSkew")),
+            aggregator_type=p.get("AggregatorType"),
+        )
+
+    @classmethod
+    def coerce(cls, obj, name: str = "") -> "LcmParamSet":
+        """``LcmParamSet`` | field-keyed dict | portal-keyed dict → ``LcmParamSet``."""
+        if isinstance(obj, cls):
+            return obj
+        if isinstance(obj, dict):
+            if any(k in obj for k in ("LambdaPricing", "LambdaAtm", "CallSkew", "PutSkew")):
+                return cls.from_properties(obj, name=obj.get("name", name))
+            return cls(**{**{"name": name}, **obj})
+        raise TypeError(f"cannot coerce {type(obj).__name__} to LcmParamSet")
+
+
+def lcm_bump_layout(lcm_sets: Sequence[LcmParamSet]) -> List[Tuple[LcmParamSet, str, str]]:
+    """``[(set, lcm_bump_name, lcm0_bump_name), ...]`` in input order.
+
+    LCM0 bumps are shared between sets with the same ``lcm0_key`` (the first
+    set owns the bump name). Raises on duplicate set names."""
+    seen_names = set()
+    lcm0_owner: Dict[Tuple, str] = {}
+    out = []
+    for s in lcm_sets:
+        if s.name in seen_names:
+            raise ValueError(f"duplicate LcmParamSet name {s.name!r}")
+        seen_names.add(s.name)
+        key = s.lcm0_key()
+        lcm0 = lcm0_owner.setdefault(key, s.bump_lcm0)
+        out.append((s, s.bump_lcm, lcm0))
+    return out
+
+
+def build_lcm_mutator(pricing_portal, props: Dict[str, Any]):
+    return pricing_portal.create_scenario_mutator(
+        name="GenericMutatorOverrideLCMWithRealisedReference",
+        mutator_properties=pricing_portal.create_scenario_mutator_properties(props),
+        mutator_properties_asset_overrides=[],
+    )
+
 
 def build_lcm_bumps(
     pricing_portal,
@@ -291,63 +415,77 @@ def build_unified_scenario(
     correl_bump_style: str = "Relative",
     lcm_properties: Optional[Dict[str, Any]] = None,
     include_lcm0: bool = False,
+    lcm_sets: Optional[Sequence[LcmParamSet]] = None,
 ) -> Optional[Any]:
     """
     Build a unified scenario axis with proper mutator padding.
 
-    Depending on flags:
-        Neither:       returns None (no scenario)
-        LCM only:      [LV, LCM]                 — 2 bumps × 2 mutators
-        LSV only:      [LV, LSV0, LSV]           — 3 bumps × 2 mutators
-        LSV + LCM:     [LV, LSV0, LSV, LCM]      — 4 bumps × 3 mutators
-    With ``include_lcm0=True`` an extra "LCM0" bump (LCM with CallSkew =
-    PutSkew = 0, see ``build_lcm_bumps``) is inserted before "LCM":
-        LCM only:      [LV, LCM0, LCM]
-        LSV + LCM:     [LV, LSV0, LSV, LCM0, LCM]
-    Off by default so existing consumers keep their MC cost and response shape.
+    LCM can be given two ways:
+      * ``lcm_sets`` — N fully-filled ``LcmParamSet``; each contributes an
+        ``LCM_<name>`` bump plus an ``LCM0_<name>`` bump (skews = 0), LCM0
+        bumps shared between sets with identical lambdas (``lcm_bump_layout``).
+        ``use_lcm`` is implied. This is the multi-set path: one call, LV priced
+        once, every set priced on the same market and MC paths.
+      * ``lcm_properties`` (+ ``include_lcm0``) — legacy single set, bump names
+        ``LCM`` / ``LCM0``. Unchanged behaviour for existing consumers.
 
-    All bumps within an axis have equal mutator count (padded with GenericMutatorNull).
-
-    Returns:
-        Scenario object or None if neither LSV nor LCM is enabled.
+    Layouts (mutator counts are equal within the axis, padded with
+    GenericMutatorNull):
+        Neither:       None
+        LSV only:      [LV, LSV0, LSV]                        2 mutators
+        LCM only:      [LV, (LCM0…), LCM…]                    2 mutators
+        LSV + LCM:     [LV, LSV0, LSV, (LCM0…), LCM…]         3 mutators
     """
+    # ── Normalise the LCM input to a layout ──
+    layout: List[Tuple[LcmParamSet, str, str]] = []
+    if lcm_sets:
+        layout = lcm_bump_layout(list(lcm_sets))
+        use_lcm = True
+    elif use_lcm:
+        legacy = LcmParamSet.from_properties(lcm_properties or DEFAULT_LCM_PROPERTIES, name="")
+        layout = [(legacy, legacy.bump_lcm, legacy.bump_lcm0 if include_lcm0 else None)]
+
     if not use_lsv and not use_lcm:
         return None
-
-    # ── LCM only ──
-    if use_lcm and not use_lsv:
-        lcm_parts = build_lcm_bumps(pricing_portal, lcm_properties)
-        null = lcm_parts["null_mutator"]
-        bumps = [pricing_portal.create_scenario_bump(name="LV", mutators=[null, null])]
-        if include_lcm0:
-            bumps.append(pricing_portal.create_scenario_bump(name="LCM0", mutators=[null, lcm_parts["lcm0_mutator"]]))
-        bumps.append(pricing_portal.create_scenario_bump(name="LCM", mutators=[null, lcm_parts["lcm_mutator"]]))
-        scenario = pricing_portal.create_scenario(axes=[pricing_portal.create_scenario_axis(bumps=bumps)])
-        return scenario
-
-    # ── LSV only ──
     if use_lsv and not use_lcm:
         return build_lsv_scenario(pricing_portal, underlying_rics, lsv_params, correl_bump, correl_bump_style)
 
-    # ── LSV + LCM ──
+    # ── LCM mutators: one per set, one per distinct LCM0 ──
+    lcm_mutators: Dict[str, Any] = {}    # bump name -> mutator
+    for s, b_lcm, b_lcm0 in layout:
+        props = s.to_properties()
+        lcm_mutators[b_lcm] = build_lcm_mutator(pricing_portal, props)
+        if b_lcm0 is not None and b_lcm0 not in lcm_mutators:
+            lcm_mutators[b_lcm0] = build_lcm_mutator(pricing_portal, lcm0_properties(props))
+    lcm0_names = [b for _, _, b in layout if b is not None]
+    lcm0_names = list(dict.fromkeys(lcm0_names))          # unique, input order
+    lcm_names = [b for _, b, _ in layout]
+
+    null = pricing_portal.create_scenario_mutator(
+        name="GenericMutatorNull",
+        mutator_properties=pricing_portal.create_scenario_mutator_properties({}),
+        mutator_properties_asset_overrides=[],
+    )
+
+    # ── LCM only: [LV, LCM0…, LCM…], 2 mutators each ──
+    if not use_lsv:
+        bumps = [pricing_portal.create_scenario_bump(name="LV", mutators=[null, null])]
+        for b in lcm0_names + lcm_names:
+            bumps.append(pricing_portal.create_scenario_bump(name=b, mutators=[null, lcm_mutators[b]]))
+        return pricing_portal.create_scenario(axes=[pricing_portal.create_scenario_axis(bumps=bumps)])
+
+    # ── LSV + LCM: [LV, LSV0, LSV, LCM0…, LCM…], 3 mutators each ──
     lsv_parts = build_lsv_bumps(pricing_portal, underlying_rics, lsv_params, correl_bump, correl_bump_style)
-    lcm_parts = build_lcm_bumps(pricing_portal, lcm_properties)
-
-    # All bumps need 3 mutators: [LSV_slot, Correl_slot, LCM_slot]
-    pad = lcm_parts["null_mutator"]
-
+    pad = null
     bumps = [
         pricing_portal.create_scenario_bump(name="LV", mutators=lsv_parts["lv_mutators"] + [pad]),
         pricing_portal.create_scenario_bump(name="LSV0", mutators=lsv_parts["lsv0_mutators"] + [pad]),
         pricing_portal.create_scenario_bump(name="LSV", mutators=lsv_parts["lsv_mutators"] + [pad]),
     ]
-    if include_lcm0:
+    for b in lcm0_names + lcm_names:
         bumps.append(pricing_portal.create_scenario_bump(
-            name="LCM0", mutators=[pad, lsv_parts["null_mutator"], lcm_parts["lcm0_mutator"]]))
-    bumps.append(pricing_portal.create_scenario_bump(
-        name="LCM", mutators=[pad, lsv_parts["null_mutator"], lcm_parts["lcm_mutator"]]))
-    scenario = pricing_portal.create_scenario(axes=[pricing_portal.create_scenario_axis(bumps=bumps)])
-    return scenario
+            name=b, mutators=[pad, lsv_parts["null_mutator"], lcm_mutators[b]]))
+    return pricing_portal.create_scenario(axes=[pricing_portal.create_scenario_axis(bumps=bumps)])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
