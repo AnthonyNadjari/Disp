@@ -2867,14 +2867,19 @@ with tab4:
                                     _rows = []
                                     for _i, _r in _pdf.iterrows():
                                         _row = {"Set": str(_r["Set"]).strip() if str(_r["Set"]).strip() not in ("", "nan") else ""}
+                                        _n_parsed = 0
                                         for _c in _LCM_COLS[1:]:
                                             try:
                                                 _v = float(str(_r[_c]).replace(",", ".").strip())
                                                 if _v != _v:          # NaN = blank cell
                                                     raise ValueError
+                                                _n_parsed += 1
                                             except (TypeError, ValueError):
                                                 _v = _prefill_row[_c]   # blank → prefill, shown in the table
                                             _row[_c] = _v
+                                        # a lone header line ("Set ...") pasted without data: skip it
+                                        if _n_parsed == 0 and _row["Set"].casefold() == "set":
+                                            continue
                                         _rows.append(_row)
                                     if not _rows:
                                         raise ValueError("no rows parsed")
