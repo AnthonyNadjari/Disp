@@ -2834,21 +2834,37 @@ with tab4:
                         _lam_ok = eqeq_lambda_var > 0
                         _lam_p_default = eqeq_lambda_var if _lam_ok else float(_lcm_defaults["LambdaPricing"])
                         _lam_a_default = eqeq_lambda_var if _lam_ok else float(_lcm_defaults["LambdaAtm"])
-                        _lcm_table_default = pd.DataFrame([{
-                            "Set": "",      # blank + single row → legacy un-suffixed columns
+                        _prefill_row = {
                             "λ Pricing": _lam_p_default,
                             "λ ATM": _lam_a_default,
                             "λ Rho0": float(_lcm_defaults["LambdaFromRho0"]),
                             "Call Skew": float(_lcm_defaults["CallSkew"]),
                             "Put Skew": float(_lcm_defaults["PutSkew"]),
-                        }])
+                        }
+                        _lcm_table_default = pd.DataFrame([{"Set": "", **_prefill_row}])
                         st.markdown("**LCM parameter sets** — one row per set. All sets are priced in the "
-                                    "same portal call: LV is computed once, each set adds an LCM and an LCM0 bump.")
+                                    "same portal call: LV is computed once, each set adds an LCM bump "
+                                    "(LCM0 is shared).")
+                        # Row count is an input: every row is seeded fully prefilled (no blank
+                        # rows to fill by hand). Edits survive a change of N; a change of EqEq λ
+                        # or region re-seeds the table.
+                        _seed_sig = f"{_lam_p_default:.6f}_{_lcm_region}"
+                        _n_lcm_sets = int(st.number_input("Number of LCM sets", min_value=1, max_value=12,
+                                                          value=1, step=1, key="p_lcm_n_sets"))
+                        _prev_rows = st.session_state.get("p_lcm_sets_rows") or []
+                        if st.session_state.get("p_lcm_sets_sig") != _seed_sig:
+                            _prev_rows = []
+                        _seed_rows = []
+                        for _i in range(_n_lcm_sets):
+                            if _i < len(_prev_rows):
+                                _seed_rows.append({**{"Set": "", **_prefill_row}, **_prev_rows[_i]})
+                            else:
+                                _seed_rows.append({"Set": "" if _n_lcm_sets == 1 else str(_i + 1), **_prefill_row})
+                        _lcm_table_default = pd.DataFrame(_seed_rows)[["Set", *_prefill_row.keys()]]
                         _lcm_sets_df = st.data_editor(
                             _lcm_table_default,
-                            num_rows="dynamic", hide_index=True, use_container_width=True,
-                            # key carries the prefill so the table re-seeds when EqEq λ / region change
-                            key=f"p_lcm_sets_{_lam_p_default:.6f}_{_lcm_region}",
+                            num_rows="fixed", hide_index=True, use_container_width=True,
+                            key=f"p_lcm_sets_{_seed_sig}_{_n_lcm_sets}",
                             column_config={
                                 "Set": st.column_config.TextColumn("Set", help="Short name (letters/digits/_ . -); becomes the column suffix [name]"),
                                 "λ Pricing": st.column_config.NumberColumn("λ Pricing", format="%.4f", step=0.01,
@@ -2860,6 +2876,9 @@ with tab4:
                                 "Put Skew": st.column_config.NumberColumn("Put Skew", format="%.4f", step=0.05),
                             },
                         )
+
+                        st.session_state["p_lcm_sets_rows"] = _lcm_sets_df.to_dict("records")
+                        st.session_state["p_lcm_sets_sig"] = _seed_sig
 
                         def _num_or_none(v):
                             try:
