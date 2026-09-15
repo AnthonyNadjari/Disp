@@ -3049,42 +3049,51 @@ with tab4:
                 progress_bar = st.progress(0, text="Starting...")
                 status_text = st.empty()
 
+                # Unified bar, monotonic. Bands per phase:
+                #   build FPFs 2% · main batches 5→40% · atms 40→45% · per-ticker
+                #   results 45→65% · capped batches 70→85% · serialize 87% · done 100%
+                _pbar_state = {"pct": 0.0}
+
+                def _bar(pct, text):
+                    pct = max(_pbar_state["pct"], min(float(pct), 1.0))   # never go backwards
+                    _pbar_state["pct"] = pct
+                    progress_bar.progress(pct, text=text)
+
                 def update_progress(progress_info):
-                    if isinstance(progress_info, dict):
-                        s = progress_info.get('status', '')
-                        if s == 'pricing_batch':
-                            batch = progress_info['batch']
-                            total = progress_info['total_batches']
-                            label = progress_info.get('label', 'main')
-                            # Unified bar: main/atms batches 5%→45%, capped batch 70%→85%
-                            batch_display = min(batch, total)
-                            frac = batch_display / max(total, 1)
-                            if label == 'capped':
-                                pct = 0.70 + frac * 0.15
-                            else:
-                                pct = 0.05 + frac * 0.40
-                            progress_bar.progress(min(pct, 1.0),
-                                                  text=f"Pricing batch {batch_display} / {total} ({label})...")
-                        elif s in ('completed', 'started', 'pricing'):
-                            # Per-ticker results: 45%→70%
-                            pct = 0.45 + (progress_info['completed'] / max(progress_info['total'], 1)) * 0.25
-                            progress_bar.progress(min(pct, 1.0),
-                                                  text=f"{progress_info.get('message', progress_info.get('ticker', ''))} ({progress_info['completed']}/{progress_info['total']})")
-                        elif s == 'failed':
-                            status_text.warning(
-                                f"⚠️ {progress_info.get('ticker', '')} - {progress_info.get('message', '')}")
-                        elif s == 'phase':
-                            # Named phases map to their slot in the unified bar
-                            msg = progress_info.get('message', '')
-                            if 'Serializ' in msg:
-                                pct = 0.87
-                            elif 'Capped' in msg:
-                                pct = 0.70
-                            elif 'Building' in msg:
-                                pct = 0.02
-                            else:
-                                pct = 0.05
-                            progress_bar.progress(pct, text=msg)
+                    if not isinstance(progress_info, dict):
+                        return
+                    s = progress_info.get('status', '')
+                    if s == 'pricing_batch':
+                        label = progress_info.get('label', 'main')
+                        ob, ot = progress_info.get('batch', 0), max(progress_info.get('total_batches', 1), 1)
+                        cb = progress_info.get('call_batch', ob)
+                        ct = max(progress_info.get('call_total', ot), 1)
+                        frac = min(cb, ct) / ct
+                        lo, hi = {'capped': (0.70, 0.85), 'atms': (0.40, 0.45)}.get(label, (0.05, 0.40))
+                        flag = "  ⚠️ failed" if progress_info.get('failed') else ""
+                        _bar(lo + frac * (hi - lo),
+                             f"Pricing {label}: batch {min(cb, ct)}/{ct}  ·  overall {min(ob, ot)}/{ot}{flag}")
+                    elif s in ('completed', 'started', 'pricing'):
+                        # Per-ticker post-processing: 45%→65%
+                        done, tot = progress_info.get('completed', 0), max(progress_info.get('total', 1), 1)
+                        _bar(0.45 + (done / tot) * 0.20,
+                             f"{progress_info.get('message') or progress_info.get('ticker', '')} ({done}/{tot})")
+                    elif s == 'done':
+                        _bar(1.0, progress_info.get('message', 'Pricing completed'))
+                    elif s == 'failed':
+                        status_text.warning(
+                            f"⚠️ {progress_info.get('ticker', '')} - {progress_info.get('message', '')}")
+                    elif s == 'phase':
+                        msg = progress_info.get('message', '')
+                        if 'Serializ' in msg:
+                            pct = 0.87
+                        elif 'Capped' in msg:
+                            pct = 0.70
+                        elif 'Building' in msg:
+                            pct = 0.02
+                        else:
+                            pct = 0.05
+                        _bar(pct, msg)
 
                 try:
                     tickers = [t for t in

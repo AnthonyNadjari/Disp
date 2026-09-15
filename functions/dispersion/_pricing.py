@@ -2253,15 +2253,16 @@ class PricingEngine(VolSwapMixin):
         successful = [r.ticker for r in results if r.success]
         failed = [r.ticker for r in results if not r.success]
         results_df = self._build_results_df(results)
-        # Final progress update at 100%
+        # Final progress update at 100% (status 'done' — distinct from the
+        # per-ticker 'completed' events so the UI can fill the bar)
         if progress_callback:
             try:
                 progress_callback({
                     'ticker': 'done',
-                    'status': 'completed',
+                    'status': 'done',
                     'completed': len(successful) + len(failed),
                     'total': len(successful) + len(failed),
-                    'message': 'Pricing completed'
+                    'message': f'Pricing completed: {len(successful)} ok, {len(failed)} failed',
                 })
             except Exception:
                 pass  # Ignore Streamlit context errors
@@ -2651,6 +2652,8 @@ class PricingEngine(VolSwapMixin):
                     "status": "pricing_batch",
                     "batch": _batch_counter_price[0],
                     "total_batches": _total_batches_price,
+                    "call_batch": _batch_counter_price[0],
+                    "call_total": _total_batches_price,
                     "label": "price",
                 })
             _batch_counter_price[0] += 1
@@ -3321,19 +3324,35 @@ class PricingEngine(VolSwapMixin):
         # Upfront estimate includes the capped re-pricing batch (Phase 2b) so
         # the counter never exceeds its own total mid-run; the dynamic adjust
         # below stays as a safety net for unusual shapes.
-        _main_chunks = (len(instruments) + MAX_INSTRUMENTS_PER_CALL - 1) // MAX_INSTRUMENTS_PER_CALL
+        def _n_chunks(n_instruments: int) -> int:
+            return (n_instruments + MAX_INSTRUMENTS_PER_CALL - 1) // MAX_INSTRUMENTS_PER_CALL
+
+        _main_chunks = _n_chunks(len(instruments))
         _atms_chunks = _main_chunks if cfg.vol_mode == "ATMF+ATMS" else 0
-        _cap_chunks_est = _main_chunks if cfg.is_capped else 0
+        # Capped re-pricing (Phase 2b) instruments per ticker: LV, LSV (if on),
+        # one per LCM set, and for cross legs the mono (+ mono LSV). Exact count
+        # is only known once the cap tasks exist; the total is corrected then.
+        if cfg.is_capped:
+            _n_lcm_est = len(cfg.lcm_sets) if cfg.lcm_sets else (
+                1 if (cfg.lcm_params and cfg.lcm_params.get('enabled')) else 0)
+            _lsv_on = 1 if (cfg.use_lsv_cross_ev and cfg.lsv_params is not None) else 0
+            _n_cross = sum(1 for t, c in zip(tickers, corr_assets) if t != c)
+            _cap_chunks_est = _n_chunks(len(tickers) * (1 + _lsv_on + _n_lcm_est) + _n_cross * (1 + _lsv_on))
+        else:
+            _cap_chunks_est = 0
         _total_batches = _main_chunks + _atms_chunks + _cap_chunks_est
         _batch_counter = [1]  # mutable counter for nested function
 
         def _price_in_batches(instruments, metrics, price_id="Price", scenario=None, batch_label="main"):
-            """Price instruments in chunks, return raw portal results dict."""
+            """Price instruments in chunks, return raw portal results dict.
+            Progress events carry the batch index within THIS call
+            (``call_batch``/``call_total``, exact) and the running overall
+            counter (``batch``/``total_batches``)."""
             nonlocal _total_batches
             all_results = {}
             global_idx = 0
-            n_chunks = (len(instruments) + MAX_INSTRUMENTS_PER_CALL - 1) // MAX_INSTRUMENTS_PER_CALL
-            # Dynamically adjust total if we're about to exceed it
+            n_chunks = _n_chunks(len(instruments))
+            # Safety net: never let the overall counter exceed its total
             if _batch_counter[0] + n_chunks - 1 > _total_batches:
                 _total_batches = _batch_counter[0] + n_chunks - 1
             for start in range(0, len(instruments), MAX_INSTRUMENTS_PER_CALL):
@@ -3375,6 +3394,8 @@ class PricingEngine(VolSwapMixin):
                             "status": "pricing_batch",
                             "batch": _batch_counter[0],
                             "total_batches": _total_batches,
+                            "call_batch": chunk_num,
+                            "call_total": n_chunks,
                             "label": batch_label,
                         })
 
@@ -3388,7 +3409,10 @@ class PricingEngine(VolSwapMixin):
                             "status": "pricing_batch",
                             "batch": _batch_counter[0],
                             "total_batches": _total_batches,
+                            "call_batch": chunk_num,
+                            "call_total": n_chunks,
                             "label": batch_label,
+                            "failed": True,
                         })
 
                 _batch_counter[0] += 1
@@ -4698,6 +4722,8 @@ class PricingEngine(VolSwapMixin):
                 elif not _per_ticker_corr_mode:
                     effective_cap_scenario = batch_scenario
 
+                # Exact overall total now that the capped instrument count is known
+                _total_batches = _batch_counter[0] - 1 + _n_chunks(len(cap_instruments))
                 cap_results_map = _price_in_batches(
                     cap_instruments,
                     metrics=[pricing_portal.create_metric("FairValue"),
