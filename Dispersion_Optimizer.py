@@ -2870,8 +2870,10 @@ with tab4:
                                         for _c in _LCM_COLS[1:]:
                                             try:
                                                 _v = float(str(_r[_c]).replace(",", ".").strip())
+                                                if _v != _v:          # NaN = blank cell
+                                                    raise ValueError
                                             except (TypeError, ValueError):
-                                                _v = _prefill_row[_c]
+                                                _v = _prefill_row[_c]   # blank → prefill, shown in the table
                                             _row[_c] = _v
                                         _rows.append(_row)
                                     if not _rows:
