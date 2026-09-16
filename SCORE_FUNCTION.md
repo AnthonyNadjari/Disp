@@ -26,7 +26,7 @@ constraint set can produce.
 
 | Metric | Definition | Direction |
 |---|---|---|
-| `last_carry` | mean of the most recent payoffs, the entry carry | higher better |
+| `last_carry` | mean payoff of the swaps that matured in the last N months (window set by `carry_window_months`, default 3) | higher better |
 | `mean_payoff` | mean of the payoff series | higher better |
 | `hit_ratio` | share of observation dates with a positive payoff | higher better |
 | `min_payoff` | worst single payoff, the floor | higher better |

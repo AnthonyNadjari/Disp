@@ -257,7 +257,7 @@ a P&L series to a scalar:
 
 | Metric | Definition |
 |---|---|
-| `last_carry` | mean of the most recent payoffs (recent-maturity carry) |
+| `last_carry` | mean payoff of the swaps that matured in the last N months (`carry_window_months`, default 3; window counted on the real date index) |
 | `mean_payoff` | mean of the series |
 | `hit_ratio` | share of positive payoffs over **all** days (NaN → metric NaN; the backtester summary divides by non-zero days instead) |
 | `min_payoff` | worst single payoff (floor) |
@@ -328,8 +328,8 @@ flowchart TD
   maximin on the same curve the backtest will deliver — not a proxy.
 - **Concave blends** of `{min_payoff, mean_payoff, last_carry}`: step 1
   bisects the maximum feasible floor as above; step 2, at that floor, one LP
-  maximizes the remaining linear part of the blend (mean + a 63-day carry
-  proxy). The blend coefficients come from a single extraction point
+  maximizes the remaining linear part of the blend (mean + the carry over
+  the same N-month window the metric uses). The blend coefficients come from a single extraction point
   (`concave_blend_lambdas`) shared by the solver, the refinement acceptance
   and the safety net, so no two components optimize different objectives.
 - **Everything else** (blends involving `hit_ratio`, `max_drawdown`, `cvar_5`,
