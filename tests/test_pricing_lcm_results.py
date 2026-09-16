@@ -91,7 +91,8 @@ def test_results_df_cross_capped_two_sets(pricing):
     cfg = _cfg(pricing, is_capped=True, lcm_sets=[{"name": "A"}, {"name": "B", "lambda_pricing": 0.55}])
     a, b = pricing._resolve_lcm_sets_for(cfg)
     tr = pricing.TickerResult(ticker="X.PA", corridor_asset=".STOXX50E", success=True, currency="EUR",
-                              strike_variance_asset=0.20, strike_corridor_asset=0.22)
+                              strike_variance_asset=0.20, strike_corridor_asset=0.22,
+                              strike_cap_priced_lv=0.195, strike_cap_priced_mono=0.215)
     for s in (a, b):
         tr.lcm[s.name] = _leg(pricing, s, ev_cross=-0.031, ev_cross0=-0.0305, strike=0.201, strike_raw=0.19,
                               strike_cap_priced=0.198, strike_cap_priced_raw=0.187,
