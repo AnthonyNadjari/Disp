@@ -543,6 +543,24 @@ class ScoreFunction:
 # ---------------------------------------------------------------------------
 
 
+def carry_window_obs(dates, months: float) -> int:
+    """Number of trailing observations that fall in the last ``months`` months
+    of ``dates`` — the ``k`` of :class:`LastCarry` for a "last N months carry".
+
+    Counted on the real date index (not ``21 × months``), so gaps and
+    non-daily grids are handled. ``months <= 0`` or no dates → ``1`` (the
+    single most recent observation, the historical behaviour). Never
+    returns 0.
+    """
+    if months is None or float(months) <= 0 or dates is None or len(dates) == 0:
+        return 1
+    import pandas as pd
+    idx = pd.DatetimeIndex(pd.to_datetime(list(dates)))
+    cutoff = idx[-1] - pd.DateOffset(months=float(months))
+    k = int((idx > cutoff).sum())
+    return max(1, k)
+
+
 def make_default_score_function(
     weights: Optional[MetricWeights] = None,
     last_carry_k: int = 1,

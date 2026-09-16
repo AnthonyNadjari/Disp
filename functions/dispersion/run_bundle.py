@@ -200,6 +200,7 @@ class RunBundle:
     bucket_constraints: Optional[List[BucketConstraint]] = None
     vega_config: Optional[VegaConfig] = None   # absolute-Vega toggle (None = OFF)
     dates: Optional[List] = None            # optional row index of pnl_matrix
+    last_carry_k: int = 1                   # LastCarry window (observations); 1 for bundles < v3
     config: Optional[Dict] = None           # DispersionConfig snapshot (informational)
     provenance: Dict = field(default_factory=dict)  # forced/excluded tickers, dates, ...
     result: Optional[Dict] = None           # outcome snapshot at save time
@@ -241,6 +242,7 @@ class RunBundle:
             global_cap=self.global_cap,
             global_floor=self.global_floor,
             metric_weights=MetricWeights(dict(self.score_weights)),
+            last_carry_k=int(self.last_carry_k),
             progress_callback=progress_callback,
             bisect_in_ga=self.bisect_in_ga,
             forced_long_indices=(list(self.forced_long_indices)
@@ -282,6 +284,7 @@ def save_run_bundle(
     bucket_constraints: Optional[List[BucketConstraint]] = None,
     vega_config: Optional[VegaConfig] = None,
     dates=None,
+    last_carry_k: int = 1,
     config: Optional[Dict] = None,
     provenance: Optional[Dict] = None,
     result: Optional[OptimizationResult] = None,
@@ -366,6 +369,7 @@ def save_run_bundle(
                                    if bucket_constraints else None),
             "vega_config": (dataclasses.asdict(vega_config)
                             if vega_config is not None else None),
+            "last_carry_k": int(last_carry_k),
         },
         "long_candidates": [_leg_to_dict(l) for l in long_candidates],
         "short_candidates": [_leg_to_dict(l) for l in short_candidates],
@@ -453,6 +457,7 @@ def load_run_bundle(path: str) -> RunBundle:
                             if opt.get("bucket_constraints") else None),
         vega_config=(VegaConfig(**opt["vega_config"])
                      if opt.get("vega_config") else None),
+        last_carry_k=int(opt.get("last_carry_k", 1)),
         dates=dates,
         config=payload.get("config"),
         provenance=dict(payload.get("provenance") or {}),

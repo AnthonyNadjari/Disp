@@ -330,8 +330,13 @@ class DispersionOptimizer:
         reference_cache: Optional[dict] = None,
         metric_targets: Optional[Dict[str, float]] = None,
         warm_start: Optional[Tuple[List[str], List[str]]] = None,
+        last_carry_k: int = 1,
     ):
         self.long_candidates = long_candidates
+        # Window (in observations) of the last_carry metric — "last N months
+        # carry". Computed by the API from the date index (carry_window_obs);
+        # 1 = most recent observation only (historical default, bundles < v3).
+        self._last_carry_k = max(1, int(last_carry_k))
         self.short_candidates = short_candidates
         self.c = constraints or OptimizationConstraints()
         self._use_exact_in_ga: bool = bisect_in_ga
@@ -791,6 +796,7 @@ class DispersionOptimizer:
                     f"carries an Axe Target — add the 'Axe Target' column to the "
                     f"long input (absolute Vega units).")
             self._score_fn = make_default_score_function(weights=self._metric_weights,
+                                                         last_carry_k=self._last_carry_k,
                                                          targets=self._metric_targets)
             ctx = ScoreContext(n_days=self._n_rows)
             # Weight bounds from stock objects (already decimal: 0.015 = 1.5%)

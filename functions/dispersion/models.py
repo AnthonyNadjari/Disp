@@ -554,6 +554,9 @@ class OptimizationResult:
     axe_recycled: Optional[float] = None     # criterion B of the delivered basket (fraction of the package)
     # ── Bootstrap robustness diagnostic (None unless robustness_check=True) ──
     robustness: Optional[Dict] = None        # {n_draws, n_challengers, top1_freq, top3_freq, winner_raw_ci}
+    # ── Carry criterion window (set by _api.optimize) ──
+    last_carry_k: int = 1                    # observations averaged by last_carry ("last N months")
+    carry_window_months: Optional[float] = None
     # ── Interactive smoothing state (set post-construction by _api.py; UI-only) ──
     _smooth_state: Optional[Dict] = None     # interactive smoothing snapshot (UI re-rank)
     _final_raw_min: Optional[float] = None   # min net P&L of the delivered basket (UI assertion)

@@ -1053,6 +1053,7 @@ def optimize(
     short_df: pd.DataFrame = None,
     score_weights: Dict[str, float] = None,
     metric_targets: Dict[str, float] = None,
+    carry_window_months: float = 3.0,
     start_date: date = None,
     end_date: date = None,
     filter_zero_hr: bool = False,
@@ -1243,6 +1244,11 @@ def optimize(
             "last_carry": 0.25, "hit_ratio": 0.25,
             "min_payoff": 0.25, "mean_payoff": 0.25,
         })
+    # last_carry = mean payoff of the swaps that matured in the last
+    # `carry_window_months` — the window is counted on the real date index.
+    from functions.dispersion.scoring.score import carry_window_obs
+    _carry_k = carry_window_obs(_optimizer_dates, carry_window_months)
+    _engine_log.info(f"[CARRY] last_carry window: {carry_window_months} month(s) = {_carry_k} observation(s)")
 
     # ── Step 6: Run GA ──
     # ── PRE-GA VALIDATION (data for UI expander) ──
@@ -1282,6 +1288,7 @@ def optimize(
         global_floor=config.global_floor,
         metric_weights=metric_weights,
         metric_targets=metric_targets,
+        last_carry_k=_carry_k,
         # Re-optimization speedup: on a prep-cache HIT (identical universe),
         # seed the GA with the previous run's winner.
         warm_start=(_PREP_CACHE.get("last_baskets")
@@ -1298,6 +1305,8 @@ def optimize(
     )
     opt_result = optimizer.run()
     opt_result._final_raw_min = getattr(optimizer, '_final_raw_min', None)
+    opt_result.last_carry_k = _carry_k
+    opt_result.carry_window_months = float(carry_window_months)
 
     # ── Optional: bootstrap robustness diagnostic ──
     if robustness_check:
@@ -1317,6 +1326,7 @@ def optimize(
             constraints=constraints,
             score_weights=metric_weights.to_dict(),
             seed=seed,
+            last_carry_k=_carry_k,
             missing_data_policy=config.missing_data_policy,
             adj_divs=config.adj_divs,
             reweight_grace_days=config.reweight_grace_days,
@@ -1561,6 +1571,7 @@ def optimize_multi(
     configs: List[Dict[str, float]],
     short_df: pd.DataFrame = None,
     metric_targets: Dict[str, float] = None,
+    carry_window_months: float = 3.0,
     start_date: date = None,
     end_date: date = None,
     filter_zero_hr: bool = False,
@@ -1663,6 +1674,9 @@ def optimize_multi(
     if _shared_ref_cache is None:
         _shared_ref_cache = {}
 
+    from functions.dispersion.scoring.score import carry_window_obs
+    _carry_k = carry_window_obs(prep.get("optimizer_dates"), carry_window_months)
+
     results: List[OptimizationResult] = []
     rows: List[Dict] = []
     for k, weights_dict in enumerate(configs):
@@ -1682,6 +1696,7 @@ def optimize_multi(
             global_floor=config.global_floor,
             metric_weights=metric_weights,
             metric_targets=metric_targets,
+            last_carry_k=_carry_k,
             progress_callback=progress_callback,
             bisect_in_ga=bisect_in_ga,
             seed=seed,

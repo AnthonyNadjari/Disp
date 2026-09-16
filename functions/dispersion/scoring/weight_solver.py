@@ -200,8 +200,6 @@ class _SolverTuning:
     sweep_projection_budget: int = 12
     #: V-grid resolution for the per-evaluation vega choice. Range [9, 101].
     vega_grid_points: int = 33
-    #: last_carry proxy window (days) in the bisection step-2 LP objective.
-    bisect_carry_window: int = 63
     #: Post-smoothing eps ladder multipliers.
     smooth_eps_ladder: Tuple[int, ...] = (1, 2, 4)
 
@@ -1893,10 +1891,12 @@ class WeightSolver:
         if lam_mean == 0.0 and lam_carry == 0.0:
             return bisect_result
 
-        # Objective: maximize lam_mean * mean(sub_pnl @ w) + lam_carry * mean(sub_pnl[-n_carry:] @ w)
+        # Objective: maximize lam_mean * mean(sub_pnl @ w) + lam_carry * mean(sub_pnl[-K:] @ w)
         # = (lam_mean * col_means + lam_carry * col_carry_means) @ w
+        # K = the LastCarry metric's own window (concave_blend_lambdas) — the
+        # SAME window the score uses (a fixed 63-day proxy was used here before).
         col_means = sub_pnl.mean(axis=0)
-        n_carry = min(SOLVER_TUNING.bisect_carry_window, n_days)  # ~3 months for "last_carry"
+        n_carry = min(int(_K2), n_days)
         col_carry_means = sub_pnl[-n_carry:].mean(axis=0) if n_carry > 0 else col_means
 
         obj_linear = -(lam_mean * col_means + lam_carry * col_carry_means)  # negate for minimize

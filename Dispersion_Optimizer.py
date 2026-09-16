@@ -1243,10 +1243,15 @@ with tab1:
             st.subheader("⚖️ Optimization Weights")
             _wc1, _wc2, _wc3, _wc4 = st.columns(4)
             with _wc1:
-                last_carry_weight = st.number_input("Last carry weight", step=0.01, min_value=0.00,
+                last_carry_weight = st.number_input("Carry weight (last N months)", step=0.01, min_value=0.00,
                                                     max_value=1.00, value=0.30,
                                                     key="opt_w_last_carry",
-                                                    help="Recent payoff (last maturities)")
+                                                    help="Mean payoff of the swaps that matured in the last N months "
+                                                         "(N set below). 0 months = most recent maturity only.")
+                carry_window_months = st.number_input("Carry window (months)", step=1.0, min_value=0.0,
+                                                      max_value=36.0, value=3.0, key="opt_carry_months",
+                                                      help="Window of the carry criterion, counted on the real "
+                                                           "observation dates. Also used by the weight solver.")
             with _wc2:
                 mean_payoff_weight = st.number_input("Mean payoff weight", step=0.01, min_value=0.00,
                                                      max_value=1.00, value=0.30,
@@ -1373,7 +1378,7 @@ with tab1:
                            "the plateau is BELOW the target.")
                 _tgt_specs = [
                     # name, label, unit hint, prefill (sensible order of magnitude), step, format
-                    ('last_carry', 'Last carry', 'vol points (mean of the last trade payoffs)', 0.5, 0.1, "%.2f"),
+                    ('last_carry', 'Carry (last N months)', 'vol points (mean payoff of the last N months of maturities)', 0.5, 0.1, "%.2f"),
                     ('mean_payoff', 'Mean payoff', 'vol points (mean payoff per trade, e.g. 0.5)', 0.5, 0.1, "%.2f"),
                     ('hit_ratio', 'Hit ratio', 'PERCENT (65 = 65% winning trades)', 65.0, 1.0, "%.0f"),
                     ('min_payoff', 'Min payoff', 'vol points (worst single trade, negative)', -2.0, 0.5, "%.2f"),
@@ -1576,6 +1581,7 @@ with tab1:
                                     short_df=_short_df_arg,
                                     score_weights=score_weights,
                                     metric_targets=metric_targets or None,
+                                    carry_window_months=float(carry_window_months),
                                     start_date=st.session_state.get('_opt_start_date_value'),
                                     filter_zero_hr=filter_zero_hr,
                                     progress_callback=_opti_progress,
@@ -1774,12 +1780,14 @@ with tab1:
                         _sm_pnl = _adaptive_pnl_fn(_ts_mat, _stock_indices, _w_smooth, _active_mask)
 
                         # Compute stats table rows
+                        _carry_k_ui = int(getattr(result, "last_carry_k", 1) or 1)
+
                         def _stats_row(pnl, w):
                             nz = pnl[pnl != 0.0]
                             return {
                                 "min_payoff": float(_np.min(pnl)),
                                 "mean_payoff": float(_np.mean(pnl)),
-                                "last_carry": float(pnl[-1]) if len(pnl) > 0 else 0.0,
+                                "last_carry": float(_np.mean(pnl[-_carry_k_ui:])) if len(pnl) > 0 else 0.0,
                                 "hit_ratio": float((nz > 0).mean()) if len(nz) > 0 else 0.0,
                                 "max_payoff": float(_np.max(pnl)),
                                 "dispersion": float(_np.std(w)),
@@ -1845,7 +1853,7 @@ with tab1:
                     _metric_labels = [
                         ("Min payoff", "min_payoff"),
                         ("Mean payoff", "mean_payoff"),
-                        ("Last carry", "last_carry"),
+                        ("Carry (last N months)", "last_carry"),
                         ("Hit ratio", "hit_ratio"),
                         ("Max payoff", "max_payoff"),
                         ("Dispersion (σ weights)", "dispersion"),
