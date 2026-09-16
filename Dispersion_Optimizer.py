@@ -500,7 +500,7 @@ def _df_from_paste(text: str, cols) -> pd.DataFrame:
         'ticker', 'tickers', 'name', 'names', 'ric', 'rics',
         'volofvar', 'eq/volcorrel', 'meanreversion',
         'set', 'λ pricing', 'λ atm', 'λ rho0', 'lambda pricing', 'lambda atm', 'lambda rho0',
-        'call skew', 'put skew',
+        'call skew', 'put skew', 'mode',
     }
     _row0 = [str(v).strip().casefold() for v in df.iloc[0].tolist()]
     if sum(1 for v in _row0 if v in _known) >= 2:
@@ -2851,21 +2851,26 @@ with tab4:
                             "Call Skew": float(_lcm_defaults["CallSkew"]),
                             "Put Skew": float(_lcm_defaults["PutSkew"]),
                         }
-                        _lcm_table_default = pd.DataFrame([{"Set": "1", **_prefill_row}])
+                        _LCM_MODES = ["adjusted", "raw"]
+                        _lcm_table_default = pd.DataFrame([{"Set": "1", **_prefill_row, "Mode": "adjusted"}])
                         st.markdown("**LCM parameter sets** — one row per set. All sets are priced in the "
                                     "same portal call: LV is computed once, each set adds an LCM bump "
-                                    "(LCM0 is shared).")
+                                    "(LCM0 is shared). **Mode**: `adjusted` = strike vs LCM0 "
+                                    "(√(−(EV_LV + EV_LCM − EV_LCM0)/RA)); `raw` = the set priced on its own "
+                                    "(√(−EV_LCM/RA), no LCM0) — column 'LCM Raw [set]'.")
                         # Row count is an input: every row is seeded fully prefilled (no blank
                         # rows to fill by hand). Edits survive a change of N; a change of EqEq λ
                         # or region re-seeds the table.
                         _seed_sig = f"{_lam_p_default:.6f}_{_lcm_region}"
-                        _LCM_COLS = ["Set", "λ Pricing", "λ ATM", "λ Rho0", "Call Skew", "Put Skew"]
+                        _LCM_NUM_COLS = ["λ Pricing", "λ ATM", "λ Rho0", "Call Skew", "Put Skew"]
+                        _LCM_COLS = ["Set", *_LCM_NUM_COLS, "Mode"]
                         # ── Paste + Fill (same parser as the basket tables) ──
                         _lcm_pasted = st.text_area(
                             "Paste LCM sets here:",
                             height=80,
                             key="p_lcm_paste",
-                            help="One row per set, tab/comma separated: Set, λ Pricing, λ ATM, λ Rho0, Call Skew, Put Skew. "
+                            help="One row per set, tab/comma separated: Set, λ Pricing, λ ATM, λ Rho0, Call Skew, Put Skew[, Mode]. "
+                                 "Mode = adjusted (default, strike vs LCM0) or raw (√(−EV_LCM/RA), no LCM0). "
                                  "A header row is skipped. Blank cells take the prefill (EqEq λ / CSV values).",
                         )
                         if st.button("Fill LCM sets", key="p_lcm_fill"):
@@ -2876,7 +2881,9 @@ with tab4:
                                     for _i, _r in _pdf.iterrows():
                                         _row = {"Set": str(_r["Set"]).strip() if str(_r["Set"]).strip() not in ("", "nan") else ""}
                                         _n_parsed = 0
-                                        for _c in _LCM_COLS[1:]:
+                                        _m = str(_r.get("Mode", "")).strip().lower()
+                                        _row["Mode"] = _m if _m in _LCM_MODES else "adjusted"
+                                        for _c in _LCM_NUM_COLS:
                                             try:
                                                 _v = float(str(_r[_c]).replace(",", ".").strip())
                                                 if _v != _v:          # NaN = blank cell
@@ -2904,10 +2911,10 @@ with tab4:
                         _seed_rows = []
                         for _i in range(_n_lcm_sets):
                             if _i < len(_prev_rows):
-                                _seed_rows.append({**{"Set": "", **_prefill_row}, **_prev_rows[_i]})
+                                _seed_rows.append({**{"Set": "", **_prefill_row, "Mode": "adjusted"}, **_prev_rows[_i]})
                             else:
-                                _seed_rows.append({"Set": str(_i + 1), **_prefill_row})
-                        _lcm_table_default = pd.DataFrame(_seed_rows)[["Set", *_prefill_row.keys()]]
+                                _seed_rows.append({"Set": str(_i + 1), **_prefill_row, "Mode": "adjusted"})
+                        _lcm_table_default = pd.DataFrame(_seed_rows)[["Set", *_prefill_row.keys(), "Mode"]]
                         _lcm_sets_df = st.data_editor(
                             _lcm_table_default,
                             num_rows="dynamic", hide_index=True, use_container_width=True,
@@ -2921,6 +2928,10 @@ with tab4:
                                 "λ Rho0": st.column_config.NumberColumn("λ Rho0", format="%.4f", step=0.01),
                                 "Call Skew": st.column_config.NumberColumn("Call Skew", format="%.4f", step=0.05),
                                 "Put Skew": st.column_config.NumberColumn("Put Skew", format="%.4f", step=0.05),
+                                "Mode": st.column_config.SelectboxColumn(
+                                    "Mode", options=_LCM_MODES, default="adjusted", required=True,
+                                    help="adjusted: strike vs LCM0 = √(−(EV_LV + EV_LCM − EV_LCM0)/RA). "
+                                         "raw: set priced on its own = √(−EV_LCM/RA), no LCM0."),
                             },
                         )
 
@@ -2953,6 +2964,8 @@ with tab4:
                                 "lambda_from_rho0": _cell(_row, "λ Rho0"),
                                 "call_skew": _cell(_row, "Call Skew"),
                                 "put_skew": _cell(_row, "Put Skew"),
+                                "mode": (str(_row.get("Mode")).strip().lower()
+                                         if str(_row.get("Mode")).strip().lower() in _LCM_MODES else "adjusted"),
                             })
                         _names = [s["name"] for s in lcm_sets_var]
                         if len(set(_names)) != len(_names):

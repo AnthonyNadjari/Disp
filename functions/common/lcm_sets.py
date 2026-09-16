@@ -108,6 +108,8 @@ def resolve_lcm_sets(
         lcm0_lam = lcm0_lambda_for(reference_lambda)
         lcm0_note = (f"LCM0 = LambdaPricing=LambdaAtm={lcm0_lam:g} ({lambda_label}), skews 0"
                      if lcm0_lam is not None else "LCM0 = same lambdas, skews 0")
+        if not f.uses_lcm0:
+            lcm0_note = "mode=raw: strike = sqrt(-EV_LCM/RA), no LCM0"
         log(f"{tag} LambdaPricing={f.lambda_pricing:g} LambdaAtm={f.lambda_atm:g} "
             f"LambdaFromRho0={f.lambda_from_rho0:g} CallSkew={f.call_skew:g} PutSkew={f.put_skew:g}"
             f"{lam_note}; {lcm0_note}")

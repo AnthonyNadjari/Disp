@@ -265,6 +265,21 @@ def test_from_properties_without_aggregator_and_coerce_name_priority():
     assert c.name == "X"                                                   # dict's own name wins
 
 
+def test_raw_mode_no_lcm0(pp):
+    sets = resolve_lcm_sets(0.4, [{"name": "A"}, {"name": "B", "lambda_pricing": 0.55, "mode": "raw"}])
+    assert sets[0].uses_lcm0 and not sets[1].uses_lcm0
+    lay = lcm_bump_layout(sets, lcm0_lambda=0.4)
+    assert [(s.name, b, b0) for s, b, b0 in lay] == [("A", "LCM_A", "LCM0_A"), ("B", "LCM_B", None)]
+    sc = build_unified_scenario(pp, use_lsv=False, lcm_sets=sets, lcm0_lambda=0.4)
+    assert _bump_names(sc) == ["LV", "LCM0_A", "LCM_A", "LCM_B"]
+    # raw-only run: no LCM0 bump at all
+    raw_only = resolve_lcm_sets(0.4, [{"name": "B", "mode": "raw"}])
+    assert _bump_names(build_unified_scenario(pp, use_lsv=False, lcm_sets=raw_only, lcm0_lambda=0.4)) == ["LV", "LCM_B"]
+    with pytest.raises(ValueError):
+        LcmParamSet(name="X", mode="whatever")
+    assert LcmParamSet.coerce({"name": "C", "LambdaPricing": 0.5, "mode": "RAW"}).mode == "raw"
+
+
 def test_column_suffix():
     assert lcm_column_suffix("") == ""
     assert lcm_column_suffix("A") == " [A]"

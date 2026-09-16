@@ -60,6 +60,12 @@ class LcmParamSet:
     Bump names derive from ``name``: ``""`` → ``LCM`` / ``LCM0`` (legacy single
     set); ``"A"`` → ``LCM_A`` / ``LCM0_A``. Names are restricted to
     ``[A-Za-z0-9_.-]`` so they survive as portal result keys.
+
+    ``mode`` decides how the set's strike is read:
+      * ``"adjusted"`` (default) — against the LCM0 control:
+        strike = sqrt(-(EV_LV + EV_LCM − EV_LCM0) / RA); the set gets an LCM0 bump.
+      * ``"raw"`` — the set priced on its own: strike = sqrt(-EV_LCM / RA);
+        NO LCM0 bump is priced for it.
     """
     name: str = ""
     lambda_pricing: Optional[float] = None
@@ -68,14 +74,22 @@ class LcmParamSet:
     call_skew: Optional[float] = None
     put_skew: Optional[float] = None
     aggregator_type: Optional[str] = None
+    mode: str = "adjusted"
 
     _NAME_RE: ClassVar = re.compile(r"^[A-Za-z0-9_.\-]*$")
     _FIELDS: ClassVar = ("lambda_pricing", "lambda_atm", "lambda_from_rho0",
                          "call_skew", "put_skew", "aggregator_type")
+    MODES: ClassVar = ("adjusted", "raw")
 
     def __post_init__(self):
         if not isinstance(self.name, str) or not self._NAME_RE.match(self.name):
             raise ValueError(f"LcmParamSet.name {self.name!r}: use only letters, digits, '_', '.', '-'")
+        if self.mode not in self.MODES:
+            raise ValueError(f"LcmParamSet.mode {self.mode!r}: expected one of {self.MODES}")
+
+    @property
+    def uses_lcm0(self) -> bool:
+        return self.mode == "adjusted"
 
     # ---- bump naming ----
     @property
@@ -122,7 +136,7 @@ class LcmParamSet:
         }
 
     @classmethod
-    def from_properties(cls, props: Dict[str, Any], name: str = "") -> "LcmParamSet":
+    def from_properties(cls, props: Dict[str, Any], name: str = "", mode: str = "adjusted") -> "LcmParamSet":
         """Inverse of ``to_properties`` (accepts scalars or one-element lists)."""
         def _s(v):
             if isinstance(v, (list, tuple)):
@@ -137,6 +151,7 @@ class LcmParamSet:
             call_skew=_s(p.get("CallSkew")),
             put_skew=_s(p.get("PutSkew")),
             aggregator_type=p.get("AggregatorType"),
+            mode=mode,
         )
 
     @classmethod
@@ -146,8 +161,12 @@ class LcmParamSet:
             return obj
         if isinstance(obj, dict):
             if any(k in obj for k in ("LambdaPricing", "LambdaAtm", "CallSkew", "PutSkew")):
-                return cls.from_properties(obj, name=obj.get("name", name))
-            return cls(**{**{"name": name}, **obj})
+                return cls.from_properties(obj, name=obj.get("name", name),
+                                           mode=str(obj.get("mode", "adjusted")).strip().lower())
+            d = {**{"name": name}, **obj}
+            if "mode" in d:
+                d["mode"] = str(d["mode"] or "adjusted").strip().lower()
+            return cls(**d)
         raise TypeError(f"cannot coerce {type(obj).__name__} to LcmParamSet")
 
 
@@ -158,7 +177,8 @@ def lcm_bump_layout(lcm_sets: Sequence[LcmParamSet],
     LCM0 bumps are shared between sets with the same ``lcm0_key(lcm0_lambda)``
     (the first set owns the bump name). With ``lcm0_lambda`` every LCM0 uses
     LambdaPricing = LambdaAtm = lcm0_lambda, so all sets with the same ρ0 share
-    ONE LCM0 bump. Raises on duplicate set names."""
+    ONE LCM0 bump. Sets in ``mode="raw"`` get no LCM0 bump (``None``).
+    Raises on duplicate set names."""
     seen_names = set()
     lcm0_owner: Dict[Tuple, str] = {}
     out = []
@@ -166,8 +186,10 @@ def lcm_bump_layout(lcm_sets: Sequence[LcmParamSet],
         if s.name in seen_names:
             raise ValueError(f"duplicate LcmParamSet name {s.name!r}")
         seen_names.add(s.name)
-        key = s.lcm0_key(lcm0_lambda)
-        lcm0 = lcm0_owner.setdefault(key, s.bump_lcm0)
+        if s.uses_lcm0:
+            lcm0 = lcm0_owner.setdefault(s.lcm0_key(lcm0_lambda), s.bump_lcm0)
+        else:
+            lcm0 = None
         out.append((s, s.bump_lcm, lcm0))
     return out
 

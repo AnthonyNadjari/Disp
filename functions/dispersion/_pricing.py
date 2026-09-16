@@ -1621,9 +1621,10 @@ class LcmLegResult:
     FairValues (decimals), strikes are vol decimals. ``impact`` = EV_LCM − EV_LCM0."""
     set_name: str
     bump_lcm: str
-    bump_lcm0: str
+    bump_lcm0: Optional[str]                            # None for a "raw" set (no LCM0 priced)
+    mode: str = "adjusted"                              # "adjusted" (vs LCM0) | "raw" (sqrt(-EV_LCM/RA))
     properties: dict = field(default_factory=dict)      # effective LCM mutator properties sent
-    properties0: dict = field(default_factory=dict)     # effective LCM0 mutator properties sent
+    properties0: dict = field(default_factory=dict)     # effective LCM0 mutator properties sent ({} when raw)
     # solve mode
     ev_cross: Optional[float] = None
     ev_cross0: Optional[float] = None
@@ -1639,6 +1640,15 @@ class LcmLegResult:
     # price mode
     mid_lcm: Optional[float] = None
     mid_lcm0: Optional[float] = None
+
+    @property
+    def is_raw(self) -> bool:
+        return self.mode == "raw"
+
+    @property
+    def strike_label(self) -> str:
+        """Column label stem: ``LCM`` (adjusted vs LCM0) or ``LCM Raw``."""
+        return "LCM Raw" if self.is_raw else "LCM"
 
     @property
     def impact(self) -> Optional[float]:
@@ -2677,11 +2687,12 @@ class PricingEngine(VolSwapMixin):
                     mid_va_lsv0 = _extract(idx, "FairValue", "LSV0")
                     mid_va_lsv = _extract(idx, "FairValue", "LSV")
                     lcm_legs = {
-                        s.name: LcmLegResult(set_name=s.name, bump_lcm=b, bump_lcm0=b0,
+                        s.name: LcmLegResult(set_name=s.name, bump_lcm=b, bump_lcm0=b0, mode=s.mode,
                                              properties=s.to_properties(),
-                                             properties0=lcm0_properties(s.to_properties(), _lcm0_lambda_for(cfg)),
+                                             properties0=(lcm0_properties(s.to_properties(), _lcm0_lambda_for(cfg))
+                                                          if b0 else {}),
                                              mid_lcm=_extract(idx, "FairValue", b),
-                                             mid_lcm0=_extract(idx, "FairValue", b0))
+                                             mid_lcm0=_extract(idx, "FairValue", b0) if b0 else None)
                         for s, b, b0 in lcm_layout
                     }
                     mid_va = mid_va_lv  # backward compat: mid = LV value
@@ -4022,7 +4033,8 @@ class PricingEngine(VolSwapMixin):
 
                 # Extract LCM / LCM0 bumps per parameter set (EV-cross only)
                 ev_lcm_by_set = {s.name: [_get_bump_fv(i, b) for i in range(n_ev)] for s, b, _ in lcm_layout}
-                ev_lcm0_by_set = {s.name: [_get_bump_fv(i, b0) for i in range(n_ev)] for s, _, b0 in lcm_layout}
+                ev_lcm0_by_set = {s.name: ([_get_bump_fv(i, b0) for i in range(n_ev)] if b0 else [None] * n_ev)
+                                  for s, _, b0 in lcm_layout}     # raw sets: no LCM0 bump
 
                 # ── LCM extraction (first ticker only) ──
                 # Vols and correlation from LV bump
@@ -4211,14 +4223,17 @@ class PricingEngine(VolSwapMixin):
                 #   strike_raw = sqrt(-EV_LCM / RA)                        (no control, kept for reference)
                 lcm_legs: Dict[str, LcmLegResult] = {}
                 for _s, _b, _b0 in lcm_layout:
-                    _leg = LcmLegResult(set_name=_s.name, bump_lcm=_b, bump_lcm0=_b0,
+                    _leg = LcmLegResult(set_name=_s.name, bump_lcm=_b, bump_lcm0=_b0, mode=_s.mode,
                                         properties=_s.to_properties(),
-                                        properties0=lcm0_properties(_s.to_properties(), _lcm0_lambda_for(cfg)),
+                                        properties0=(lcm0_properties(_s.to_properties(), _lcm0_lambda_for(cfg))
+                                                     if _b0 else {}),
                                         ev_cross=ev_lcm_by_set.get(_s.name, [None] * n_ev)[idx],
                                         ev_cross0=ev_lcm0_by_set.get(_s.name, [None] * n_ev)[idx])
                     if _leg.ev_cross is not None and ra_val is not None and ra_val != 0:
                         _leg.strike_raw = math.sqrt(abs(-_leg.ev_cross / ra_val))
-                        if _leg.ev_cross0 is not None:
+                        if _leg.is_raw:
+                            _leg.strike = _leg.strike_raw           # the set priced on its own
+                        elif _leg.ev_cross0 is not None:
                             _leg.strike = math.sqrt(abs(-(ev_val + (_leg.ev_cross - _leg.ev_cross0)) / ra_val))
                         else:
                             dbg.warn("batch", f"{ticker}: bump {_b0} missing - LCM strike [{_s.name}] left empty, raw kept")
@@ -4741,14 +4756,22 @@ class PricingEngine(VolSwapMixin):
                             continue
                         ev_cap_lv = _get_cap_fv(inst_idx, "LV")
                         ev_cap_lcm = _get_cap_fv(inst_idx, _leg.bump_lcm)
-                        ev_cap_lcm0 = _get_cap_fv(inst_idx, _leg.bump_lcm0)
+                        ev_cap_lcm0 = _get_cap_fv(inst_idx, _leg.bump_lcm0) if _leg.bump_lcm0 else None
                         dbg.info("CAP-LCM-DEBUG",
                                  f"{ticker} [{_leg.set_name}]: inst_idx={inst_idx}, ev_cap_lv={ev_cap_lv}, "
                                  f"ev_cap_lcm0={ev_cap_lcm0}, ev_cap_lcm={ev_cap_lcm}")
                         if ev_cap_lcm is not None:
                             _leg.ev_cap_cross = ev_cap_lcm
                             _leg.strike_cap_priced_raw = math.sqrt(abs(-ev_cap_lcm / ra_val))
-                        if ev_cap_lv is not None and ev_cap_lcm is not None and ev_cap_lcm0 is not None:
+                        if _leg.is_raw and ev_cap_lcm is not None:
+                            # raw set: the capped strike IS the raw one; no LCM0 to difference against
+                            real_cap_strike = _leg.strike_cap_priced_raw
+                            _leg.strike_cap_priced = real_cap_strike
+                            _cap_str_serial_jobs.append((_leg, 'fpf_string_cap',
+                                                          _build_capped_fpf_obj(ref_obj, ticker, corr, real_cap_strike),
+                                                          result_obj))
+                            dbg.ok("CAP-PRICED", f"{ticker} [{_leg.set_name}]: LCM capped strike (raw) = {real_cap_strike * 100:.2f}%")
+                        elif ev_cap_lv is not None and ev_cap_lcm is not None and ev_cap_lcm0 is not None:
                             real_cap_strike = math.sqrt(abs(-(ev_cap_lv + (ev_cap_lcm - ev_cap_lcm0)) / ra_val))
                             _leg.strike_cap_priced = real_cap_strike
                             _leg.ev_cap_cross0 = ev_cap_lcm0
@@ -5135,9 +5158,9 @@ class PricingEngine(VolSwapMixin):
                         f'Strike Cross Corr LV{_uncap_label} (%)'] = f"{r.strike_variance_asset * 100:.2f}%" if r.strike_variance_asset else 'FAILED'
                     if r.strike_cross_lsv is not None:
                         row[f'Strike Cross Corr LSV{_uncap_label} (%)'] = f"{r.strike_cross_lsv * 100:.2f}%"
-                    for _leg in r.lcm.values():      # LV, LSV, LCM [set]… — same block as before
+                    for _leg in r.lcm.values():      # LV, LSV, LCM [set]… — "LCM Raw [set]" for a raw-mode set
                         if _leg.strike is not None:
-                            row[f'Strike Cross Corr LCM{_uncap_label}{lcm_column_suffix(_leg.set_name)} (%)'] = \
+                            row[f'Strike Cross Corr {_leg.strike_label}{_uncap_label}{lcm_column_suffix(_leg.set_name)} (%)'] = \
                                 f"{_leg.strike * 100:.2f}%"
                     if _is_capped:
                         if r.cap_impact_bp is not None and r.cap_impact_bp > 0:
@@ -5150,7 +5173,7 @@ class PricingEngine(VolSwapMixin):
                             row['Strike Cross Corr Cap Priced LSV (%)'] = f"{r.strike_cap_priced_lsv * 100:.2f}%"
                         for _leg in r.lcm.values():  # Cap Priced LV, LSV, LCM [set]… (highlighted rows)
                             if _leg.strike_cap_priced is not None:
-                                row[f'Strike Cross Corr Cap Priced LCM{lcm_column_suffix(_leg.set_name)} (%)'] = \
+                                row[f'Strike Cross Corr Cap Priced {_leg.strike_label}{lcm_column_suffix(_leg.set_name)} (%)'] = \
                                     f"{_leg.strike_cap_priced * 100:.2f}%"
                     # ── LCM: one grouped block per parameter set (EV, impact, params) ──
                     for _leg in r.lcm.values():

@@ -206,6 +206,32 @@ def test_results_df_missing_lcm0_leaves_strike_empty_keeps_raw(pricing):
     assert "LCM Impact Cross [A] (%)" not in df.columns
 
 
+def test_results_df_raw_mode_set(pricing):
+    """Set A adjusted (vs LCM0), set B raw: A → 'LCM [A]', B → 'LCM Raw [B]', no LCM0 columns for B."""
+    cfg = _cfg(pricing, is_capped=True, lcm_sets=[{"name": "A"}, {"name": "B", "mode": "raw"}])
+    a, b = pricing._resolve_lcm_sets_for(cfg)
+    lay = pricing._lcm_layout_for(cfg, [a, b])
+    assert lay[1][2] is None                                   # raw set: no LCM0 bump
+    tr = pricing.TickerResult(ticker="X.PA", corridor_asset=".STOXX50E", success=True, currency="EUR",
+                              strike_variance_asset=0.20, strike_corridor_asset=0.22,
+                              strike_cap_priced_lv=0.195, strike_cap_priced_mono=0.215)
+    tr.lcm["A"] = _leg(pricing, a, ev_cross=-0.031, ev_cross0=-0.0305, strike=0.201, strike_raw=0.19,
+                       strike_cap_priced=0.198, strike_cap_priced_raw=0.187)
+    tr.lcm["B"] = pricing.LcmLegResult(set_name="B", bump_lcm="LCM_B", bump_lcm0=None, mode="raw",
+                                       properties=b.to_properties(), ev_cross=-0.033,
+                                       strike=0.19, strike_raw=0.19, strike_cap_priced=0.187, strike_cap_priced_raw=0.187)
+    df = pricing.PricingEngine(cfg)._build_results_df([tr])
+    cols = list(df.columns)
+    assert "Strike Cross Corr LCM [A] (%)" in cols and "Strike Cross Corr LCM Raw [B] (%)" in cols
+    assert "Strike Cross Corr Cap Priced LCM [A] (%)" in cols and "Strike Cross Corr Cap Priced LCM Raw [B] (%)" in cols
+    assert "EV Cross LCM0 [A] (%)" in cols and "EV Cross LCM0 [B] (%)" not in cols
+    assert "LCM Impact Cross [B] (%)" not in cols
+    assert "LCM0" not in df["LCM Params [B]"].iloc[0]          # no LCM0 part for a raw set
+    i = cols.index
+    assert i("Strike Cross Corr Cap Priced LV (%)") < i("Strike Cross Corr Cap Priced LCM [A] (%)") \
+        < i("Strike Cross Corr Cap Priced LCM Raw [B] (%)") < i("Strike Mono Corr LV (%)")
+
+
 def test_params_label(pricing):
     p = {"LambdaPricing": 0.55, "LambdaAtm": [0.3], "LambdaFromRho0": 0.1, "CallSkew": [-0.5], "PutSkew": [-0.9]}
     assert pricing._lcm_params_label(p) == "lamP=0.55 lamATM=0.3 rho0=0.1 CS=-0.5 PS=-0.9"
