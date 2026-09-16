@@ -112,13 +112,16 @@ def test_results_df_cross_capped_two_sets(pricing):
     assert "lamP=0.55" in row["LCM Params [B]"] and "lamATM=0.4" in row["LCM Params [B]"]
     assert "lamP=0.4 " in row["LCM Params [A]"]
     assert row["FPF Cross LCM Cap [B]"] == "FPFCAP-B"
-    # columns grouped per set: every [A] metric column precedes the first [B] one,
-    # and the block sits right after the LSV cap strike, before the mono strikes
     cols = list(df.columns)
-    a_cols = [c for c in cols if "[A]" in c and not c.startswith("FPF")]
-    b_cols = [c for c in cols if "[B]" in c and not c.startswith("FPF")]
-    assert max(cols.index(c) for c in a_cols) < min(cols.index(c) for c in b_cols)
-    assert cols.index("Strike Cross Corr LCM [A] (%)") < cols.index("Strike Mono Corr LV (%)")
+    # strike block keeps the LV / LSV / LCM [A] / LCM [B] order …
+    i = cols.index
+    assert i("Strike Cross Corr LV (%)") < i("Strike Cross Corr LCM [A] (%)") < i("Strike Cross Corr LCM [B] (%)") \
+        < i("Strike Cross Corr Cap Priced LV (%)") < i("Strike Cross Corr Cap Priced LCM [A] (%)") \
+        < i("Strike Cross Corr Cap Priced LCM [B] (%)") < i("Strike Mono Corr LV (%)")
+    # … and the non-strike columns are grouped per set (all [A] before any [B])
+    a_cols = [c for c in cols if "[A]" in c and "Strike" not in c and not c.startswith("FPF")]
+    b_cols = [c for c in cols if "[B]" in c and "Strike" not in c and not c.startswith("FPF")]
+    assert max(i(c) for c in a_cols) < min(i(c) for c in b_cols)
 
 
 def test_results_df_uncapped_suffix_after_label(pricing):

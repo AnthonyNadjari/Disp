@@ -502,17 +502,16 @@ def _lcm_params_label(props: dict, props0: Optional[dict] = None) -> str:
 
 
 def _lcm_row_fields(leg: "LcmLegResult", is_capped: bool, uncap_label: str) -> Dict[str, str]:
-    """Result-table columns of ONE LCM set, grouped together (strike, EV, impact,
-    capped, price-mode FV, params). Suffix ``[name]`` sits after the
-    ``(Uncapped)`` label like the LV/LSV columns' own labels. FPF strings are
-    emitted separately with the other FPF columns."""
+    """Result-table columns of ONE LCM set, grouped together (EV, impact,
+    capped EVs, price-mode FV, params). The two STRIKE columns are NOT here:
+    they are emitted next to their LV / LSV siblings (uncapped strike after
+    ``Strike Cross Corr LSV``, cap-priced after ``Cap Priced LSV``) so the
+    strike block keeps its LV / LSV / LCM order and the LCM cap-priced rows
+    are highlighted like the others. Suffix ``[name]`` sits after the
+    ``(Uncapped)`` label. FPF strings go with the other FPF columns."""
     sfx = lcm_column_suffix(leg.set_name)
     pct = lambda v: f"{v * 100:.2f}%"
     out: Dict[str, str] = {}
-    if leg.strike is not None:
-        out[f'Strike Cross Corr LCM{uncap_label}{sfx} (%)'] = pct(leg.strike)
-    if is_capped and leg.strike_cap_priced is not None:
-        out[f'Strike Cross Corr Cap Priced LCM{sfx} (%)'] = pct(leg.strike_cap_priced)
     if leg.ev_cross is not None:
         out[f'EV Cross LCM{sfx} (%)'] = pct(leg.ev_cross)
     if leg.ev_cross0 is not None:
@@ -5132,6 +5131,10 @@ class PricingEngine(VolSwapMixin):
                         f'Strike Cross Corr LV{_uncap_label} (%)'] = f"{r.strike_variance_asset * 100:.2f}%" if r.strike_variance_asset else 'FAILED'
                     if r.strike_cross_lsv is not None:
                         row[f'Strike Cross Corr LSV{_uncap_label} (%)'] = f"{r.strike_cross_lsv * 100:.2f}%"
+                    for _leg in r.lcm.values():      # LV, LSV, LCM [set]… — same block as before
+                        if _leg.strike is not None:
+                            row[f'Strike Cross Corr LCM{_uncap_label}{lcm_column_suffix(_leg.set_name)} (%)'] = \
+                                f"{_leg.strike * 100:.2f}%"
                     if _is_capped:
                         if r.cap_impact_bp is not None and r.cap_impact_bp > 0:
                             row['Cap Theoretical Impact (bp)'] = f"{r.cap_impact_bp:.2f}"
@@ -5141,7 +5144,11 @@ class PricingEngine(VolSwapMixin):
                             row['Strike Cross Corr Cap Priced LV (%)'] = f"{r.strike_cap_priced_lv * 100:.2f}%"
                         if r.strike_cap_priced_lsv is not None:
                             row['Strike Cross Corr Cap Priced LSV (%)'] = f"{r.strike_cap_priced_lsv * 100:.2f}%"
-                    # ── LCM: one grouped block per parameter set ──
+                        for _leg in r.lcm.values():  # Cap Priced LV, LSV, LCM [set]… (highlighted rows)
+                            if _leg.strike_cap_priced is not None:
+                                row[f'Strike Cross Corr Cap Priced LCM{lcm_column_suffix(_leg.set_name)} (%)'] = \
+                                    f"{_leg.strike_cap_priced * 100:.2f}%"
+                    # ── LCM: one grouped block per parameter set (EV, impact, params) ──
                     for _leg in r.lcm.values():
                         row.update(_lcm_row_fields(_leg, _is_capped, _uncap_label))
                     # ── Mono Corridor Strikes ──

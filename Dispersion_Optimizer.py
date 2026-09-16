@@ -3215,8 +3215,9 @@ with tab4:
             # Ensure all values are strings to avoid Arrow serialization errors (mixed int/str/None)
             _df_t = _df_t.fillna('').astype(str)
 
-            # LCM strike rows carry a "[set]" suffix → match by prefix
-            _highlight_prefixes = ('Strike Cross Corr Cap Priced LCM', 'Strike Cross Corr LCM')
+            # LCM cap-priced rows carry a "[set]" suffix → match by prefix (same
+            # colour as the LV / LSV cap-priced rows above)
+            _highlight_prefixes = ('Strike Cross Corr Cap Priced LCM',)
 
             def _highlight_key_rows(row):
                 if row.name in _highlight_rows or str(row.name).startswith(_highlight_prefixes):
