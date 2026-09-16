@@ -108,7 +108,8 @@ def test_results_df_cross_capped_two_sets(pricing):
                 "FPF Cross LCM Uncapped [A]", "FPF Cross LCM Cap [B]"]:
         assert col in df.columns, col
     row = df.iloc[0]
-    assert row["LCM Impact Cross [A] (%)"] == "-0.05%"
+    assert row["LCM Impact Cross [A] (%)"] == "-0.0500%"        # EVs / impacts: 4 decimals
+    assert row["EV Cross LCM0 [A] (%)"] == "-3.0500%"
     assert row["Strike Cross Corr LCM [A] (%)"] == "20.10%"
     assert "lamP=0.55" in row["LCM Params [B]"] and "lamATM=0.4" in row["LCM Params [B]"]
     assert "lamP=0.4 " in row["LCM Params [A]"]
@@ -186,8 +187,8 @@ def test_results_df_price_mode_impact_vs_lcm0(pricing):
     tr.lcm["A"] = _leg(pricing, s, mid_lcm=0.012, mid_lcm0=0.011)
     tr.sync_legacy_lcm()
     df = pricing.PricingEngine(cfg)._build_results_df([tr])
-    assert df["FV Variance Asset LCM0 [A] (%)"].iloc[0] == "1.10%"
-    assert df["LCM Impact Variance Asset [A] (%)"].iloc[0] == "0.10%"
+    assert df["FV Variance Asset LCM0 [A] (%)"].iloc[0] == "1.1000%"
+    assert df["LCM Impact Variance Asset [A] (%)"].iloc[0] == "0.1000%"
     assert "LCM Params [A]" in df.columns
     assert tr.lcm["A"].mid_lcm == 0.012
 
