@@ -1682,7 +1682,9 @@ class TickerResult:
     atms_vol_variance_asset: Optional[float] = None
     atms_vol_corridor_asset: Optional[float] = None
     vol_spread: Optional[float] = None
-    ev_cross_lsv: Optional[Union[float, str]] = None
+    ev_cross_lsv: Optional[Union[float, str]] = None   # EV_LV + (EV_LSV − EV_LSV0), cross leg (%)
+    ev_cross_lsv_raw: Optional[float] = None           # raw EV under the LSV bump, cross leg (%)
+    ev_cross_lsv0: Optional[float] = None              # raw EV under the LSV0 bump, cross leg (%)
     ev_mono_lsv_adjusted: Optional[float] = None  # EV_mono_LV + LSV_impact (raw, for debug)
     strike_lsv: Optional[float] = None  # mono LSV strike
     strike_cross_lsv: Optional[float] = None  # cross LSV strike
@@ -4406,6 +4408,8 @@ class PricingEngine(VolSwapMixin):
                     # a different instrument — see ev_mono_lsv_adjusted below).
                     ev_cross_lsv=(ev_val + (_ev_cross_lsv - _ev_cross_lsv0)) * 100 if (
                                 _ev_cross_lsv is not None and _ev_cross_lsv0 is not None and ev_val is not None) else None,
+                    ev_cross_lsv_raw=_ev_cross_lsv * 100 if _ev_cross_lsv is not None else None,
+                    ev_cross_lsv0=_ev_cross_lsv0 * 100 if _ev_cross_lsv0 is not None else None,
                     lcm=lcm_legs,
                     ev_mono_lsv_adjusted=_mono_lsv_adjusted_ev * 100 if _mono_lsv_adjusted_ev is not None else None,
                     ev_mono_lsv=ev_mono_lsv_values[m_idx] * 100 if (
@@ -5182,6 +5186,10 @@ class PricingEngine(VolSwapMixin):
                         row['EV Cross LV (%)'] = f"{r.ev_cross:.4f}%"
                     if r.ev_cross_lsv is not None:
                         row['EV Cross LSV Adjusted (%)'] = f"{r.ev_cross_lsv:.4f}%"
+                    if r.ev_cross_lsv0 is not None:
+                        row['EV Cross LSV0 (%)'] = f"{r.ev_cross_lsv0:.4f}%"
+                    if r.ev_cross_lsv_raw is not None:
+                        row['EV Cross LSV (%)'] = f"{r.ev_cross_lsv_raw:.4f}%"
 
                     if r.range_accrual is not None:
                         # Mono and cross legs share the corridor asset → one RA column
@@ -5203,13 +5211,13 @@ class PricingEngine(VolSwapMixin):
                     if r.ev_cap_cross_lsv0 is not None:
                         row['EV Cap Cross LSV0 (%)'] = f"{r.ev_cap_cross_lsv0 * 100:.4f}%"
                     if r.ev_cap_cross_lsv is not None:
-                        row['EV Cap Cross LSV Adjusted (%)'] = f"{r.ev_cap_cross_lsv * 100:.4f}%"
+                        row['EV Cap Cross LSV (%)'] = f"{r.ev_cap_cross_lsv * 100:.4f}%"   # raw EV under LSV (capped)
                     if r.ev_cap_mono_lv is not None:
                         row['EV Cap Mono LV (%)'] = f"{r.ev_cap_mono_lv * 100:.4f}%"
                     if r.ev_cap_mono_lsv0 is not None:
                         row['EV Cap Mono LSV0 (%)'] = f"{r.ev_cap_mono_lsv0 * 100:.4f}%"
                     if r.ev_cap_mono_lsv is not None:
-                        row['EV Cap Mono LSV Adjusted (%)'] = f"{r.ev_cap_mono_lsv * 100:.4f}%"
+                        row['EV Cap Mono LSV (%)'] = f"{r.ev_cap_mono_lsv * 100:.4f}%"   # raw EV under LSV (capped)
                     # ── Obs dates / Vols / Correlation ──
                     if r.obs_dates_cross is not None:
                         row['Obs Dates Cross'] = r.obs_dates_cross
@@ -5310,6 +5318,10 @@ class PricingEngine(VolSwapMixin):
                             row['Strike Cap Priced LCM (%)'] = f"{r.strike_cap_priced_lcm * 100:.2f}%"
                         if r.ev_cap_cross_lv is not None:
                             row['EV Cap LV (%)'] = f"{r.ev_cap_cross_lv * 100:.4f}%"
+                        if r.ev_cap_cross_lsv0 is not None:
+                            row['EV Cap LSV0 (%)'] = f"{r.ev_cap_cross_lsv0 * 100:.4f}%"
+                        if r.ev_cap_cross_lsv is not None:
+                            row['EV Cap LSV (%)'] = f"{r.ev_cap_cross_lsv * 100:.4f}%"
                         if r.cap_impact_bp is not None and r.cap_impact_bp > 0:
                             row['Cap Theoretical Impact (bp)'] = f"{r.cap_impact_bp:.2f}"
                     # ── EV (mono corridor) — was missing in mono mode ──
