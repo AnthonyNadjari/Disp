@@ -215,8 +215,23 @@ class _FpfTemplateEngine:
 
     _VA, _CA, _KO = "__TPLVA__", "__TPLCA__", "__TPLKO__"
     _S, _C = 0.123456789, 0.987654321          # numeric sentinels (never rounded away by %g-style formats)
+
+    @staticmethod
+    def _fpf_repr(v: float) -> str:
+        """``repr`` in the FPF serializer's style: scientific notation is written
+        ``1.0e-6`` (mantissa with a decimal point, exponent without zero padding)
+        where Python writes ``1e-06`` — the strike 0.000001 of the mono / EV
+        references hit exactly that and disabled templating for the whole run."""
+        s = repr(float(v))
+        if "e" in s:
+            mant, exp = s.split("e")
+            if "." not in mant:
+                mant += ".0"
+            return f"{mant}e{int(exp)}"
+        return s
+
     _FMTS = (
-        ("repr", repr),
+        ("repr", _fpf_repr.__func__),
         ("%.17g", lambda v: "%.17g" % v), ("%.15g", lambda v: "%.15g" % v),
         ("%.12g", lambda v: "%.12g" % v), ("%.10g", lambda v: "%.10g" % v),
         ("%.9f", lambda v: "%.9f" % v), ("%.8f", lambda v: "%.8f" % v),
