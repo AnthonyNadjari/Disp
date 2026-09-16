@@ -1070,6 +1070,7 @@ class CrossCorridorVarianceSwap:
         self.eqeq_lambda = eqeq_lambda
         self.correl_floor = correl_floor
         self.eqfx_shift = eqfx_shift
+        self.individual_correlation = individual_correlation   # read by solve_strike / price_* (was never set)
         # ATMF vol storage (populated by solve_strike or compute_atmf_volspread)
         self.ref_atmf_vol = None
         self.linked_atmf_vol = None
@@ -2822,6 +2823,16 @@ class PricingEngine(VolSwapMixin):
         ref_corr_asset = corr_assets[0]
         ref_currency = currencies[0]
 
+        # Currency per corridor asset: the mono EV instrument and the RA (ZCB)
+        # are computed ONCE per corridor asset, so every leg on that corridor
+        # must share a currency. First seen wins; a mismatch is reported.
+        _corr_ccy: Dict[str, str] = {}
+        for _i, _c in enumerate(corr_assets):
+            _prev = _corr_ccy.setdefault(_c, currencies[_i])
+            if _prev != currencies[_i]:
+                dbg.warn("batch", f"corridor asset {_c}: legs in {_prev} and {currencies[_i]} "
+                                  f"({tickers[_i]}) - mono EV / RA priced in {_prev}")
+
         # DEBUG: Log schedule asset configuration
         for idx, (t, c, s) in enumerate(zip(tickers, corr_assets, schedule_assets)):
             is_cross = t != c
@@ -3069,19 +3080,15 @@ class PricingEngine(VolSwapMixin):
             t_clone = time.time()
             ev_cross_fpfs = {}
             ev_mono_fpfs = {}
-            ev_mono_lsv_fpfs = {}
-            ev_mono_lsv_zero_fpfs = {}
             _clone_tasks = []  # (type, key, ref_obj, ticker, corr_asset)
             for i, ticker in enumerate(tickers):
                 sched_asset = schedule_assets[i]
                 ev_cross_ref_obj = ev_cross_ref_objs[schedule_assets[i]]
                 _clone_tasks.append(('ev', i, ev_cross_ref_obj, ticker, corr_assets[i]))
-            for corr, (ev_obj, ra_obj, ev_lsv_obj, ev_lsv_zero_obj) in mono_ref_objs.items():
+            for corr, (ev_obj, _ra_obj, _ev_lsv_obj, _ev_lsv_zero_obj) in mono_ref_objs.items():
+                # LSV / LSV0 mono values are read from the scenario bumps of the
+                # plain mono EV instrument — no separate LSV mono FPFs are sent.
                 _clone_tasks.append(('ev_mono', corr, ev_obj, None, None))
-                if ev_lsv_obj is not None:
-                    _clone_tasks.append(('ev_mono_lsv', corr, ev_lsv_obj, None, None))
-                if ev_lsv_zero_obj is not None:
-                    _clone_tasks.append(('ev_mono_lsv_zero', corr, ev_lsv_zero_obj, None, None))
 
             def _do_clone(task):
                 kind, key, obj, ticker, corr = task
@@ -3097,10 +3104,6 @@ class PricingEngine(VolSwapMixin):
                         ev_cross_fpfs[key] = fpf_str
                     elif kind == 'ev_mono':
                         ev_mono_fpfs[key] = fpf_str
-                    elif kind == 'ev_mono_lsv':
-                        ev_mono_lsv_fpfs[key] = fpf_str
-                    elif kind == 'ev_mono_lsv_zero':
-                        ev_mono_lsv_zero_fpfs[key] = fpf_str
 
             dbg.info("batch",
                      f"[TIMING] Clone+serialize: {time.time() - t_clone:.2f}s ({len(_clone_tasks)} FPFs, "
@@ -3172,41 +3175,30 @@ class PricingEngine(VolSwapMixin):
         dbg.info("batch", f"[TIMING] Underlyings loaded: {time.time() - t_ul:.3f}s ({len(all_rics)} RICs)")
         self._batch_timings['underlyings'] = time.time() - t_ul
 
-        def _make_instrument(fpf_string, rics_needed):
-            """Create a portal instrument from FPF string."""
+        def _make_instrument(fpf_string, rics_needed, ccy=None):
+            """Create a portal instrument from FPF string, priced in ``ccy``
+            (the leg's own currency — was the first ticker's for the whole batch)."""
             ul = [underlyings_map[r] for r in set(rics_needed)]
             return pricing_portal.create_fpf(
-                fpf_string=fpf_string, instrument_ccy=ref_currency,
+                fpf_string=fpf_string, instrument_ccy=ccy or ref_currency,
                 underlyings=ul, premium_date=datetime.datetime.now().date(),
             )
 
-        # Build instrument list: [EV_cross_0..N-1, EV_mono_0..M-1, RA_0..M-1, EV_mono_lsv_0..M-1, EV_mono_lsv_zero_0..M-1]
-        # RA is computed once per unique corridor asset and reused for both cross and mono strikes
+        # Build instrument list: [EV_cross_0..N-1, EV_mono_0..M-1]
+        # RA comes from the PayoutTrace metric on the mono EV instruments (no RA
+        # instruments). LSV / LSV0 / LCM values of every instrument come from the
+        # scenario bumps of the same call — no dedicated LSV instruments.
         t_instr = time.time()
         instruments = []
         # Cross EV instruments (1 per ticker)
         for i, ticker in enumerate(tickers):
-            instruments.append(_make_instrument(ev_cross_fpfs[i], [ticker, corr_assets[i]]))
+            instruments.append(_make_instrument(ev_cross_fpfs[i], [ticker, corr_assets[i]], currencies[i]))
         n_ev = len(tickers)
         # Mono EV instruments (1 per unique corridor asset)
         mono_corr_order = unique_corr_assets
         for corr in mono_corr_order:
-            instruments.append(_make_instrument(ev_mono_fpfs[corr], [corr]))
+            instruments.append(_make_instrument(ev_mono_fpfs[corr], [corr], _corr_ccy.get(corr)))
         n_ev_mono = len(mono_corr_order)
-        # No dedicated RA instruments: RA comes from the PayoutTrace metric.
-        # LSV versions for mono EV (if enabled)
-        n_ev_mono_lsv = 0
-        n_ev_mono_lsv_zero = 0
-        if use_lsv_mono_ev:
-            for corr in mono_corr_order:
-                if corr in ev_mono_lsv_fpfs:
-                    instruments.append(_make_instrument(ev_mono_lsv_fpfs[corr], [corr]))
-                    n_ev_mono_lsv += 1
-            for corr in mono_corr_order:
-                if corr in ev_mono_lsv_zero_fpfs:
-                    instruments.append(_make_instrument(ev_mono_lsv_zero_fpfs[corr], [corr]))
-                    n_ev_mono_lsv_zero += 1
-        # Build corridor asset → RA index mapping for cross strike lookup
         dbg.info("batch", f"[TIMING] Instruments created: {time.time() - t_instr:.3f}s ({len(instruments)} total)")
         self._batch_timings['instruments'] = time.time() - t_instr
 
@@ -3214,9 +3206,8 @@ class PricingEngine(VolSwapMixin):
         _has_scenario = (lsv_scenario is not None) or (
                     cfg.lcm_params is not None and cfg.lcm_params.get('enabled', False))
         _scenario_label = " | Scenario=enabled" if _has_scenario else ""
-        _lsv_label = f" | LSV_mono×{n_ev_mono_lsv}" if n_ev_mono_lsv > 0 else ""
         _safe_print(f"\n[BATCH] Model={_model} | Tickers={len(tickers)} | Instruments={len(instruments)} "
-                    f"(EV_cross×{n_ev}, EV_linked×{n_ev_mono}{_lsv_label}) | Corr assets={len(unique_corr_assets)}{_scenario_label}")
+                    f"(EV_cross×{n_ev}, EV_linked×{n_ev_mono}) | Corr assets={len(unique_corr_assets)}{_scenario_label}")
 
         t_http = time.time()
 
@@ -3398,7 +3389,7 @@ class PricingEngine(VolSwapMixin):
                 # Build instruments for this group
                 group_instruments = []
                 for i in ticker_indices:
-                    group_instruments.append(_make_instrument(ev_cross_fpfs[i], [tickers[i], corr_assets[i]]))
+                    group_instruments.append(_make_instrument(ev_cross_fpfs[i], [tickers[i], corr_assets[i]], currencies[i]))
 
                 # Create scenario for this correlation level
                 group_scenario = None
@@ -3426,7 +3417,7 @@ class PricingEngine(VolSwapMixin):
             # Mono instruments: price without per-ticker correlation (they use the corridor asset itself)
             mono_instruments = []
             for corr in mono_corr_order:
-                mono_instruments.append(_make_instrument(ev_mono_fpfs[corr], [corr]))
+                mono_instruments.append(_make_instrument(ev_mono_fpfs[corr], [corr], _corr_ccy.get(corr)))
 
             _mono_metrics = [
                 pricing_portal.create_metric("FairValue"),
@@ -3479,9 +3470,7 @@ class PricingEngine(VolSwapMixin):
                     running += cd["chunk_size"]
                 return None
 
-            _corr_ccy = {}
-            for _i, _c in enumerate(corr_assets):
-                _corr_ccy.setdefault(_c, currencies[_i])
+            # (_corr_ccy: currency per corridor asset, built once at the top)
             ra_values_by_corr = {}
             ra_zcb_by_corr = {}
             for _m_idx, _corr in enumerate(mono_corr_order):
@@ -3656,9 +3645,7 @@ class PricingEngine(VolSwapMixin):
             # barriers → E[n] is computed once per UNIQUE corridor asset (from
             # the mono EV instrument) and reused by the cross legs; n_total is
             # read from each FPF's own observation schedule.
-            _corr_ccy = {}
-            for _i, _c in enumerate(corr_assets):
-                _corr_ccy.setdefault(_c, currencies[_i])
+            # (_corr_ccy: currency per corridor asset, built once at the top)
             ra_values_by_corr = {}
             ra_zcb_by_corr = {}
             for _m_idx, _corr in enumerate(mono_corr_order):
@@ -4216,9 +4203,7 @@ class PricingEngine(VolSwapMixin):
                         mono_lsv_impact = ev_lsv_val - ev_lsv_zero_val
                         _base_ev = ev_mono_values[m_idx] if ev_mono_values[m_idx] is not None else ev_val
                         _mono_lsv_adjusted_ev = _base_ev + mono_lsv_impact
-                        _ra_for_lsv = ra_values_by_corr.get(corr_assets[idx]) if ra_values_by_corr.get(
-                            corr_assets[idx]) else ra_val
-                        strike_lsv_vol = math.sqrt(abs(-_mono_lsv_adjusted_ev / _ra_for_lsv))
+                        strike_lsv_vol = math.sqrt(abs(-_mono_lsv_adjusted_ev / ra_val))   # ra_val IS the corridor's RA
 
                 # LCM strikes, one per parameter set, same construction as the cross LSV strike:
                 #   strike     = sqrt(-(EV_LV + (EV_LCM - EV_LCM0)) / RA)   (skew impact vs LCM0)
@@ -4604,7 +4589,7 @@ class PricingEngine(VolSwapMixin):
                             dbg.warn("batch", f"capped instrument serialization failed for "
                                               f"{tickers[idx_v]} ({variant_v}): {err}")
                             continue
-                        cap_instruments.append(_make_instrument(capped_fpf_str, rics))
+                        cap_instruments.append(_make_instrument(capped_fpf_str, rics, currencies[idx_v]))
                         _cap_task_map_aligned.append((idx_v, variant_v))
                     cap_task_map = _cap_task_map_aligned
 
