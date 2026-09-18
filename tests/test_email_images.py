@@ -101,3 +101,20 @@ def test_canonical_basket_df_is_non_destructive():
     assert "Variance Asset" in out.columns and "Strike Mono Var Swap (%)" in out.columns
     assert list(VOLSWAP_BASKET.columns) == before            # caller's frame not mutated
     assert _canonical_basket_df(None) is None
+
+
+def test_volswap_table_headers_say_asset_and_strike_vol_swap():
+    html = _html_with(VOLSWAP_BASKET)
+    assert ">Asset<" in html and ">Strike Vol Swap (%)<" in html
+    assert ">Variance Asset<" not in html and ">Strike Mono Var Swap (%)<" not in html
+
+
+def test_var_swap_table_keeps_variance_headers():
+    from functions.dispersion._charts import _generate_email_html
+    idx = pd.bdate_range("2025-01-01", periods=60)
+    series = pd.Series(np.linspace(0, 2, 60), index=idx)
+    basket = pd.DataFrame([{"Variance Asset": "AAPL UW Equity",
+                            "Strike Mono Var Swap (%)": 20.0, "Weight (%)": 100.0}])
+    html = _generate_email_html({"has_short_leg": False}, series, basket, 60, False,
+                                "Var Swap", 2.5, 1.3, 0.7, "SPX Index", "No", carry_series=series)
+    assert ">Variance Asset<" in html and ">Strike Mono Var Swap (%)<" in html

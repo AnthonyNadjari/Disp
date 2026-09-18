@@ -1073,7 +1073,7 @@ def _generate_email_html(charts_data: Dict, result_series: Optional[pd.Series],
 
     # Tables
     returns_table = _create_returns_table(result_series, carry_series=carry_series)
-    underlyings_table = _create_underlyings_table(data_editor, n_exp)
+    underlyings_table = _create_underlyings_table(data_editor, n_exp, product_type)
 
     # Parameters
     matu = _convert_matu(n_exp)
@@ -1450,16 +1450,23 @@ def _create_returns_table(result_series: Optional[pd.Series], carry_series: Opti
         '</table>'
     )
 
-def _create_underlyings_table(data_editor: Optional[pd.DataFrame], n_exp: int) -> str:
+def _create_underlyings_table(data_editor: Optional[pd.DataFrame], n_exp: int,
+                              product_type: str = "") -> str:
     """
     Create underlyings table matching original format exactly:
     Proper columns, alternating row colors, centered numbers, left-aligned tickers.
+
+    Headers follow the product: a vol swap has no variance leg, so its columns
+    read "Asset" / "Strike Vol Swap (%)".
     """
     if data_editor is None or len(data_editor) == 0:
         return ""
     try:
         df = data_editor.copy()
         is_cross_corridor = 'Corridor Condition Asset' in df.columns
+        _is_vol_swap = str(product_type).strip().lower() == 'vol swap'
+        _asset_hdr = 'Asset' if _is_vol_swap else 'Variance Asset'
+        _strike_hdr = 'Strike Vol Swap (%)' if _is_vol_swap else 'Strike Mono Var Swap (%)'
 
         # Sort by decreasing absolute weight so heaviest positions appear first
         wt_col = 'Weight (%)' if 'Weight (%)' in df.columns else 'Weights'
@@ -1492,11 +1499,11 @@ def _create_underlyings_table(data_editor: Optional[pd.DataFrame], n_exp: int) -
                 </tr>"""
             return header + rows + "</table>"
         else:
-            header = """
+            header = f"""
             <table style="border-collapse: collapse; width: 70%; margin: 5px 0; font-size: 13px; border: 1px solid #ddd;">
                 <tr style="background-color: #00AEEF; color: white;">
-                    <th style="padding: 6px; text-align: center; font-size: 13px; border: 1px solid #ddd;">Variance Asset</th>
-                    <th style="padding: 6px; text-align: center; font-size: 13px; border: 1px solid #ddd;">Strike Mono Var Swap (%)</th>
+                    <th style="padding: 6px; text-align: center; font-size: 13px; border: 1px solid #ddd;">{_asset_hdr}</th>
+                    <th style="padding: 6px; text-align: center; font-size: 13px; border: 1px solid #ddd;">{_strike_hdr}</th>
                     <th style="padding: 6px; text-align: center; font-size: 13px; border: 1px solid #ddd;">Weight (%)</th>
                     <th style="padding: 6px; text-align: center; font-size: 13px; border: 1px solid #ddd;">N Exp</th>
                 </tr>"""
