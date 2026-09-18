@@ -438,7 +438,10 @@ class DispersionOptimizer:
         # empty candidate list: a short leg that failed to load / was excluded
         # used to flip the whole run to long-only and silently ignore
         # min_stocks_short. run() raises instead.
-        self._long_only = (self.c.max_stocks_short == 0)
+        # The one data-driven case that stays legitimate: shorts are OPTIONAL
+        # (min_stocks_short == 0) and none are available — nothing is violated.
+        self._long_only = (self.c.max_stocks_short == 0
+                           or (self.c.min_stocks_short == 0 and not self.short_candidates))
         # Rejection tracking
         self._rejection_reasons = {
             "fitness<=0": 0,
@@ -1962,7 +1965,7 @@ class DispersionOptimizer:
                     min(self.c.max_stocks_short, len(self.short_candidates))
                 )
                 short_indices = self._rng.sample(range(len(self.short_candidates)), n_short)
-                short_w = np.full(n_short, 1.0 / n_short)
+                short_w = np.full(n_short, 1.0 / n_short) if n_short else np.zeros(0)
 
             # Compute net P&L for this basket
             net_pnl = self._compute_net_pnl(long_indices, long_w, short_indices, short_w)

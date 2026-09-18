@@ -60,6 +60,17 @@ def test_fewer_short_candidates_than_min_raises():
         opt.run()
 
 
+def test_optional_shorts_with_no_candidates_runs_long_only():
+    """min_stocks_short = 0 (shorts optional) and no candidates: nothing is
+    violated, so the run proceeds long-only — and must not divide by zero when
+    drawing the reference sample."""
+    legs, pnl, col_map = _universe()
+    opt = _opt(legs, [], pnl, col_map, min_stocks_short=0, max_stocks_short=5)
+    assert opt._long_only
+    result = opt.run()
+    assert result.long_basket and not result.short_basket
+
+
 def test_explicit_long_only_still_runs():
     """max_stocks_short = 0 is the long-only intent — unchanged behaviour."""
     legs, pnl, col_map = _universe()
