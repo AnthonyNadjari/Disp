@@ -1322,9 +1322,17 @@ def _canonical_basket_df(data_editor):
 
 
 def _return_offer(data_editor) -> str:
-    """'Offer @ X%' of the email trade description: weight-averaged dispersion spread
-    (mono var-swap strike minus cross-corridor strike) in vol points.
-    Falls back to the average mono strike when there is no cross column."""
+    """'Offer @ X%' of the email trade description, in vol points.
+
+    Cross-corridor: each row already carries its own spread (mono var-swap
+    strike minus cross-corridor strike), so the offer is their weighted average.
+
+    Otherwise (vol swap / mono var swap): the basket holds BOTH legs, the short
+    leg being the row(s) with a negative weight. The offer is the dispersion
+    spread — weighted-average long strike MINUS weighted-average short strike —
+    not an average over |weight|, which would add the short strike in instead of
+    subtracting it. With no short row it degrades to the plain weighted average.
+    """
     if data_editor is None or len(data_editor) == 0:
         return "N/A"
     try:
@@ -1336,11 +1344,15 @@ def _return_offer(data_editor) -> str:
         if mono_col is None and cross_col is None:
             return "N/A"
 
-        def _wavg(values):
+        weights = (pd.to_numeric(df[weight_col], errors='coerce')
+                   if weight_col is not None else None)
+
+        def _wavg(values, w=None):
+            """Weighted mean over the rows where both the value and a strictly
+            positive weight are present; plain mean when there is no weight."""
             values = pd.to_numeric(values, errors='coerce')
-            if weight_col is None:
+            if w is None:
                 return values.dropna().mean()
-            w = pd.to_numeric(df[weight_col], errors='coerce').abs()
             mask = values.notna() & w.notna() & (w > 0)
             if mask.sum() == 0:
                 return float('nan')
@@ -1348,10 +1360,17 @@ def _return_offer(data_editor) -> str:
 
         if mono_col and cross_col:
             spread = pd.to_numeric(df[mono_col], errors='coerce') - pd.to_numeric(df[cross_col], errors='coerce')
-            v = _wavg(spread)
+            v = _wavg(spread, None if weights is None else weights.abs())
             if v == v:
                 return f"{v:.2f}"
-        v = _wavg(df[mono_col or cross_col])
+
+        strikes = df[mono_col or cross_col]
+        if weights is not None and (weights < 0).any():
+            long_avg = _wavg(strikes.where(weights > 0), weights)
+            short_avg = _wavg(strikes.where(weights < 0), -weights)
+            v = long_avg - short_avg
+        else:
+            v = _wavg(strikes, None if weights is None else weights.abs())
         return f"{v:.2f}" if v == v else "N/A"
     except Exception:
         return "N/A"

@@ -118,3 +118,44 @@ def test_var_swap_table_keeps_variance_headers():
     html = _generate_email_html({"has_short_leg": False}, series, basket, 60, False,
                                 "Var Swap", 2.5, 1.3, 0.7, "SPX Index", "No", carry_series=series)
     assert ">Variance Asset<" in html and ">Strike Mono Var Swap (%)<" in html
+
+
+# ── "Offer @ X%" — dispersion spread, not an |weight| average ────────────────
+# A vol-swap / mono basket holds BOTH legs, the short being the negative-weight
+# row. Averaging over |weight| added the short strike instead of subtracting it.
+
+def _offer(rows):
+    from functions.dispersion._charts import _return_offer, _canonical_basket_df
+    return _return_offer(_canonical_basket_df(pd.DataFrame(rows)))
+
+
+def test_offer_is_long_minus_short_for_a_volswap_dispersion():
+    assert _offer([
+        {"Underlying": "AAPL UW Equity", "Strike (%)": 22.5, "Weight (%)": 60.0},
+        {"Underlying": "MSFT UW Equity", "Strike (%)": 19.0, "Weight (%)": 40.0},
+        {"Underlying": "SPX Index", "Strike (%)": 15.0, "Weight (%)": -100.0},
+    ]) == "6.10"                                  # 21.10 long avg − 15.00 short
+
+
+def test_offer_handles_a_multi_name_short_leg():
+    assert _offer([
+        {"Underlying": "A", "Strike (%)": 30.0, "Weight (%)": 50.0},
+        {"Underlying": "B", "Strike (%)": 20.0, "Weight (%)": 50.0},
+        {"Underlying": "C", "Strike (%)": 18.0, "Weight (%)": -50.0},
+        {"Underlying": "D", "Strike (%)": 12.0, "Weight (%)": -50.0},
+    ]) == "10.00"                                 # 25.00 − 15.00
+
+
+def test_offer_long_only_basket_is_the_weighted_average():
+    assert _offer([
+        {"Underlying": "AAPL UW Equity", "Strike (%)": 22.5, "Weight (%)": 60.0},
+        {"Underlying": "MSFT UW Equity", "Strike (%)": 19.0, "Weight (%)": 40.0},
+    ]) == "21.10"
+
+
+def test_offer_cross_corridor_uses_the_per_row_spread():
+    from functions.dispersion._charts import _return_offer
+    assert _return_offer(pd.DataFrame([{
+        "Variance Asset": "A", "Corridor Condition Asset": ".SPX",
+        "Strike Mono Var Swap (%)": 25.0, "Strike Cross Corridor (%)": 20.0,
+        "Weight (%)": 100.0}])) == "5.00"
