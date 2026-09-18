@@ -56,3 +56,48 @@ def test_sections_render_in_cid_mode():
 
 def test_no_images_no_img_tags():
     assert _html().count("<img") == 0
+
+
+# ── Vol-swap basket columns ───────────────────────────────────────────────────
+# A vol-swap basket carries 'Underlying' / 'Strike (%)'; the email reads the
+# canonical 'Variance Asset' / 'Strike Mono Var Swap (%)'. Without the alias
+# mapping the underlyings table printed blank tickers and zero strikes, and the
+# trade description showed "Offer @ N/A".
+
+VOLSWAP_BASKET = pd.DataFrame([
+    {"Underlying": "AAPL UW Equity", "Strike (%)": 22.5, "Weight (%)": 60.0},
+    {"Underlying": "MSFT UW Equity", "Strike (%)": 19.0, "Weight (%)": 40.0},
+])
+
+
+def _html_with(basket):
+    from functions.dispersion._charts import _generate_email_html
+    idx = pd.bdate_range("2025-01-01", periods=60)
+    series = pd.Series(np.linspace(0, 2, 60), index=idx)
+    return _generate_email_html(
+        {"has_short_leg": False}, series, basket, 60, False, "Vol Swap",
+        2.5, 1.3, 0.7, "SPX Index", "No", carry_series=series)
+
+
+def test_volswap_basket_fills_the_underlyings_table():
+    html = _html_with(VOLSWAP_BASKET)
+    assert "AAPL UW Equity" in html and "MSFT UW Equity" in html
+    assert "22.50" in html or "22.5" in html
+
+
+def test_volswap_basket_gives_a_real_offer():
+    html = _html_with(VOLSWAP_BASKET)
+    assert "Offer @ N/A" not in html
+    assert "Offer @ 21.10%" in html          # weight-averaged 22.5/19.0 at 60/40
+
+
+def test_canonical_basket_df_is_non_destructive():
+    from functions.dispersion._charts import _canonical_basket_df
+    canonical = pd.DataFrame([{"Variance Asset": "X", "Strike Mono Var Swap (%)": 20.0,
+                               "Weight (%)": 100.0}])
+    assert _canonical_basket_df(canonical) is canonical      # already canonical: untouched
+    before = list(VOLSWAP_BASKET.columns)
+    out = _canonical_basket_df(VOLSWAP_BASKET)
+    assert "Variance Asset" in out.columns and "Strike Mono Var Swap (%)" in out.columns
+    assert list(VOLSWAP_BASKET.columns) == before            # caller's frame not mutated
+    assert _canonical_basket_df(None) is None

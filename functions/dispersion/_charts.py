@@ -1012,6 +1012,7 @@ def _generate_email_html(charts_data: Dict, result_series: Optional[pd.Series],
     is_dual_sectorial = charts_data.get('is_dual_sectorial', False)
     base64_images = base64_images or {}
     cid_map = cid_map or {}
+    data_editor = _canonical_basket_df(data_editor)
 
     # Detect structure type
     if data_editor is None or len(data_editor) == 0:
@@ -1289,6 +1290,35 @@ def _convert_matu(n_exp: int) -> str:
     """n_exp (business days) → maturity month label used in the email subject/body
     (e.g. 'Dec27'). ~21 business days per month."""
     return (date.today() + relativedelta(months=int(round((n_exp or 0) / 21.0)))).strftime("%b%y")
+
+
+#: Basket-table column aliases → the canonical names the email reads.
+#: A vol-swap basket carries 'Underlying' / 'Strike (%)'; without this the
+#: underlyings table printed blank tickers and zero strikes, and the
+#: "Offer @ X%" line fell back to "N/A" (no strike column found).
+_BASKET_COL_ALIASES = {
+    'Underlying': 'Variance Asset',
+    'Underlyings': 'Variance Asset',
+    'Tickers': 'Variance Asset',
+    'Ticker': 'Variance Asset',
+    'Strike (%)': 'Strike Mono Var Swap (%)',
+    'Strikes (%)': 'Strike Mono Var Swap (%)',
+    'Strikes': 'Strike Mono Var Swap (%)',
+    'Strike Mono': 'Strike Mono Var Swap (%)',
+    'Weights (%)': 'Weight (%)',
+    'Weights': 'Weight (%)',
+}
+
+
+def _canonical_basket_df(data_editor):
+    """Rename the basket columns to the canonical names used throughout the
+    email (vol-swap tables use 'Underlying' / 'Strike (%)'). Existing canonical
+    columns always win; the caller's frame is never mutated."""
+    if data_editor is None or len(data_editor) == 0:
+        return data_editor
+    rename = {old: new for old, new in _BASKET_COL_ALIASES.items()
+              if old in data_editor.columns and new not in data_editor.columns}
+    return data_editor.rename(columns=rename) if rename else data_editor
 
 
 def _return_offer(data_editor) -> str:
