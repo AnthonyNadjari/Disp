@@ -92,22 +92,22 @@ _SECTION_TRIGGERS = [
 ]
 
 # ─── Priority columns that get orange highlight in horizontal export ──────
-# Exact names for LV / LSV / mono; the LCM cap-priced columns carry a per-set
-# suffix ("Strike Cross Corr Cap Priced LCM [A] (%)") → matched by prefix.
-_PRIORITY_HIGHLIGHT = {
-    'Strike Cross Corr Cap Priced LV (%)',
-    'Strike Cross Corr Cap Priced LSV (%)',
-    'Strike Mono Corr Cap Priced LV (%)',
-    'Strike Mono Corr Cap Priced LSV (%)',
-}
-_PRIORITY_HIGHLIGHT_PREFIXES = ("Strike Cross Corr Cap Priced LCM",)
+# Matched by PREFIX: the LCM cap-priced columns carry a per-set suffix
+# ("Strike Cross Corr Cap Priced LCM [A] (%)"), and mono-corridor pricing emits
+# its own shorter names ("Strike Cap Priced LV (%)").
+_PRIORITY_HIGHLIGHT_PREFIXES = (
+    "Strike Cross Corr Cap Priced",     # cross mode, cross leg (LV / LSV / LCM [set])
+    "Strike Mono Corr Cap Priced",      # cross mode, mono leg
+    "Strike Cap Priced",                # mono-corridor mode
+)
+_LCM_CAP_PRICED_PREFIX = "Strike Cross Corr Cap Priced LCM"
 
 # ─── Columns exported with 4 decimals (EVs are small numbers; 2 hide the LCM impacts)
 _FOUR_DECIMAL_PREFIXES = ("EV ", "FV Variance", "LSV Impact", "LCM Impact")
 
 
 def _is_priority_highlight(label: str) -> bool:
-    return label in _PRIORITY_HIGHLIGHT or label.startswith(_PRIORITY_HIGHLIGHT_PREFIXES)
+    return label.startswith(_PRIORITY_HIGHLIGHT_PREFIXES)
 
 
 def _get_row_style(label: str, horizontal: bool = False):
@@ -186,21 +186,28 @@ def _number_format_for(label: str) -> str:
 
 def _priority_columns(metrics):
     """Priority columns first, in the fixed LV / LSV / LCM… / mono order —
-    every LCM cap-priced set column slots in after the LSV one."""
+    every LCM cap-priced set column slots in after the LSV one. Covers both
+    cross-corridor and mono-corridor column naming."""
     order = [
-        'Index Ticker',
+        'Index Ticker',                          # cross mode
+        'Ticker',                                # mono mode
         'Corridor Asset',
         'Currency',
+        # cross-corridor pricing
         'Strike Cross Corr Cap Priced LV (%)',
         'Strike Cross Corr Cap Priced LSV (%)',
         '__LCM_CAP_PRICED__',
         'Strike Mono Corr Cap Priced LV (%)',
         'Strike Mono Corr Cap Priced LSV (%)',
+        # mono-corridor pricing
+        'Strike Cap Priced LV (%)',
+        'Strike Cap Priced LSV (%)',
+        'Strike Cap Priced LCM (%)',
     ]
     present = []
     for c in order:
         if c == '__LCM_CAP_PRICED__':
-            present.extend(m for m in metrics if str(m).startswith(_PRIORITY_HIGHLIGHT_PREFIXES))
+            present.extend(m for m in metrics if str(m).startswith(_LCM_CAP_PRICED_PREFIX))
         elif c in metrics:
             present.append(c)
     return present

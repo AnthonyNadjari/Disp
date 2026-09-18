@@ -63,6 +63,37 @@ def test_number_formats_four_decimals_for_evs():
     assert val["EV Cross LV (%)"] == pytest.approx(-0.031234)
 
 
+def _mono_df():
+    """Mono-corridor pricing uses its own, shorter column names."""
+    return pd.DataFrame([{
+        "Ticker": ".STOXX50E", "Currency": "EUR",
+        "Strike LV Uncapped (%)": "20.00%",
+        "Strike Cap Priced LV (%)": "19.50%",
+        "Strike Cap Priced LSV (%)": "19.60%",
+        "EV Mono LV (%)": "-3.1234%",
+        "RA (%)": "85.00%",
+    }], index=[".STOXX50E"])
+
+
+def test_mono_cap_priced_columns_are_orange_and_first():
+    data = ex.export_result_matrix(_mono_df(), horizontal=True)
+    ws = openpyxl.load_workbook(io.BytesIO(data)).active
+    headers = [c.value for c in ws[1]][1:]
+    fills = {c.value: c.fill.start_color.rgb[-6:] for c in ws[1]}
+    for h in ("Strike Cap Priced LV (%)", "Strike Cap Priced LSV (%)"):
+        assert fills[h] == ex._ORANGE, h
+    assert fills["Strike LV Uncapped (%)"] != ex._ORANGE      # uncapped stays plain
+    assert headers.index("Strike Cap Priced LV (%)") < headers.index("Strike LV Uncapped (%)")
+
+
+def test_mono_cap_priced_rows_are_orange_vertical():
+    data = ex.export_result_matrix(_mono_df().T, horizontal=False)
+    ws = openpyxl.load_workbook(io.BytesIO(data)).active
+    rows = {ws.cell(row=r, column=1).value: ws.cell(row=r, column=1).fill.start_color.rgb[-6:]
+            for r in range(1, ws.max_row + 1)}
+    assert rows["Strike Cap Priced LV (%)"] == ex._ORANGE
+
+
 def test_vertical_export_runs_and_colours_strikes():
     ws = _sheet(horizontal=False)
     rows = {ws.cell(row=r, column=1).value: ws.cell(row=r, column=1).fill.start_color.rgb[-6:]

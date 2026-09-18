@@ -3215,22 +3215,20 @@ with tab4:
                     st.exception(e)
         # ── Persistent Result Matrix display (survives rerun from download button) ──
         if 'pricing_results_df' in st.session_state and st.session_state['pricing_results_df'] is not None:
-            _highlight_rows = [
-                'Strike Cross Corr Cap Priced LV (%)',
-                'Strike Cross Corr Cap Priced LSV (%)',
-                'Strike Cross Corr Cap Priced LCM (%)',
-                'Strike Mono Corr Cap Priced LV (%)',
-                'Strike Mono Corr Cap Priced LSV (%)',
-                'RA (%)',
-                'Correlation',
-            ]
+            _highlight_rows = ['RA (%)', 'Correlation']
             _df_t = st.session_state['pricing_results_df'].T
             # Ensure all values are strings to avoid Arrow serialization errors (mixed int/str/None)
             _df_t = _df_t.fillna('').astype(str)
 
-            # LCM cap-priced rows carry a "[set]" suffix → match by prefix (same
-            # colour as the LV / LSV cap-priced rows above)
-            _highlight_prefixes = ('Strike Cross Corr Cap Priced LCM',)
+            # Every cap-priced strike row, matched by PREFIX so the LCM per-set
+            # suffix ("… LCM [A] (%)") and the mono-corridor names are covered:
+            #   cross mode : 'Strike Cross Corr Cap Priced …' + 'Strike Mono Corr Cap Priced …'
+            #   mono  mode : 'Strike Cap Priced …'
+            _highlight_prefixes = (
+                'Strike Cross Corr Cap Priced',
+                'Strike Mono Corr Cap Priced',
+                'Strike Cap Priced',
+            )
 
             def _highlight_key_rows(row):
                 if row.name in _highlight_rows or str(row.name).startswith(_highlight_prefixes):
