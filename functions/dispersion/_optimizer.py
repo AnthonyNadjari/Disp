@@ -434,7 +434,11 @@ class DispersionOptimizer:
                 self.reweight_grace_days), nan=0.0)
         else:
             self._active_mask = self._valid_mask
-        self._long_only = len(self.short_candidates) == 0
+        # Long-only is an INTENT (max_stocks_short == 0), never inferred from an
+        # empty candidate list: a short leg that failed to load / was excluded
+        # used to flip the whole run to long-only and silently ignore
+        # min_stocks_short. run() raises instead.
+        self._long_only = (self.c.max_stocks_short == 0)
         # Rejection tracking
         self._rejection_reasons = {
             "fitness<=0": 0,
@@ -778,7 +782,15 @@ class DispersionOptimizer:
         if len(self.long_candidates) < self.c.min_stocks_long:
             return self._empty_result()
         if not self._long_only and len(self.short_candidates) < self.c.min_stocks_short:
-            return self._empty_result()
+            # Loud: the run was asked for shorts and cannot honour it. Returning a
+            # long-only basket here would silently violate min_stocks_short.
+            raise ValueError(
+                f"Short leg requested but not feasible: min_stocks_short="
+                f"{self.c.min_stocks_short}, max_stocks_short={self.c.max_stocks_short}, "
+                f"usable short candidates={len(self.short_candidates)}.\n"
+                f"Either provide at least {self.c.min_stocks_short} valid short candidate(s), "
+                f"or set max_stocks_short=0 (long-only) — check the Long Only toggle."
+            )
         # ── Setup new scoring system (bilevel) if metric_weights provided ──
         if self._use_new_scoring:
             # Vega-mode / axe-criteria coherence (checked BEFORE the reference

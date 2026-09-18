@@ -928,6 +928,24 @@ def _prepare_optimization_inputs(
     # max_stocks_short=0 means explicit long-only — skip short feasibility and clear shorts
     if constraints.max_stocks_short == 0:
         short_valid = []
+    elif len(short_valid) < constraints.min_stocks_short:
+        # Shorts were REQUESTED but cannot be honoured. Never fall back to a
+        # long-only basket silently — that ignores min/max_stocks_short.
+        if not short_legs_loaded:
+            _why = ("no short candidates were provided (the short basket table is "
+                    "empty, or short_df was not passed)")
+        else:
+            _dropped = [s.corridor_condition_asset if config.cross_corridor else s.variance_asset
+                        for s in short_legs_loaded]
+            _why = (f"{len(short_legs_loaded)} short candidate(s) were provided "
+                    f"({', '.join(map(str, _dropped[:8]))}) but only {len(short_valid)} "
+                    f"survived price loading / exclusions / filters")
+        raise ValueError(
+            f"Infeasible short constraints: min_stocks_short="
+            f"{constraints.min_stocks_short} but {_why}.\n"
+            f"Either add valid short candidates, or run long-only "
+            f"(max_stocks_short = 0 / the Long Only toggle)."
+        )
 
     if short_valid:
         max_w_short = max((s.max_weight for s in short_valid), default=0.0)
