@@ -12,6 +12,10 @@ from __future__ import annotations
 
 import base64
 import io
+import os
+import re
+import shutil
+import tempfile
 from datetime import date
 from typing import Dict, List, Optional, Tuple
 
@@ -982,10 +986,20 @@ def _generate_email_html(charts_data: Dict, result_series: Optional[pd.Series],
                          short_leg_display: str = "Index",
                          adj_divs: str = "No",
                          base64_images: Optional[Dict[str, str]] = None,
-                         carry_series: Optional[pd.Series] = None) -> str:
+                         carry_series: Optional[pd.Series] = None,
+                         cid_map: Optional[Dict[str, str]] = None) -> str:
     """
     Generate email HTML matching original Gaia_PP format exactly.
-    Charts embedded as base64 data URIs — no external files needed.
+
+    Image source, per ``cid_map``:
+      * ``cid_map`` given  -> ``<img src="cid:...">``, i.e. the images are real
+        attachments of the message. THE ONLY form Outlook keeps intact through
+        a forward / reply / copy-paste.
+      * ``cid_map`` None   -> ``data:image/png;base64,...`` URIs, for a browser
+        preview (Streamlit). Outlook's renderer does NOT support data URIs: it
+        rewrites them into embedded DIB pictures at send time, and the copy
+        degrades to "<< OLE Object: Picture (Device Independent Bitmap) >>" as
+        soon as the message is forwarded or pasted into a new one.
 
     A section (and its bullet in the intro list) is emitted only when its image was
     rendered: no "Entry Point" title without a chart, no "Sector Split" without a pie.
@@ -997,6 +1011,7 @@ def _generate_email_html(charts_data: Dict, result_series: Optional[pd.Series],
     has_short_leg = charts_data.get('has_short_leg', False)
     is_dual_sectorial = charts_data.get('is_dual_sectorial', False)
     base64_images = base64_images or {}
+    cid_map = cid_map or {}
 
     # Detect structure type
     if data_editor is None or len(data_editor) == 0:
@@ -1086,18 +1101,25 @@ def _generate_email_html(charts_data: Dict, result_series: Optional[pd.Series],
         source_period = ""
     source_line = f"Source: Bloomberg and Barclays, {source_period}" if source_period else "Source: Bloomberg and Barclays"
 
-    # Image embedding helper
+    # Image embedding helper — cid: attachment (Outlook) or data URI (browser preview)
+    def _src(key: str) -> str:
+        if key in cid_map:
+            return f'cid:{cid_map[key]}'
+        return f'data:image/png;base64,{base64_images[key]}'
+
+    def _has_img(key: str) -> bool:
+        return key in cid_map or key in base64_images
+
     def _img(key: str, w: int = 1000, h: int = 500) -> str:
-        if key in base64_images:
-            return f'<img width="{w}" height="{h}" src="data:image/png;base64,{base64_images[key]}">'
+        if _has_img(key):
+            return f'<img width="{w}" height="{h}" src="{_src(key)}">'
         return ''
 
     def _img_pie(key: str) -> str:
         """Pie charts with legend — wider aspect ratio to fit legend beside pie."""
-        if key not in base64_images:
+        if not _has_img(key):
             return ''
-        b64 = base64_images[key]
-        return f'<img width="700" height="480" src="data:image/png;base64,{b64}" style="display:block; max-width:100%;">'
+        return f'<img width="700" height="480" src="{_src(key)}" style="display:block; max-width:100%;">'
 
     # Section title style: Aptos 14px, rgb(0,174,239), bold underline
     _title_style = 'font-family:Aptos,Calibri,sans-serif; color:rgb(0,174,239); font-size:14px;'
@@ -1109,7 +1131,7 @@ def _generate_email_html(charts_data: Dict, result_series: Optional[pd.Series],
     else:
         _pie_keys = ["sectorial.png"]
     _pie_keys.append("weights_pie.png")
-    _pie_cells = [_img_pie(k) for k in _pie_keys if k in base64_images]
+    _pie_cells = [_img_pie(k) for k in _pie_keys if _has_img(k)]
     if _pie_cells:
         _rows = [_pie_cells[i:i + 2] for i in range(0, len(_pie_cells), 2)]
         sectorial_html = '<table cellpadding="0" cellspacing="0">' + ''.join(
@@ -1146,7 +1168,7 @@ def _generate_email_html(charts_data: Dict, result_series: Optional[pd.Series],
     # Entry point — title and bullet only when the image exists (mono and cross corridor)
     entry_point_bullet = ""
     entry_point_image = ""
-    if 'entry_point.png' in base64_images:
+    if _has_img('entry_point.png'):
         entry_point_bullet = f'''
         <li style="color: #2e75b6; font-size:14.5px; line-height:22px;">
             <span style="color:#000000; font-size:14.5px; line-height:22px;">
@@ -1602,8 +1624,11 @@ def send_email_with_attachments(charts_data: Dict, recipient_email: str = "",
 
     This function:
     - Renders charts to PNG bytes in-memory using matplotlib (no kaleido/orca)
-    - Embeds images as base64 data URIs directly in the HTML body
-    - Never writes any file to disk
+    - Attaches each chart and references it as ``cid:`` in the HTML body, the
+      only embedding Outlook keeps intact when the message is forwarded,
+      replied to or copy-pasted (data: URIs become DIB OLE objects and show up
+      as "<< OLE Object: Picture (Device Independent Bitmap) >>")
+    - Writes the PNGs to a temp directory, removed before returning
     - Never spawns a subprocess that can timeout
     - Works identically from Streamlit, Jupyter, or plain Python
 
@@ -1626,6 +1651,8 @@ def send_email_with_attachments(charts_data: Dict, recipient_email: str = "",
         {'success': bool, 'message': str}
     """
     com_initialized = False
+    _tmp_dir = None
+    _tmp_files = []      # [(chart filename, path on disk)]
 
     try:
         import win32com.client as win32
@@ -1643,8 +1670,21 @@ def send_email_with_attachments(charts_data: Dict, recipient_email: str = "",
         if progress_callback:
             progress_callback(50, "Building email HTML...")
 
-        # Base64-encode for inline embedding
-        base64_images = {fname: base64.b64encode(png).decode('ascii') for fname, png in chart_items}
+        # ── Charts as real attachments referenced by cid: ──────────────────
+        # Outlook does NOT support data: URIs. Setting HTMLBody with them makes
+        # Outlook rewrite each image into an embedded DIB picture, which the
+        # recipient loses the moment the message is forwarded / replied to /
+        # copy-pasted ("<< OLE Object: Picture (Device Independent Bitmap) >>").
+        # A cid: attachment survives all of those.
+        _tmp_dir = tempfile.mkdtemp(prefix="gaia_email_")
+        cid_map = {}
+        for fname, png in chart_items:
+            path = os.path.join(_tmp_dir, fname)
+            with open(path, "wb") as fh:
+                fh.write(png)
+            # content id: filename without extension, unique within the message
+            cid_map[fname] = re.sub(r"[^A-Za-z0-9_.-]", "_", os.path.splitext(fname)[0])
+            _tmp_files.append((fname, path))
 
         # Normalize adj_divs to string
         if isinstance(adj_divs, bool):
@@ -1655,7 +1695,7 @@ def send_email_with_attachments(charts_data: Dict, recipient_email: str = "",
             charts_data, result_series, data_editor,
             n_exp, is_cross_corridor, product_type,
             local_cap, barrier_up, barrier_down, short_leg_display, adj_divs,
-            base64_images=base64_images,
+            cid_map=cid_map,
             carry_series=carry_series,
         )
 
@@ -1682,7 +1722,27 @@ def send_email_with_attachments(charts_data: Dict, recipient_email: str = "",
         else:
             mail.Subject = f'{short_name} Corridor Variance Swap Dispersion {matu}'
 
-        # Set HTML body — images are base64-embedded, no attachments needed
+        # Force HTML: in an RTF message every picture becomes an OLE object,
+        # which is the other way the "<< OLE Object ... >>" placeholder appears.
+        try:
+            mail.BodyFormat = 2            # olFormatHTML
+        except Exception:
+            pass
+
+        # Attach each chart and give it its Content-ID BEFORE setting HTMLBody,
+        # so Outlook binds every cid: reference to its attachment.
+        _PR_ATTACH_CONTENT_ID = "http://schemas.microsoft.com/mapi/proptag/0x3712001F"
+        _PR_ATTACHMENT_HIDDEN = "http://schemas.microsoft.com/mapi/proptag/0x7FFE000B"
+        for fname, path in _tmp_files:
+            att = mail.Attachments.Add(path)
+            att.PropertyAccessor.SetProperty(_PR_ATTACH_CONTENT_ID, cid_map[fname])
+            try:
+                # keep the paperclip list clean; not honoured by every Outlook build
+                att.PropertyAccessor.SetProperty(_PR_ATTACHMENT_HIDDEN, True)
+            except Exception:
+                pass
+
+        # Set HTML body — images resolve against the cid: attachments above
         mail.HTMLBody = html_body
 
         if progress_callback:
@@ -1713,6 +1773,11 @@ def send_email_with_attachments(charts_data: Dict, recipient_email: str = "",
             except Exception:
                 pass
         return {'success': False, 'message': f'Email generation failed: {str(e)}'}
+    finally:
+        # Outlook has copied the attachments into the item by now; the temp PNGs
+        # are only needed for Attachments.Add.
+        if _tmp_dir:
+            shutil.rmtree(_tmp_dir, ignore_errors=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # BacktestResult Extensions — monkey-patches .plot(), .email(), .rerun()
